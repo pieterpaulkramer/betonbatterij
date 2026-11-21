@@ -1,0 +1,9 @@
+[project]
+name = "betonbatterij"
+version = "0.1.0"
+description = "BetonBatterij — Slimme Vloerverwarming & Warmtepomp Regeling (Laag 1 Digital Twin)"
+requires-python = ">=3.12"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]

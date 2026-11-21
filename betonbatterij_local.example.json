@@ -1,0 +1,110 @@
+{
+  "entities": {
+    "presence_boolean": "input_boolean.aanwezig",
+    "wp_z1_climate": "climate.panasonic_heat_pump_main_z1_temp",
+    "wp_z1_cooling_climate": "climate.panasonic_heat_pump_main_z1_temp_cooling",
+    "wp_operating_mode": "select.panasonic_heat_pump_main_operating_mode_state",
+    "wp_threeway_valve": "sensor.panasonic_heat_pump_main_threeway_valve_state",
+    "wp_defrosting": "binary_sensor.panasonic_heat_pump_main_defrosting_state",
+    "wp_internal_heater": "binary_sensor.panasonic_heat_pump_main_internal_heater_state",
+    "wp_pump_flow": "sensor.panasonic_heat_pump_main_pump_flow",
+    "wp_outlet_temp": "sensor.panasonic_heat_pump_main_main_outlet_temp",
+    "wp_inlet_temp": "sensor.panasonic_heat_pump_main_main_inlet_temp",
+    "wp_compressor_freq": "sensor.panasonic_heat_pump_main_compressor_freq",
+    "wp_power_consumption": "sensor.panasonic_heat_pump_consumption",
+    "wp_outside_temp": "sensor.panasonic_heat_pump_main_outside_temp",
+    "buf_top_temp": "sensor.buffer_vat_boven_temperatuur",
+    "buf_bot_temp": "sensor.buffer_vat_onder_temperatuur",
+    "dhw_top_temp": "sensor.sww_boiler_boven_temperatuur",
+    "dhw_bot_temp": "sensor.sww_boiler_onder_temperatuur",
+    "pump_secondary_switch": "switch.panasonic_heat_pump_gpio_relay_two",
+    "valve_bg": "switch.panasonic_heat_pump_gpio_relay_one",
+    "valve_slaapkamer": "switch.vloerverwarming_slaapkamer",
+    "valve_slaapkamer_voor": "switch.vloerverwarming_slaapkamer_voor",
+    "valve_slaapkamer_achter": "switch.vloerverwarming_slaapkamer_achter",
+    "valve_badkamer": "switch.vloerverwarming_badkamer",
+    "valve_werkkamer_1e": "switch.vloerverwarming_werkkamer_1e",
+    "valve_kamer_1e_midden": "switch.vloerverwarming_kamer_1e_midden",
+    "valve_kamer_1e_zuid": "switch.vloerverwarming_kamer_1e_zuid",
+    "valve_kantoor": "switch.vloerverwarming_kantoor",
+    "valve_badkamer_boven": "switch.vloerverwarming_badkamer_boven",
+    "valve_logeerkamer": "switch.vloerverwarming_logeerkamer",
+    "outdoor_temp_dak": "sensor.buitenthermometer_temperatuur",
+    "outdoor_humidity_dak": "sensor.buitenthermometer_luchtvochtigheid",
+    "weather_entity": "weather.home",
+    "sun_entity": "sun.sun",
+    "pv_power_w": "sensor.pv_omvormer_vermogen",
+    "pv_forecast_now_w": "sensor.power_production_now",
+    "epex_price_eur_kwh": "sensor.epex_huidige_uurprijs",
+    "screen_small_cover": "cover.zonwering_woonkamer_klein",
+    "screen_large_cover": "cover.zonwering_woonkamer_groot",
+    "p1_power_consumed_kw": "sensor.p1_meter_power_consumed",
+    "p1_power_produced_kw": "sensor.p1_meter_power_produced",
+    "ac_kantoor_climate": "climate.airco_kantoor",
+    "ac_kantoor_power_w": "sensor.airco_kantoor_power",
+    "ac_kantoor_defrosting": "binary_sensor.airco_kantoor_defrosting",
+    "ac_kantoor_occupancy": "binary_sensor.airco_kantoor_occupancy",
+    "growlights_kantoor_power_w": "sensor.groeilampen_kantoor_power",
+    "desk_kantoor_power_w": null,
+    "bg_manifold_supply_temp": null,
+    "bg_manifold_return_temp": null,
+    "bg_manifold_return_offset_c": 0.0,
+    "floor_surface_sensor_wk": null
+  },
+  "room_sensors": {
+    "wk": {
+      "temp_entity_id": "sensor.thermostaat_woonkamer_temperatuur",
+      "humidity_entity_id": "sensor.thermostaat_woonkamer_luchtvochtigheid",
+      "pre_swap_temp_entity_id": null,
+      "swap_timestamp_utc": null
+    },
+    "slaapkamer": {
+      "temp_entity_id": "sensor.thermostaat_slaapkamer_temperatuur",
+      "humidity_entity_id": "sensor.thermostaat_slaapkamer_luchtvochtigheid",
+      "pre_swap_temp_entity_id": null,
+      "swap_timestamp_utc": null
+    },
+    "badkamer": {
+      "temp_entity_id": "sensor.thermometer_badkamer_temperatuur",
+      "humidity_entity_id": "sensor.thermometer_badkamer_luchtvochtigheid",
+      "pre_swap_temp_entity_id": null,
+      "swap_timestamp_utc": null
+    },
+    "werkkamer_1e": {
+      "temp_entity_id": "sensor.thermometer_werkkamer_1e_temperatuur",
+      "humidity_entity_id": "sensor.thermometer_werkkamer_1e_luchtvochtigheid",
+      "pre_swap_temp_entity_id": null,
+      "swap_timestamp_utc": null
+    },
+    "kamer_1e_midden": {
+      "temp_entity_id": "sensor.thermometer_kamer_1e_midden_temperatuur",
+      "humidity_entity_id": "sensor.thermometer_kamer_1e_midden_luchtvochtigheid",
+      "pre_swap_temp_entity_id": null,
+      "swap_timestamp_utc": null
+    },
+    "kamer_1e_zuid": {
+      "temp_entity_id": "sensor.thermometer_kamer_1e_zuid_temperatuur",
+      "humidity_entity_id": "sensor.thermometer_kamer_1e_zuid_luchtvochtigheid",
+      "pre_swap_temp_entity_id": null,
+      "swap_timestamp_utc": null
+    },
+    "kantoor": {
+      "temp_entity_id": "sensor.thermometer_kantoor_temperatuur",
+      "humidity_entity_id": "sensor.thermometer_kantoor_luchtvochtigheid",
+      "pre_swap_temp_entity_id": null,
+      "swap_timestamp_utc": null
+    },
+    "badkamer_boven": {
+      "temp_entity_id": "sensor.thermometer_badkamer_boven_temperatuur",
+      "humidity_entity_id": "sensor.thermometer_badkamer_boven_luchtvochtigheid",
+      "pre_swap_temp_entity_id": null,
+      "swap_timestamp_utc": null
+    },
+    "logeerkamer": {
+      "temp_entity_id": "sensor.thermometer_logeerkamer_temperatuur",
+      "humidity_entity_id": "sensor.thermometer_logeerkamer_luchtvochtigheid",
+      "pre_swap_temp_entity_id": null,
+      "swap_timestamp_utc": null
+    }
+  }
+}

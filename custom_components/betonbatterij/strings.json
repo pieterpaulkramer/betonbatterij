@@ -1,0 +1,107 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "BetonBatterij — Laag 1 Shadow Mode",
+        "description": "Configure the BetonBatterij Layer 1 Digital Twin (2R2C thermal slab estimator, sub-5-minute ZOH accumulator, and 90-day ring buffer). Default rotameter flow rates will be seeded and can be adjusted anytime via Configure."
+      }
+    },
+    "abort": {
+      "already_configured": "Device is already configured"
+    }
+  },
+  "options": {
+    "step": {
+      "init": {
+        "title": "Manifold rotameter flow rates",
+        "description": "Enter the measured manifold rotameter flow rates (0.1–25.0 L/min) for each hydraulic floor-heating group.",
+        "data": {
+          "flow_wk_l_min": "Ground floor — Living room (Woonkamer)",
+          "flow_gang_l_min": "Ground floor — Hallway (Gang)",
+          "flow_slaapkamer_l_min": "1st floor — Master bedroom (Slaapkamer)",
+          "flow_badkamer_l_min": "1st floor — Bathroom (Badkamer)",
+          "flow_werkkamer_1e_l_min": "1st floor — Study (Werkkamer 1e)",
+          "flow_kamer_1e_midden_l_min": "1st floor — Middle room (Kamer 1e midden)",
+          "flow_kamer_1e_zuid_l_min": "1st floor — South room (Kamer 1e zuid)",
+          "flow_kantoor_l_min": "2nd floor — Attic office (Kantoor)",
+          "flow_badkamer_boven_l_min": "2nd floor — Upper bathroom (Badkamer boven)",
+          "flow_logeerkamer_l_min": "2nd floor — Guest room (Logeerkamer)"
+        },
+        "data_description": {
+          "flow_wk_l_min": "Measured manifold rotameter flow rate in L/min (0.1–25.0).",
+          "flow_gang_l_min": "Measured manifold rotameter flow rate in L/min (0.1–25.0).",
+          "flow_slaapkamer_l_min": "Measured manifold rotameter flow rate in L/min (0.1–25.0).",
+          "flow_badkamer_l_min": "Measured manifold rotameter flow rate in L/min (0.1–25.0).",
+          "flow_werkkamer_1e_l_min": "Measured manifold rotameter flow rate in L/min (0.1–25.0).",
+          "flow_kamer_1e_midden_l_min": "Measured manifold rotameter flow rate in L/min (0.1–25.0).",
+          "flow_kamer_1e_zuid_l_min": "Measured manifold rotameter flow rate in L/min (0.1–25.0).",
+          "flow_kantoor_l_min": "Measured manifold rotameter flow rate in L/min (0.1–25.0).",
+          "flow_badkamer_boven_l_min": "Measured manifold rotameter flow rate in L/min (0.1–25.0).",
+          "flow_logeerkamer_l_min": "Measured manifold rotameter flow rate in L/min (0.1–25.0)."
+        }
+      }
+    }
+  },
+  "entity": {
+    "sensor": {
+      "woonkamer_geschatte_vloertemperatuur": {
+        "name": "Living room estimated floor temperature"
+      },
+      "woonkamer_geschatte_pvc_oppervlaktetemperatuur": {
+        "name": "Living room estimated PVC surface temperature"
+      },
+      "woonkamer_ongeplande_warmtelast": {
+        "name": "Living room unplanned heat load"
+      },
+      "woonkamer_vloer_afgiftevermogen": {
+        "name": "Living room floor thermal power"
+      },
+      "woonkamer_hindcast_6u": {
+        "name": "Living room 6h hindcast"
+      },
+      "kantoor_geschatte_vloertemperatuur": {
+        "name": "Office estimated floor temperature"
+      },
+      "kantoor_geschatte_pvc_oppervlaktetemperatuur": {
+        "name": "Office estimated PVC surface temperature"
+      },
+      "kantoor_ongeplande_warmtelast": {
+        "name": "Office unplanned heat load"
+      },
+      "kantoor_vloer_afgiftevermogen": {
+        "name": "Office floor thermal power"
+      },
+      "kantoor_hindcast_6u": {
+        "name": "Office 6h hindcast"
+      },
+      "fit_woonkamer": {
+        "name": "Living room 6h hindcast RMSE"
+      },
+      "fit_kantoor": {
+        "name": "Office 6h hindcast RMSE"
+      },
+      "fit_warmtepomp_cop": {
+        "name": "Heat pump expected COP"
+      }
+    },
+    "switch": {
+      "auto_kalibratie": {
+        "name": "Automatic weekly calibration"
+      }
+    },
+    "button": {
+      "herbereken_parameters": {
+        "name": "Recalculate parameters"
+      },
+      "rollback_parameters": {
+        "name": "Rollback parameters"
+      },
+      "reset_parameters": {
+        "name": "Reset parameters to Day-1 priors"
+      },
+      "exporteer_csv": {
+        "name": "Export diagnostics CSV"
+      }
+    }
+  }
+}

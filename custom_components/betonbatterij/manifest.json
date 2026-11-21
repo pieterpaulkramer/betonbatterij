@@ -1,0 +1,14 @@
+{
+  "domain": "betonbatterij",
+  "name": "BetonBatterij",
+  "after_dependencies": ["recorder"],
+  "codeowners": ["@pieterpaulkramer"],
+  "config_flow": true,
+  "documentation": "https://github.com/pieterpaulkramer/betonbatterij",
+  "integration_type": "hub",
+  "iot_class": "local_push",
+  "issue_tracker": "https://github.com/pieterpaulkramer/betonbatterij/issues",
+  "requirements": [],
+  "single_config_entry": true,
+  "version": "0.1.0"
+}

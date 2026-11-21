@@ -1,0 +1,107 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "BetonBatterij — Laag 1 Shadow Mode",
+        "description": "Installeer de BetonBatterij Laag 1 Digital Twin (2R2C betonvloer-toestandschatter, sub-5-minuten ZOH-accumulator en 90-dagen ringbuffer). De rotameter-debieten worden vooringevuld met de standaardwaarden en zijn op elk moment aan te passen via Configureren."
+      }
+    },
+    "abort": {
+      "already_configured": "Apparaat is al geconfigureerd"
+    }
+  },
+  "options": {
+    "step": {
+      "init": {
+        "title": "Verdeler rotameter-debieten",
+        "description": "Vul de afgelezen rotameter-debieten (0,1–25,0 L/min) in voor alle 10 hydraulische vloerverwarmingsgroepen.",
+        "data": {
+          "flow_wk_l_min": "Begane grond — Woonkamer",
+          "flow_gang_l_min": "Begane grond — Gang",
+          "flow_slaapkamer_l_min": "1e verdieping — Slaapkamer",
+          "flow_badkamer_l_min": "1e verdieping — Badkamer",
+          "flow_werkkamer_1e_l_min": "1e verdieping — Werkkamer 1e",
+          "flow_kamer_1e_midden_l_min": "1e verdieping — Kamer 1e midden",
+          "flow_kamer_1e_zuid_l_min": "1e verdieping — Kamer 1e zuid",
+          "flow_kantoor_l_min": "2e verdieping — Zolderkantoor",
+          "flow_badkamer_boven_l_min": "2e verdieping — Badkamer boven",
+          "flow_logeerkamer_l_min": "2e verdieping — Logeerkamer"
+        },
+        "data_description": {
+          "flow_wk_l_min": "Afgelezen rotameter-debiet op de verdeler in L/min (0,1–25,0).",
+          "flow_gang_l_min": "Afgelezen rotameter-debiet op de verdeler in L/min (0,1–25,0).",
+          "flow_slaapkamer_l_min": "Afgelezen rotameter-debiet op de verdeler in L/min (0,1–25,0).",
+          "flow_badkamer_l_min": "Afgelezen rotameter-debiet op de verdeler in L/min (0,1–25,0).",
+          "flow_werkkamer_1e_l_min": "Afgelezen rotameter-debiet op de verdeler in L/min (0,1–25,0).",
+          "flow_kamer_1e_midden_l_min": "Afgelezen rotameter-debiet op de verdeler in L/min (0,1–25,0).",
+          "flow_kamer_1e_zuid_l_min": "Afgelezen rotameter-debiet op de verdeler in L/min (0,1–25,0).",
+          "flow_kantoor_l_min": "Afgelezen rotameter-debiet op de verdeler in L/min (0,1–25,0).",
+          "flow_badkamer_boven_l_min": "Afgelezen rotameter-debiet op de verdeler in L/min (0,1–25,0).",
+          "flow_logeerkamer_l_min": "Afgelezen rotameter-debiet op de verdeler in L/min (0,1–25,0)."
+        }
+      }
+    }
+  },
+  "entity": {
+    "sensor": {
+      "woonkamer_geschatte_vloertemperatuur": {
+        "name": "Woonkamer geschatte vloertemperatuur"
+      },
+      "woonkamer_geschatte_pvc_oppervlaktetemperatuur": {
+        "name": "Woonkamer geschatte PVC-oppervlaktetemperatuur"
+      },
+      "woonkamer_ongeplande_warmtelast": {
+        "name": "Woonkamer ongeplande warmtelast"
+      },
+      "woonkamer_vloer_afgiftevermogen": {
+        "name": "Woonkamer vloer afgiftevermogen"
+      },
+      "woonkamer_hindcast_6u": {
+        "name": "Woonkamer hindcast 6u"
+      },
+      "kantoor_geschatte_vloertemperatuur": {
+        "name": "Kantoor geschatte vloertemperatuur"
+      },
+      "kantoor_geschatte_pvc_oppervlaktetemperatuur": {
+        "name": "Kantoor geschatte PVC-oppervlaktetemperatuur"
+      },
+      "kantoor_ongeplande_warmtelast": {
+        "name": "Kantoor ongeplande warmtelast"
+      },
+      "kantoor_vloer_afgiftevermogen": {
+        "name": "Kantoor vloer afgiftevermogen"
+      },
+      "kantoor_hindcast_6u": {
+        "name": "Kantoor hindcast 6u"
+      },
+      "fit_woonkamer": {
+        "name": "Fit woonkamer"
+      },
+      "fit_kantoor": {
+        "name": "Fit kantoor"
+      },
+      "fit_warmtepomp_cop": {
+        "name": "Fit warmtepomp COP"
+      }
+    },
+    "switch": {
+      "auto_kalibratie": {
+        "name": "Automatische kalibratie"
+      }
+    },
+    "button": {
+      "herbereken_parameters": {
+        "name": "Herbereken parameters"
+      },
+      "rollback_parameters": {
+        "name": "Rollback parameters"
+      },
+      "reset_parameters": {
+        "name": "Reset parameters"
+      },
+      "exporteer_csv": {
+        "name": "Exporteer CSV"
+      }
+    }
+  }
+}

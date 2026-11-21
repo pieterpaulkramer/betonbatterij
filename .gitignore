@@ -1,0 +1,33 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Testing & coverage
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# IDE & OS
+.vscode/
+.idea/
+Thumbs.db
+.DS_Store
+
+# Local house-specific configuration & private project documentation
+betonbatterij_local.json
+onderzoek/
+features/
+design/
+TODO.md
+GEMINI.md
+
+# Scratch / local exports
+*.tmp
+telemetry_5m.csv
+fit_report.json
