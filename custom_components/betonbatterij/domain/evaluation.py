@@ -34,6 +34,31 @@ STRIDE_6H_STEPS: int = 6  # 30 minutes
 STRIDE_AC_1H_STEPS: int = 2  # 10 minutes
 COOLING_TAIL_STEPS: int = 24  # 2.0 hours post-cooling exclusion
 
+_LEGACY_LTS_ACCUM_FLAGS: int = (
+    const.FLAG_DHW_TANK
+    | const.FLAG_Z1_OFF_HARVEST
+    | const.FLAG_PV_FALLBACK
+    | const.FLAG_DEFROST_WP
+    | const.FLAG_DEFROST_AC
+    | const.FLAG_INTERNAL_HEATER
+)
+_LEGACY_LTS_UPSTAIRS_VALVE_COLS: tuple[str, ...] = (
+    "u_eff_slaapkamer",
+    "u_eff_badkamer",
+    "u_eff_werkkamer_1e",
+    "u_eff_kamer_1e_midden",
+    "u_eff_kamer_1e_zuid",
+    "u_eff_badkamer_boven",
+    "u_eff_logeerkamer",
+)
+_LEGACY_LTS_INDEP_CHANNELS: tuple[str, ...] = (
+    "t_out_dak_c",
+    "t_out_hm_c",
+    "t_air_wk_c",
+    "t_air_kantoor_c",
+    "p_p1_net_w",
+)
+
 CSV_EXPORT_COLUMNS: tuple[str, ...] = (
     "ts_utc",
     "iso_utc",
@@ -197,6 +222,9 @@ class PreprocessedHistory:
         cooling_or_tail: Mask covering active cooling plus 2.0h post-cooling tail.
         hyd_k_hx_wk: Reference `K_hx` used for `wk` in hydraulic pass [W/K].
         hyd_k_hx_kt: Reference `K_hx` used for `kt` in hydraulic pass [W/K].
+        p_wp_raw_el_w: Raw heat-pump electrical power [W].
+        is_lts_row: Per-step mask for `v0.1.1+` or legacy `v0.1.0` LTS rows.
+        missing_prim_th: Per-step mask where primary thermal power is missing.
     """
 
     n_rows: int
@@ -240,6 +268,265 @@ class PreprocessedHistory:
     cooling_or_tail: list[bool]
     hyd_k_hx_wk: float
     hyd_k_hx_kt: float
+    p_wp_raw_el_w: list[float] = dataclasses.field(default_factory=list)
+    is_lts_row: list[bool] = dataclasses.field(default_factory=list)
+    missing_prim_th: list[bool] = dataclasses.field(default_factory=list)
+    _tape_wk: PrecomputedZoneTape | None = dataclasses.field(
+        default=None, repr=False, compare=False
+    )
+    _tape_kt: PrecomputedZoneTape | None = dataclasses.field(
+        default=None, repr=False, compare=False
+    )
+
+
+def detect_lts_and_missing_prim_rows(
+    columns: Mapping[str, Sequence[float | int]],
+) -> tuple[list[bool], list[bool]]:
+    """Detects `v0.1.1+` / legacy `v0.1.0` LTS rows and missing `p_prim_th_w`.
+
+    Args:
+        columns: RingBuffer column sequences.
+
+    Returns:
+        A tuple `(is_lts_row, missing_prim_th)` of equal-length boolean lists.
+    """
+    if "ts_utc" in columns:
+        n = len(columns["ts_utc"])
+    elif columns:
+        n = min(len(v) for v in columns.values())
+    else:
+        return [], []
+    if n == 0:
+        return [], []
+
+    is_lts_row: list[bool] = [False] * n
+    flags_seq = columns.get("flags")
+    if flags_seq is not None:
+        lim_f = min(n, len(flags_seq))
+        for k in range(lim_f):
+            fv = flags_seq[k]
+            if fv is not None and (int(fv) & const.FLAG_LTS_BACKFILL) != 0:
+                is_lts_row[k] = True
+
+    ts_seq = columns.get("ts_utc")
+    if ts_seq is not None and n >= 13:
+        wea_seq = columns.get("t_out_weather_c")
+        valve_seqs = [
+            columns[c]
+            for c in _LEGACY_LTS_UPSTAIRS_VALVE_COLS
+            if c in columns
+        ]
+        indep_seqs: list[Sequence[float | int]] = []
+        for ch_name in _LEGACY_LTS_INDEP_CHANNELS:
+            if ch_name in columns:
+                indep_seqs.append(columns[ch_name])
+            elif ch_name == "t_air_kantoor_c" and "t_air_kt_c" in columns:
+                indep_seqs.append(columns["t_air_kt_c"])
+
+        detected_k0: set[int] = set()
+        flat_candidate_k0: set[int] = set()
+
+        for k0 in range(0, n - 12):
+            ts0 = int(ts_seq[k0])
+            if ts0 % 3600 != 0:
+                continue
+            grid_ok = True
+            for j in range(1, 13):
+                if int(ts_seq[k0 + j]) - int(ts_seq[k0 + j - 1]) != 300:
+                    grid_ok = False
+                    break
+            if not grid_ok:
+                continue
+
+            abc_ok = True
+            if flags_seq is not None:
+                for m in range(k0, k0 + 13):
+                    if m < len(flags_seq) and flags_seq[m] is not None:
+                        if (int(flags_seq[m]) & _LEGACY_LTS_ACCUM_FLAGS) != 0:
+                            abc_ok = False
+                            break
+            if abc_ok and wea_seq is not None:
+                for m in range(k0, k0 + 13):
+                    if m < len(wea_seq) and wea_seq[m] is not None:
+                        if math.isfinite(float(wea_seq[m])):
+                            abc_ok = False
+                            break
+            if abc_ok:
+                for vseq in valve_seqs:
+                    for m in range(k0, k0 + 13):
+                        if m >= len(vseq) or vseq[m] is None:
+                            abc_ok = False
+                            break
+                        vf = float(vseq[m])
+                        if not math.isfinite(vf) or abs(vf) > 1e-9:
+                            abc_ok = False
+                            break
+                    if not abc_ok:
+                        break
+            if not abc_ok:
+                continue
+
+            n_changing = 0
+            all_changing_linear = True
+            for yseq in indep_seqs:
+                if k0 + 12 >= len(yseq):
+                    continue
+                y0_raw = yseq[k0]
+                y12_raw = yseq[k0 + 12]
+                if y0_raw is None or y12_raw is None:
+                    continue
+                y0 = float(y0_raw)
+                y12 = float(y12_raw)
+                if not (math.isfinite(y0) and math.isfinite(y12)):
+                    continue
+                if abs(y12 - y0) > 1e-3:
+                    n_changing += 1
+                    vals_13 = [0.0] * 13
+                    valid_13 = True
+                    for j in range(13):
+                        vj_raw = yseq[k0 + j]
+                        if vj_raw is None:
+                            valid_13 = False
+                            break
+                        vj = float(vj_raw)
+                        if not math.isfinite(vj):
+                            valid_13 = False
+                            break
+                        vals_13[j] = vj
+                    if not valid_13:
+                        all_changing_linear = False
+                        break
+                    tol = max(
+                        1e-5,
+                        4e-6 * max(1.0, abs(vals_13[0]), abs(vals_13[12])),
+                    )
+                    for j in range(1, 12):
+                        sec_diff = abs(
+                            vals_13[j + 1] - 2.0 * vals_13[j] + vals_13[j - 1]
+                        )
+                        if sec_diff >= tol:
+                            all_changing_linear = False
+                            break
+                    if not all_changing_linear:
+                        break
+
+            if n_changing >= 2 and all_changing_linear:
+                detected_k0.add(k0)
+            elif all_changing_linear:
+                flat_candidate_k0.add(k0)
+
+        bridged_k0: set[int] = set()
+        visited_flat: set[int] = set()
+        for k0 in sorted(flat_candidate_k0):
+            if k0 in visited_flat:
+                continue
+            run: list[int] = []
+            cur = k0
+            while cur in flat_candidate_k0:
+                visited_flat.add(cur)
+                run.append(cur)
+                cur += 12
+            if (k0 - 12) in detected_k0 and cur in detected_k0:
+                bridged_k0.update(run)
+
+        for k0 in detected_k0 | bridged_k0:
+            for m in range(k0, k0 + 13):
+                is_lts_row[m] = True
+
+    p_prim_seq = columns.get("p_prim_th_w")
+    has_both_wp_temps = ("t_wp_out_c" in columns) and ("t_wp_in_c" in columns)
+    wp_out_seq = columns.get("t_wp_out_c") if has_both_wp_temps else None
+    wp_in_seq = columns.get("t_wp_in_c") if has_both_wp_temps else None
+
+    missing_prim_th: list[bool] = [False] * n
+    for k in range(n):
+        if is_lts_row[k]:
+            missing_prim_th[k] = True
+            continue
+        if p_prim_seq is None or k >= len(p_prim_seq):
+            missing_prim_th[k] = True
+            continue
+        pv = p_prim_seq[k]
+        if pv is None or not math.isfinite(float(pv)):
+            missing_prim_th[k] = True
+            continue
+        if wp_out_seq is not None and wp_in_seq is not None:
+            if k >= len(wp_out_seq) or k >= len(wp_in_seq):
+                missing_prim_th[k] = True
+                continue
+            vo = wp_out_seq[k]
+            vi = wp_in_seq[k]
+            if (
+                vo is None
+                or vi is None
+                or not math.isfinite(float(vo))
+                or not math.isfinite(float(vi))
+            ):
+                missing_prim_th[k] = True
+
+    return is_lts_row, missing_prim_th
+
+
+def compute_train_holdout_split(
+    columns: Mapping[str, Sequence[float | int]],
+    *,
+    is_lts_row: Sequence[bool] | None = None,
+) -> int:
+    """Computes raw-aware chronological `train_end` split index.
+
+    Ensures both the training slice `[0, train_end)` and the out-of-sample
+    holdout slice `[train_end, n_total)` contain genuine non-LTS Recorder rows
+    whenever `>= 4` days of non-LTS telemetry are available.
+
+    Args:
+        columns: Full RingBuffer column sequences.
+        is_lts_row: Optional precomputed boolean mask of LTS rows matching
+            `len(columns["ts_utc"])`.
+
+    Returns:
+        Exclusive end index `train_end` for the training slice.
+    """
+    ts_seq = columns.get("ts_utc", ())
+    n_total = len(ts_seq)
+    if n_total == 0:
+        return 0
+
+    if is_lts_row is not None and len(is_lts_row) == n_total:
+        is_lts = is_lts_row
+    else:
+        is_lts = detect_lts_and_missing_prim_rows(columns)[0]
+
+    n_raw = 0
+    first_raw_idx = n_total
+    for i, lts_flag in enumerate(is_lts):
+        if not lts_flag:
+            if first_raw_idx == n_total:
+                first_raw_idx = i
+            n_raw += 1
+
+    # Case A: >= 28 days of raw Recorder data -> standard 14-day holdout.
+    if n_raw >= 28 * const.STEPS_PER_DAY:
+        return n_total - EVAL_14D_STEPS
+
+    # Case B: 4..28 days of raw data -> 65/35 split on the non-LTS tail.
+    if n_raw >= 4 * const.STEPS_PER_DAY:
+        holdout_raw = max(2 * const.STEPS_PER_DAY, int(round(0.35 * n_raw)))
+        holdout_cap = min(
+            EVAL_14D_STEPS,
+            max(const.STEPS_PER_DAY, n_raw - 2 * const.STEPS_PER_DAY),
+        )
+        holdout_raw = min(holdout_raw, holdout_cap)
+        return max(first_raw_idx + 1, n_total - holdout_raw)
+
+    # Case C: < 4 days of raw data -> total-length fallback.
+    if n_total >= 28 * const.STEPS_PER_DAY:
+        return n_total - EVAL_14D_STEPS
+    if n_total >= 4 * const.STEPS_PER_DAY:
+        train_end = max(2 * const.STEPS_PER_DAY, int(0.70 * n_total))
+        if n_total - train_end < HORIZON_6H_STEPS + 24:
+            train_end = n_total - (HORIZON_6H_STEPS + 24)
+        return train_end
+    return n_total
 
 
 def slice_columns(
@@ -332,6 +619,7 @@ def preprocess_history_columns(
     t_sup_sec_c: list[float] = [20.0] * n
     f_comp_hz: list[float] = [0.0] * n
     p_prim_th_w: list[float] = [0.0] * n
+    p_wp_raw_el_w: list[float] = [0.0] * n
     q_fh_wk_hyd_w: list[float] = [0.0] * n
     q_fh_kt_hyd_w: list[float] = [0.0] * n
     q_sec_tot_w: list[float] = [0.0] * n
@@ -347,19 +635,159 @@ def preprocess_history_columns(
     hm_ema_c: float | None = None
     interfloor_cache: dict[str, tuple[float, int]] = {}
     desk_state: dict[str, Any] = {}
-    t_floor_wk_running: float = _col_at(columns, "t_air_wk_c", 0, 19.5) + 0.8
-    t_floor_kt_running: float = (
-        _col_at(columns, "t_air_kantoor_c", 0, 19.0, "t_air_kt_c") + 0.5
-    )
+    def _prep_col(
+        key: str,
+        default: float,
+        alt_key: str | None = None,
+    ) -> list[float]:
+        seq = columns.get(key)
+        if seq is None and alt_key is not None:
+            seq = columns.get(alt_key)
+        if seq is None:
+            return [default] * n
+        m_len = len(seq)
+        pos_inf = math.inf
+        neg_inf = -math.inf
+        out = [default] * n
+        lim = min(n, m_len)
+        for i in range(lim):
+            v = seq[i]
+            if v is not None:
+                fv = float(v)
+                if fv == fv and fv != pos_inf and fv != neg_inf:
+                    out[i] = fv
+        return out
 
     flags_seq = columns.get("flags")
     surf_seq = columns.get("t_floor_surf_meas_wk_c")
     bg_sup_seq = columns.get("t_bg_sup_c")
     bg_ret_seq = columns.get("t_bg_ret_c")
     desk_seq = columns.get("p_desk_kt_w")
+    t_dak_seq = columns.get("t_out_dak_c")
+    t_wea_seq = columns.get("t_out_weather_c")
+    t_hm_seq = columns.get("t_out_hm_c")
+    t_out_direct_seq = columns.get("t_out_c")
+    pv_seq = columns.get("p_pv_w")
+    has_preproj_sol = (
+        "i_sol_wk_wm2" in columns
+        and "i_sol_kt_wm2" in columns
+        and pv_seq is None
+    )
+
+    v_wind_raw = _prep_col("v_wind_ms", 3.0)
+    pv_fc_raw = _prep_col("p_pv_forecast_w", 0.0)
+    epex_raw = _prep_col("epex_eur_kwh", 0.20)
+    scr_s_raw = _prep_col("screen_small_pos", 100.0)
+    scr_l_raw = _prep_col("screen_large_pos", 100.0)
+    i_wk_in = _prep_col("i_sol_wk_wm2", 0.0) if has_preproj_sol else []
+    i_kt_in = _prep_col("i_sol_kt_wm2", 0.0) if has_preproj_sol else []
+    tau_scr_in = _prep_col("tau_screen_wk", 1.0) if has_preproj_sol else []
+
+    t_air_wk_c = _prep_col("t_air_wk_c", 19.5)
+    t_air_kt_c = _prep_col("t_air_kantoor_c", 19.0, "t_air_kt_c")
+    t_slaap_col = _prep_col("t_air_slaapkamer_c", 18.0)
+    t_bad_col = _prep_col("t_air_badkamer_c", 18.5)
+    t_werk1e_col = _prep_col("t_air_werkkamer_1e_c", 18.0)
+    t_mid1e_col = _prep_col("t_air_kamer_1e_midden_c", 18.0)
+    t_zuid1e_col = _prep_col("t_air_kamer_1e_zuid_c", 18.0)
+    t_badbov_col = _prep_col("t_air_badkamer_boven_c", 18.0)
+    t_logeer_col = _prep_col("t_air_logeerkamer_c", 17.5)
+
+    u_bg_raw = _prep_col("u_eff_bg", 0.0, "u_eff_wk")
+    u_kt_raw = _prep_col("u_eff_kantoor", 0.0, "u_eff_kt")
+    u_pump_raw = _prep_col("u_pump_sec", 0.0)
+    u_slaap_col = _prep_col("u_eff_slaapkamer", 0.0)
+    u_bad_col = _prep_col("u_eff_badkamer", 0.0)
+    u_werk1e_col = _prep_col("u_eff_werkkamer_1e", 0.0)
+    u_mid1e_col = _prep_col("u_eff_kamer_1e_midden", 0.0)
+    u_zuid1e_col = _prep_col("u_eff_kamer_1e_zuid", 0.0)
+    u_badbov_col = _prep_col("u_eff_badkamer_boven", 0.0)
+    u_logeer_col = _prep_col("u_eff_logeerkamer", 0.0)
+
+    v_prim_raw = _prep_col("v_prim_l_min", 0.0)
+    p_prim_th_w = _prep_col("p_prim_th_w", 0.0)
+    f_comp_raw = _prep_col("f_comp_hz", 0.0)
+    p_wp_raw_in = _prep_col("p_wp_raw_el_w", 0.0)
+
+    has_q_fh_wk_col = "q_fh_wk_w" in columns
+    has_q_fh_kt_col = "q_fh_kt_w" in columns
+    q_fh_wk_in = _prep_col("q_fh_wk_w", 0.0) if has_q_fh_wk_col else []
+    q_fh_kt_in = _prep_col("q_fh_kt_w", 0.0) if has_q_fh_kt_col else []
+
+    def _prep_col_fb(
+        key: str,
+        fb_arr: Sequence[float],
+        offset: float = 0.0,
+        alt_key: str | None = None,
+    ) -> list[float]:
+        seq = columns.get(key)
+        if seq is None and alt_key is not None:
+            seq = columns.get(alt_key)
+        if seq is None:
+            return (
+                list(fb_arr)
+                if offset == 0.0
+                else [v + offset for v in fb_arr]
+            )
+        m_len = len(seq)
+        pos_inf = math.inf
+        neg_inf = -math.inf
+        out = [0.0] * n
+        for i in range(n):
+            if i < m_len:
+                v = seq[i]
+                if v is not None:
+                    fv = float(v)
+                    if fv == fv and fv != pos_inf and fv != neg_inf:
+                        out[i] = fv
+                        continue
+            out[i] = fb_arr[i] + offset
+        return out
+
+    t_top_e_col = _prep_col("t_buf_top_end_c", 22.0, "t_buf_top_c")
+    t_top_s_col = _prep_col_fb("t_buf_top_start_c", t_top_e_col)
+    t_bot_e_col = _prep_col_fb(
+        "t_buf_bot_end_c", t_top_e_col, -1.0, "t_buf_bot_c"
+    )
+    t_bot_s_col = _prep_col_fb("t_buf_bot_start_c", t_bot_e_col)
+
+    p_ac_raw = _prep_col("p_el_ac_kt_w", 0.0)
+    ac_mode_code = _prep_col("ac_mode_code", 0.0)
+    pir_occ_kt = _prep_col("pir_occ_kt", 0.0)
+    p_grow_raw = _prep_col("p_growlights_kt_w", 0.0)
+    d_est_col_wk_w = _prep_col("d_est_wk_w", 0.0)
+    d_est_col_kt_w = _prep_col("d_est_kt_w", 0.0)
+
+    t_floor_wk_running: float = (t_air_wk_c[0] if n > 0 else 19.5) + 0.8
+    t_floor_kt_running: float = (t_air_kt_c[0] if n > 0 else 19.0) + 0.5
+
     default_flags = (
         const.FLAG_VALID_WK | const.FLAG_VALID_KT | const.FLAG_AANWEZIG
     )
+    c_wk_j = 3600.0 * house_config.DAY1_PRIORS_WK.c_floor_wh_k
+    h_fh_wk = 1000.0 / house_config.DAY1_PRIORS_WK.r_fh_k_kw
+    c_kt_j = 3600.0 * house_config.DAY1_PRIORS_KT.c_floor_wh_k
+    h_fh_kt = 1000.0 / house_config.DAY1_PRIORS_KT.r_fh_k_kw
+    buf_bot_off = house_config.BUF_BOT_SENSOR_OFFSET_C
+    baseload_wk = house_config.BASELOAD_WK_W
+    ac_cool_modes = (int(const.AC_MODE_COOL), int(const.AC_MODE_DRY))
+    cool_flags_mask = const.FLAG_FLOOR_COOL | const.FLAG_AC_COOL_KT
+
+    room_temps: dict[str, float | None] = {
+        "wk": 19.5,
+        "gang": 18.7,
+        "slaapkamer": 18.0,
+        "badkamer": 18.5,
+        "werkkamer_1e": 18.0,
+        "kamer_1e_midden": 18.0,
+        "kamer_1e_zuid": 18.0,
+        "kantoor": 19.0,
+        "badkamer_boven": 18.0,
+        "logeerkamer": 17.5,
+    }
+    u_valves: dict[str, float] = {
+        g: 0.0 for g in const.ALL_HYDRAULIC_GROUPS
+    }
 
     for k in range(n):
         ts_k = int(ts_seq[k])
@@ -376,22 +804,28 @@ def preprocess_history_columns(
             dt_s[k] = diff if 1.0 <= diff <= 86400.0 else float(const.DT_STEP_S)
 
         t_dak = (
-            _opt_float(columns["t_out_dak_c"][k])
-            if "t_out_dak_c" in columns and k < len(columns["t_out_dak_c"])
+            _opt_float(t_dak_seq[k])
+            if t_dak_seq is not None and k < len(t_dak_seq)
             else None
         )
         t_wea = (
-            _opt_float(columns["t_out_weather_c"][k])
-            if "t_out_weather_c" in columns and k < len(columns["t_out_weather_c"])
+            _opt_float(t_wea_seq[k])
+            if t_wea_seq is not None and k < len(t_wea_seq)
             else None
         )
         t_hm = (
-            _opt_float(columns["t_out_hm_c"][k])
-            if "t_out_hm_c" in columns and k < len(columns["t_out_hm_c"])
+            _opt_float(t_hm_seq[k])
+            if t_hm_seq is not None and k < len(t_hm_seq)
             else None
         )
-        if t_dak is None and t_wea is None and t_hm is None and "t_out_c" in columns:
-            t_dak = _opt_float(columns["t_out_c"][k])
+        if (
+            t_dak is None
+            and t_wea is None
+            and t_hm is None
+            and t_out_direct_seq is not None
+            and k < len(t_out_direct_seq)
+        ):
+            t_dak = _opt_float(t_out_direct_seq[k])
         if t_hm is not None:
             hm_ema_c = (
                 t_hm if hm_ema_c is None else (t_hm / 6.0) + (5.0 / 6.0) * hm_ema_c
@@ -405,120 +839,85 @@ def preprocess_history_columns(
             lon_deg=lon_deg,
         )
         t_out_c[k] = t_out_k
-        v_wind_ms[k] = max(0.0, _col_at(columns, "v_wind_ms", k, 3.0))
+        vw_k = v_wind_raw[k]
+        v_wind_ms[k] = vw_k if vw_k > 0.0 else 0.0
 
         pv_fb_flag = bool(fl_k & const.FLAG_PV_FALLBACK)
-        if "p_pv_w" in columns and k < len(columns["p_pv_w"]):
-            raw_pv = columns["p_pv_w"][k]
-            p_pv_k = math.nan if raw_pv is None else float(raw_pv)
-        else:
-            p_pv_k = 0.0
-        p_pv_fc_k = _col_at(columns, "p_pv_forecast_w", k, 0.0)
-        epex_k = _col_at(columns, "epex_eur_kwh", k, 0.20)
-        scr_s = _col_at(columns, "screen_small_pos", k, 100.0)
-        scr_l = _col_at(columns, "screen_large_pos", k, 100.0)
-
-        if (
-            "i_sol_wk_wm2" in columns
-            and "i_sol_kt_wm2" in columns
-            and "p_pv_w" not in columns
-        ):
-            i_wk = _col_at(columns, "i_sol_wk_wm2", k, 0.0)
-            i_kt = _col_at(columns, "i_sol_kt_wm2", k, 0.0)
-            tau_scr = _col_at(columns, "tau_screen_wk", k, 1.0)
+        if has_preproj_sol:
+            i_wk = i_wk_in[k]
+            i_kt = i_kt_in[k]
+            tau_scr = tau_scr_in[k]
             pv_fb = pv_fb_flag
         else:
+            if pv_seq is not None and k < len(pv_seq):
+                raw_pv = pv_seq[k]
+                p_pv_k = math.nan if raw_pv is None else float(raw_pv)
+            else:
+                p_pv_k = 0.0
             i_wk, i_kt, tau_scr, pv_fb = solar_weather.project_solar_irradiance(
                 ts_utc=ts_k,
                 p_pv_w=p_pv_k,
-                p_pv_forecast_w=p_pv_fc_k,
-                epex_eur_kwh=epex_k,
-                screen_small_pos=scr_s,
-                screen_large_pos=scr_l,
+                p_pv_forecast_w=pv_fc_raw[k],
+                epex_eur_kwh=epex_raw[k],
+                screen_small_pos=scr_s_raw[k],
+                screen_large_pos=scr_l_raw[k],
                 pv_stale=pv_fb_flag,
                 lat_deg=lat_deg,
                 lon_deg=lon_deg,
             )
-        i_sol_wk_wm2[k] = max(0.0, i_wk)
-        i_sol_kt_wm2[k] = max(0.0, i_kt)
+        i_sol_wk_wm2[k] = i_wk if i_wk > 0.0 else 0.0
+        i_sol_kt_wm2[k] = i_kt if i_kt > 0.0 else 0.0
         tau_screen_wk[k] = tau_scr
-        pv_fallback[k] = pv_fb or pv_fb_flag
-        if pv_fallback[k]:
+        pv_fb_k = pv_fb or pv_fb_flag
+        pv_fallback[k] = pv_fb_k
+        if pv_fb_k:
             flags[k] |= const.FLAG_PV_FALLBACK
 
-        t_wk = _col_at(columns, "t_air_wk_c", k, 19.5)
-        t_kt = _col_at(columns, "t_air_kantoor_c", k, 19.0, "t_air_kt_c")
-        t_air_wk_c[k] = t_wk
-        t_air_kt_c[k] = t_kt
-        room_temps: dict[str, float | None] = {
-            "wk": t_wk,
-            "gang": t_wk - 0.8,
-            "slaapkamer": _col_at(columns, "t_air_slaapkamer_c", k, 18.0),
-            "badkamer": _col_at(columns, "t_air_badkamer_c", k, 18.5),
-            "werkkamer_1e": _col_at(columns, "t_air_werkkamer_1e_c", k, 18.0),
-            "kamer_1e_midden": _col_at(
-                columns, "t_air_kamer_1e_midden_c", k, 18.0
-            ),
-            "kamer_1e_zuid": _col_at(
-                columns, "t_air_kamer_1e_zuid_c", k, 18.0
-            ),
-            "kantoor": t_kt,
-            "badkamer_boven": _col_at(columns, "t_air_badkamer_boven_c", k, 18.0),
-            "logeerkamer": _col_at(columns, "t_air_logeerkamer_c", k, 17.5),
-        }
+        t_wk = t_air_wk_c[k]
+        t_kt = t_air_kt_c[k]
+        room_temps["wk"] = t_wk
+        room_temps["gang"] = t_wk - 0.8
+        room_temps["slaapkamer"] = t_slaap_col[k]
+        room_temps["badkamer"] = t_bad_col[k]
+        room_temps["werkkamer_1e"] = t_werk1e_col[k]
+        room_temps["kamer_1e_midden"] = t_mid1e_col[k]
+        room_temps["kamer_1e_zuid"] = t_zuid1e_col[k]
+        room_temps["kantoor"] = t_kt
+        room_temps["badkamer_boven"] = t_badbov_col[k]
+        room_temps["logeerkamer"] = t_logeer_col[k]
 
-        u_bg = min(1.0, max(0.0, _col_at(columns, "u_eff_bg", k, 0.0, "u_eff_wk")))
-        u_kt_v = min(
-            1.0, max(0.0, _col_at(columns, "u_eff_kantoor", k, 0.0, "u_eff_kt"))
-        )
-        u_pump = min(1.0, max(0.0, _col_at(columns, "u_pump_sec", k, 0.0)))
+        u_bg = min(1.0, max(0.0, u_bg_raw[k]))
+        u_kt_v = min(1.0, max(0.0, u_kt_raw[k]))
+        u_pump = min(1.0, max(0.0, u_pump_raw[k]))
         u_pump_sec[k] = u_pump
         u_eff_wk[k] = u_bg
         u_eff_kt[k] = u_kt_v
 
-        u_valves: dict[str, float] = {
-            "wk": u_bg,
-            "gang": u_bg,
-            "slaapkamer": min(
-                1.0, max(0.0, _col_at(columns, "u_eff_slaapkamer", k, 0.0))
-            ),
-            "badkamer": min(
-                1.0, max(0.0, _col_at(columns, "u_eff_badkamer", k, 0.0))
-            ),
-            "werkkamer_1e": min(
-                1.0, max(0.0, _col_at(columns, "u_eff_werkkamer_1e", k, 0.0))
-            ),
-            "kamer_1e_midden": min(
-                1.0, max(0.0, _col_at(columns, "u_eff_kamer_1e_midden", k, 0.0))
-            ),
-            "kamer_1e_zuid": min(
-                1.0, max(0.0, _col_at(columns, "u_eff_kamer_1e_zuid", k, 0.0))
-            ),
-            "kantoor": u_kt_v,
-            "badkamer_boven": min(
-                1.0, max(0.0, _col_at(columns, "u_eff_badkamer_boven", k, 0.0))
-            ),
-            "logeerkamer": min(
-                1.0, max(0.0, _col_at(columns, "u_eff_logeerkamer", k, 0.0))
-            ),
-        }
+        u_valves["wk"] = u_bg
+        u_valves["gang"] = u_bg
+        u_valves["slaapkamer"] = min(1.0, max(0.0, u_slaap_col[k]))
+        u_valves["badkamer"] = min(1.0, max(0.0, u_bad_col[k]))
+        u_valves["werkkamer_1e"] = min(1.0, max(0.0, u_werk1e_col[k]))
+        u_valves["kamer_1e_midden"] = min(1.0, max(0.0, u_mid1e_col[k]))
+        u_valves["kamer_1e_zuid"] = min(1.0, max(0.0, u_zuid1e_col[k]))
+        u_valves["kantoor"] = u_kt_v
+        u_valves["badkamer_boven"] = min(1.0, max(0.0, u_badbov_col[k]))
+        u_valves["logeerkamer"] = min(1.0, max(0.0, u_logeer_col[k]))
 
         threeway_room = (fl_k & const.FLAG_DHW_TANK) == 0
         wp_defrost = bool(fl_k & const.FLAG_DEFROST_WP)
-        v_prim = max(0.0, _col_at(columns, "v_prim_l_min", k, 0.0))
-        p_prim = _col_at(columns, "p_prim_th_w", k, 0.0)
-        f_hz = max(0.0, _col_at(columns, "f_comp_hz", k, 0.0))
+        v_prim = max(0.0, v_prim_raw[k])
+        p_prim = p_prim_th_w[k]
+        f_hz = max(0.0, f_comp_raw[k])
         f_comp_hz[k] = f_hz
-        p_prim_th_w[k] = p_prim
+        p_wp_raw_el_w[k] = max(0.0, p_wp_raw_in[k])
 
-        t_top_e = _col_at(columns, "t_buf_top_end_c", k, 22.0, "t_buf_top_c")
-        t_top_s = _col_at(columns, "t_buf_top_start_c", k, t_top_e)
-        t_bot_e = _col_at(
-            columns, "t_buf_bot_end_c", k, t_top_e - 1.0, "t_buf_bot_c"
-        )
-        t_bot_s = _col_at(columns, "t_buf_bot_start_c", k, t_bot_e)
+        t_top_e = t_top_e_col[k]
+        t_top_s = t_top_s_col[k]
+        t_bot_e = t_bot_e_col[k]
+        t_bot_s = t_bot_s_col[k]
         t_buf_top_c[k] = t_top_e
-        t_buf_bot_cal_c[k] = t_bot_e + house_config.BUF_BOT_SENSOR_OFFSET_C
+        t_buf_bot_cal_c[k] = t_bot_e + buf_bot_off
 
         tf_wk_in = t_floor_wk_running
         tf_kt_in = t_floor_kt_running
@@ -534,8 +933,17 @@ def preprocess_history_columns(
             else None
         )
 
-        v_sec_tot = u_pump * sum(
-            u_valves[g] * flows[g] for g in const.ALL_HYDRAULIC_GROUPS
+        v_sec_tot = u_pump * (
+            u_valves["wk"] * flows["wk"]
+            + u_valves["gang"] * flows["gang"]
+            + u_valves["slaapkamer"] * flows["slaapkamer"]
+            + u_valves["badkamer"] * flows["badkamer"]
+            + u_valves["werkkamer_1e"] * flows["werkkamer_1e"]
+            + u_valves["kamer_1e_midden"] * flows["kamer_1e_midden"]
+            + u_valves["kamer_1e_zuid"] * flows["kamer_1e_zuid"]
+            + u_valves["kantoor"] * flows["kantoor"]
+            + u_valves["badkamer_boven"] * flows["badkamer_boven"]
+            + u_valves["logeerkamer"] * flows["logeerkamer"]
         )
         t_sup_sec_c[k] = hyd.compute_effective_supply_temp(
             threeway_room=threeway_room,
@@ -570,19 +978,19 @@ def preprocess_history_columns(
         q_tot = sum(hyd_res.q_fh_by_group_w.values())
 
         if (
-            "q_fh_wk_w" in columns
+            has_q_fh_wk_col
             and v_prim == 0.0
             and u_pump == 0.0
-            and _col_at(columns, "q_fh_wk_w", k, 0.0) > 0.0
+            and q_fh_wk_in[k] > 0.0
         ):
-            q_wk = _col_at(columns, "q_fh_wk_w", k, 0.0)
+            q_wk = q_fh_wk_in[k]
         if (
-            "q_fh_kt_w" in columns
+            has_q_fh_kt_col
             and v_prim == 0.0
             and u_pump == 0.0
-            and _col_at(columns, "q_fh_kt_w", k, 0.0) > 0.0
+            and q_fh_kt_in[k] > 0.0
         ):
-            q_kt = _col_at(columns, "q_fh_kt_w", k, 0.0)
+            q_kt = q_fh_kt_in[k]
 
         q_fh_wk_hyd_w[k] = q_wk
         q_fh_kt_hyd_w[k] = q_kt
@@ -590,14 +998,11 @@ def preprocess_history_columns(
         f_flow_wk[k] = hyd_res.f_flow_wk
         f_flow_kt[k] = hyd_res.f_flow_kt
 
-        c_wk_j = 3600.0 * house_config.DAY1_PRIORS_WK.c_floor_wh_k
-        h_fh_wk = 1000.0 / house_config.DAY1_PRIORS_WK.r_fh_k_kw
-        t_floor_wk_running = tf_wk_in + (dt_s[k] / c_wk_j) * (
+        dt_k = dt_s[k]
+        t_floor_wk_running = tf_wk_in + (dt_k / c_wk_j) * (
             q_wk - (tf_wk_in - t_wk) * h_fh_wk
         )
-        c_kt_j = 3600.0 * house_config.DAY1_PRIORS_KT.c_floor_wh_k
-        h_fh_kt = 1000.0 / house_config.DAY1_PRIORS_KT.r_fh_k_kw
-        t_floor_kt_running = tf_kt_in + (dt_s[k] / c_kt_j) * (
+        t_floor_kt_running = tf_kt_in + (dt_k / c_kt_j) * (
             q_kt - (tf_kt_in - t_kt) * h_fh_kt
         )
 
@@ -607,27 +1012,23 @@ def preprocess_history_columns(
             ts_utc=ts_k,
         )
         t_up_wk_c[k] = t_up_w
-        t_down_wk_c[k] = house_config.T_GROUND_MEAN_C
         t_down_kt_c[k] = t_dn_k
-        q_int_wk_w[k] = house_config.BASELOAD_WK_W + max(
-            0.0, hyd_res.q_leak_1e_to_wk_w
-        )
+        leak_w = hyd_res.q_leak_1e_to_wk_w
+        q_int_wk_w[k] = baseload_wk + (leak_w if leak_w > 0.0 else 0.0)
 
-        p_ac = max(0.0, _col_at(columns, "p_el_ac_kt_w", k, 0.0))
-        ac_mode = _col_at(columns, "ac_mode_code", k, 0.0)
+        p_ac = max(0.0, p_ac_raw[k])
+        ac_mode = ac_mode_code[k]
         p_desk_opt = (
             _opt_float(desk_seq[k], 0.0)
             if desk_seq is not None and k < len(desk_seq)
             else None
         )
-        pir_k = _col_at(columns, "pir_occ_kt", k, 0.0)
-        p_grow = max(0.0, _col_at(columns, "p_growlights_kt_w", k, 0.0))
+        pir_k = pir_occ_kt[k]
+        p_grow = max(0.0, p_grow_raw[k])
         ac_def = bool(fl_k & const.FLAG_DEFROST_AC)
 
         p_el_ac_kt_w[k] = p_ac
-        ac_mode_code[k] = ac_mode
         p_desk_kt_w[k] = p_desk_opt if p_desk_opt is not None else 0.0
-        pir_occ_kt[k] = pir_k
 
         q_int_k, q_ac_k = solar_weather.compute_internal_and_ac_loads_kt(
             p_desk_w=p_desk_opt,
@@ -639,22 +1040,17 @@ def preprocess_history_columns(
             t_out_c=t_out_k,
             eta_ac=eta_ref,
             desk_state=desk_state,
-            dt_s=dt_s[k],
+            dt_s=dt_k,
         )
         q_int_kt_w[k] = q_int_k
         q_ac_base_kt_w[k] = q_ac_k
 
-        t_surf_meas_wk_c[k] = (
-            _opt_float(surf_seq[k], 5.0)
-            if surf_seq is not None and k < len(surf_seq)
-            else None
-        )
-        d_est_col_wk_w[k] = _col_at(columns, "d_est_wk_w", k, 0.0)
-        d_est_col_kt_w[k] = _col_at(columns, "d_est_kt_w", k, 0.0)
+        if surf_seq is not None and k < len(surf_seq):
+            t_surf_meas_wk_c[k] = _opt_float(surf_seq[k], 5.0)
 
-        cooling_raw[k] = bool(
-            fl_k & (const.FLAG_FLOOR_COOL | const.FLAG_AC_COOL_KT)
-        ) or round(ac_mode) in (int(const.AC_MODE_COOL), int(const.AC_MODE_DRY))
+        cooling_raw[k] = bool(fl_k & cool_flags_mask) or (
+            round(ac_mode) in ac_cool_modes
+        )
 
     cooling_or_tail: list[bool] = [False] * n
     countdown = 0
@@ -664,6 +1060,8 @@ def preprocess_history_columns(
         if countdown > 0:
             cooling_or_tail[k] = True
             countdown -= 1
+
+    is_lts_row, missing_prim_th = detect_lts_and_missing_prim_rows(columns)
 
     return PreprocessedHistory(
         n_rows=n,
@@ -707,6 +1105,353 @@ def preprocess_history_columns(
         cooling_or_tail=cooling_or_tail,
         hyd_k_hx_wk=float(k_hx_map["wk"]),
         hyd_k_hx_kt=float(k_hx_map["kantoor"]),
+        p_wp_raw_el_w=p_wp_raw_el_w,
+        is_lts_row=is_lts_row,
+        missing_prim_th=missing_prim_th,
+    )
+
+
+def recompute_history_for_khx(
+    base_hist: PreprocessedHistory,
+    columns: Mapping[str, Sequence[float | int]],
+    flow_rates_l_min: Mapping[str, float] | None = None,
+    k_hx_by_group: Mapping[str, float] | None = None,
+) -> PreprocessedHistory:
+    """Recomputes only hydraulic fields on `base_hist` for updated `k_hx`."""
+    n = base_hist.n_rows
+    flows = dict(const.DEFAULT_FLOW_RATES_L_MIN)
+    if flow_rates_l_min is not None:
+        flows.update({k: float(v) for k, v in flow_rates_l_min.items()})
+
+    k_hx_map = dict(house_config.DAY1_K_HX_BY_GROUP_W_K)
+    if k_hx_by_group is not None:
+        for group_name, val in k_hx_by_group.items():
+            target_key = "kantoor" if group_name == "kt" else group_name
+            k_hx_map[target_key] = float(val)
+
+    if (
+        abs(base_hist.hyd_k_hx_wk - float(k_hx_map["wk"])) <= 1e-9
+        and abs(base_hist.hyd_k_hx_kt - float(k_hx_map["kantoor"])) <= 1e-9
+    ):
+        return base_hist
+
+    hyd = hydraulics.HydraulicModel(
+        flow_rates_l_min=flows, k_hx_by_group_w_k=k_hx_map
+    )
+
+    def _pcol(
+        key: str, default: float, alt_key: str | None = None
+    ) -> list[float]:
+        seq = columns.get(key)
+        if seq is None and alt_key is not None:
+            seq = columns.get(alt_key)
+        if seq is None:
+            return [default] * n
+        m_len = len(seq)
+        pos_inf = math.inf
+        neg_inf = -math.inf
+        out = [default] * n
+        lim = min(n, m_len)
+        for i in range(lim):
+            v = seq[i]
+            if v is not None:
+                fv = float(v)
+                if fv == fv and fv != pos_inf and fv != neg_inf:
+                    out[i] = fv
+        return out
+
+    def _pcol_fb(
+        key: str,
+        fb_arr: Sequence[float],
+        offset: float = 0.0,
+        alt_key: str | None = None,
+    ) -> list[float]:
+        seq = columns.get(key)
+        if seq is None and alt_key is not None:
+            seq = columns.get(alt_key)
+        if seq is None:
+            return (
+                list(fb_arr)
+                if offset == 0.0
+                else [v + offset for v in fb_arr]
+            )
+        m_len = len(seq)
+        pos_inf = math.inf
+        neg_inf = -math.inf
+        out = [0.0] * n
+        for i in range(n):
+            if i < m_len:
+                v = seq[i]
+                if v is not None:
+                    fv = float(v)
+                    if fv == fv and fv != pos_inf and fv != neg_inf:
+                        out[i] = fv
+                        continue
+            out[i] = fb_arr[i] + offset
+        return out
+
+    t_slaap_col = _pcol("t_air_slaapkamer_c", 18.0)
+    t_bad_col = _pcol("t_air_badkamer_c", 18.5)
+    t_werk1e_col = _pcol("t_air_werkkamer_1e_c", 18.0)
+    t_mid1e_col = _pcol("t_air_kamer_1e_midden_c", 18.0)
+    t_zuid1e_col = _pcol("t_air_kamer_1e_zuid_c", 18.0)
+    t_badbov_col = _pcol("t_air_badkamer_boven_c", 18.0)
+    t_logeer_col = _pcol("t_air_logeerkamer_c", 17.5)
+
+    u_slaap_col = _pcol("u_eff_slaapkamer", 0.0)
+    u_bad_col = _pcol("u_eff_badkamer", 0.0)
+    u_werk1e_col = _pcol("u_eff_werkkamer_1e", 0.0)
+    u_mid1e_col = _pcol("u_eff_kamer_1e_midden", 0.0)
+    u_zuid1e_col = _pcol("u_eff_kamer_1e_zuid", 0.0)
+    u_badbov_col = _pcol("u_eff_badkamer_boven", 0.0)
+    u_logeer_col = _pcol("u_eff_logeerkamer", 0.0)
+
+    v_prim_raw = _pcol("v_prim_l_min", 0.0)
+    has_q_fh_wk_col = "q_fh_wk_w" in columns
+    has_q_fh_kt_col = "q_fh_kt_w" in columns
+    q_fh_wk_in = _pcol("q_fh_wk_w", 0.0) if has_q_fh_wk_col else []
+    q_fh_kt_in = _pcol("q_fh_kt_w", 0.0) if has_q_fh_kt_col else []
+
+    t_top_e_col = list(base_hist.t_buf_top_c)
+    t_top_s_col = _pcol_fb("t_buf_top_start_c", t_top_e_col)
+    t_bot_e_col = _pcol_fb(
+        "t_buf_bot_end_c", t_top_e_col, -1.0, "t_buf_bot_c"
+    )
+    t_bot_s_col = _pcol_fb("t_buf_bot_start_c", t_bot_e_col)
+    bg_sup_seq = columns.get("t_bg_sup_c")
+    bg_ret_seq = columns.get("t_bg_ret_c")
+
+    t_sup_sec_c: list[float] = [20.0] * n
+    q_fh_wk_hyd_w: list[float] = [0.0] * n
+    q_fh_kt_hyd_w: list[float] = [0.0] * n
+    q_sec_tot_w: list[float] = [0.0] * n
+    f_flow_wk: list[float] = [0.0] * n
+    f_flow_kt: list[float] = [0.0] * n
+    q_int_wk_w: list[float] = [house_config.BASELOAD_WK_W] * n
+
+    t_air_wk_c = base_hist.t_air_wk_c
+    t_air_kt_c = base_hist.t_air_kt_c
+    u_pump_sec = base_hist.u_pump_sec
+    u_eff_wk = base_hist.u_eff_wk
+    u_eff_kt = base_hist.u_eff_kt
+    flags = base_hist.flags
+    dt_s = base_hist.dt_s
+    p_prim_th_w = base_hist.p_prim_th_w
+    f_comp_hz = base_hist.f_comp_hz
+
+    t_floor_wk_running: float = (t_air_wk_c[0] if n > 0 else 19.5) + 0.8
+    t_floor_kt_running: float = (t_air_kt_c[0] if n > 0 else 19.0) + 0.5
+    c_wk_j = 3600.0 * house_config.DAY1_PRIORS_WK.c_floor_wh_k
+    h_fh_wk = 1000.0 / house_config.DAY1_PRIORS_WK.r_fh_k_kw
+    c_kt_j = 3600.0 * house_config.DAY1_PRIORS_KT.c_floor_wh_k
+    h_fh_kt = 1000.0 / house_config.DAY1_PRIORS_KT.r_fh_k_kw
+    baseload_wk = house_config.BASELOAD_WK_W
+
+    room_temps: dict[str, float | None] = {
+        "wk": 19.5,
+        "gang": 18.7,
+        "slaapkamer": 18.0,
+        "badkamer": 18.5,
+        "werkkamer_1e": 18.0,
+        "kamer_1e_midden": 18.0,
+        "kamer_1e_zuid": 18.0,
+        "kantoor": 19.0,
+        "badkamer_boven": 18.0,
+        "logeerkamer": 17.5,
+    }
+    u_valves: dict[str, float] = {
+        g: 0.0 for g in const.ALL_HYDRAULIC_GROUPS
+    }
+
+    for k in range(n):
+        fl_k = flags[k]
+        t_wk = t_air_wk_c[k]
+        t_kt = t_air_kt_c[k]
+        room_temps["wk"] = t_wk
+        room_temps["gang"] = t_wk - 0.8
+        room_temps["slaapkamer"] = t_slaap_col[k]
+        room_temps["badkamer"] = t_bad_col[k]
+        room_temps["werkkamer_1e"] = t_werk1e_col[k]
+        room_temps["kamer_1e_midden"] = t_mid1e_col[k]
+        room_temps["kamer_1e_zuid"] = t_zuid1e_col[k]
+        room_temps["kantoor"] = t_kt
+        room_temps["badkamer_boven"] = t_badbov_col[k]
+        room_temps["logeerkamer"] = t_logeer_col[k]
+
+        u_bg = u_eff_wk[k]
+        u_kt_v = u_eff_kt[k]
+        u_pump = u_pump_sec[k]
+        u_valves["wk"] = u_bg
+        u_valves["gang"] = u_bg
+        u_valves["slaapkamer"] = min(1.0, max(0.0, u_slaap_col[k]))
+        u_valves["badkamer"] = min(1.0, max(0.0, u_bad_col[k]))
+        u_valves["werkkamer_1e"] = min(1.0, max(0.0, u_werk1e_col[k]))
+        u_valves["kamer_1e_midden"] = min(1.0, max(0.0, u_mid1e_col[k]))
+        u_valves["kamer_1e_zuid"] = min(1.0, max(0.0, u_zuid1e_col[k]))
+        u_valves["kantoor"] = u_kt_v
+        u_valves["badkamer_boven"] = min(1.0, max(0.0, u_badbov_col[k]))
+        u_valves["logeerkamer"] = min(1.0, max(0.0, u_logeer_col[k]))
+
+        threeway_room = (fl_k & const.FLAG_DHW_TANK) == 0
+        wp_defrost = bool(fl_k & const.FLAG_DEFROST_WP)
+        v_prim = max(0.0, v_prim_raw[k])
+        t_top_e = t_top_e_col[k]
+        t_bot_e = t_bot_e_col[k]
+        tf_wk_in = t_floor_wk_running
+        tf_kt_in = t_floor_kt_running
+
+        t_bg_sup = (
+            _opt_float(bg_sup_seq[k], 5.0)
+            if bg_sup_seq is not None and k < len(bg_sup_seq)
+            else None
+        )
+        t_bg_ret = (
+            _opt_float(bg_ret_seq[k], 5.0)
+            if bg_ret_seq is not None and k < len(bg_ret_seq)
+            else None
+        )
+
+        v_sec_tot = u_pump * (
+            u_valves["wk"] * flows["wk"]
+            + u_valves["gang"] * flows["gang"]
+            + u_valves["slaapkamer"] * flows["slaapkamer"]
+            + u_valves["badkamer"] * flows["badkamer"]
+            + u_valves["werkkamer_1e"] * flows["werkkamer_1e"]
+            + u_valves["kamer_1e_midden"] * flows["kamer_1e_midden"]
+            + u_valves["kamer_1e_zuid"] * flows["kamer_1e_zuid"]
+            + u_valves["kantoor"] * flows["kantoor"]
+            + u_valves["badkamer_boven"] * flows["badkamer_boven"]
+            + u_valves["logeerkamer"] * flows["logeerkamer"]
+        )
+        t_sup_sec_c[k] = hyd.compute_effective_supply_temp(
+            threeway_room=threeway_room,
+            v_prim_l_min=v_prim,
+            v_sec_total_l_min=v_sec_tot,
+            t_buf_top_c=t_top_e,
+            t_buf_bot_raw_c=t_bot_e,
+        )
+        hyd_res = hyd.step(
+            dt_s=dt_s[k],
+            u_pump_sec=u_pump,
+            u_valves=u_valves,
+            threeway_room=threeway_room,
+            wp_defrost=wp_defrost,
+            v_prim_l_min=v_prim,
+            p_prim_th_w=p_prim_th_w[k],
+            f_comp_hz=f_comp_hz[k],
+            t_buf_top_start_c=t_top_s_col[k],
+            t_buf_top_end_c=t_top_e,
+            t_buf_bot_start_c=t_bot_s_col[k],
+            t_buf_bot_end_c=t_bot_e,
+            t_floor_wk_c=tf_wk_in,
+            t_floor_kt_c=tf_kt_in,
+            room_temps_c=room_temps,
+            t_bg_sup_c=t_bg_sup,
+            t_bg_ret_c=t_bg_ret,
+            bg_ret_offset_c=0.0,
+        )
+        q_wk = hyd_res.q_fh_wk_w
+        q_kt = hyd_res.q_fh_kt_w
+        if (
+            has_q_fh_wk_col
+            and v_prim == 0.0
+            and u_pump == 0.0
+            and q_fh_wk_in[k] > 0.0
+        ):
+            q_wk = q_fh_wk_in[k]
+        if (
+            has_q_fh_kt_col
+            and v_prim == 0.0
+            and u_pump == 0.0
+            and q_fh_kt_in[k] > 0.0
+        ):
+            q_kt = q_fh_kt_in[k]
+
+        q_fh_wk_hyd_w[k] = q_wk
+        q_fh_kt_hyd_w[k] = q_kt
+        q_sec_tot_w[k] = sum(hyd_res.q_fh_by_group_w.values())
+        f_flow_wk[k] = hyd_res.f_flow_wk
+        f_flow_kt[k] = hyd_res.f_flow_kt
+
+        dt_k = dt_s[k]
+        t_floor_wk_running = tf_wk_in + (dt_k / c_wk_j) * (
+            q_wk - (tf_wk_in - t_wk) * h_fh_wk
+        )
+        t_floor_kt_running = tf_kt_in + (dt_k / c_kt_j) * (
+            q_kt - (tf_kt_in - t_kt) * h_fh_kt
+        )
+        leak_w = hyd_res.q_leak_1e_to_wk_w
+        q_int_wk_w[k] = baseload_wk + (leak_w if leak_w > 0.0 else 0.0)
+
+    cloned_tape_wk = (
+        dataclasses.replace(
+            base_hist._tape_wk,
+            hyd_k_hx=float(k_hx_map["wk"]),
+            t_sup_sec=t_sup_sec_c,
+            q_fh_hyd=q_fh_wk_hyd_w,
+            q_int=q_int_wk_w,
+        )
+        if base_hist._tape_wk is not None
+        else None
+    )
+    cloned_tape_kt = (
+        dataclasses.replace(
+            base_hist._tape_kt,
+            hyd_k_hx=float(k_hx_map["kantoor"]),
+            t_sup_sec=t_sup_sec_c,
+            q_fh_hyd=q_fh_kt_hyd_w,
+        )
+        if base_hist._tape_kt is not None
+        else None
+    )
+
+    return PreprocessedHistory(
+        n_rows=n,
+        ts_utc=base_hist.ts_utc,
+        flags=base_hist.flags,
+        dt_s=base_hist.dt_s,
+        t_out_c=base_hist.t_out_c,
+        v_wind_ms=base_hist.v_wind_ms,
+        i_sol_wk_wm2=base_hist.i_sol_wk_wm2,
+        i_sol_kt_wm2=base_hist.i_sol_kt_wm2,
+        tau_screen_wk=base_hist.tau_screen_wk,
+        pv_fallback=base_hist.pv_fallback,
+        t_up_wk_c=base_hist.t_up_wk_c,
+        t_down_wk_c=base_hist.t_down_wk_c,
+        t_down_kt_c=base_hist.t_down_kt_c,
+        q_int_wk_w=q_int_wk_w,
+        q_int_kt_w=base_hist.q_int_kt_w,
+        q_ac_base_kt_w=base_hist.q_ac_base_kt_w,
+        p_el_ac_kt_w=base_hist.p_el_ac_kt_w,
+        ac_mode_code=base_hist.ac_mode_code,
+        p_desk_kt_w=base_hist.p_desk_kt_w,
+        pir_occ_kt=base_hist.pir_occ_kt,
+        u_pump_sec=base_hist.u_pump_sec,
+        u_eff_wk=base_hist.u_eff_wk,
+        u_eff_kt=base_hist.u_eff_kt,
+        t_buf_top_c=base_hist.t_buf_top_c,
+        t_buf_bot_cal_c=base_hist.t_buf_bot_cal_c,
+        t_sup_sec_c=t_sup_sec_c,
+        f_comp_hz=base_hist.f_comp_hz,
+        p_prim_th_w=base_hist.p_prim_th_w,
+        q_fh_wk_hyd_w=q_fh_wk_hyd_w,
+        q_fh_kt_hyd_w=q_fh_kt_hyd_w,
+        q_sec_tot_w=q_sec_tot_w,
+        f_flow_wk=f_flow_wk,
+        f_flow_kt=f_flow_kt,
+        t_air_wk_c=base_hist.t_air_wk_c,
+        t_air_kt_c=base_hist.t_air_kt_c,
+        t_surf_meas_wk_c=base_hist.t_surf_meas_wk_c,
+        d_est_col_wk_w=base_hist.d_est_col_wk_w,
+        d_est_col_kt_w=base_hist.d_est_col_kt_w,
+        cooling_or_tail=base_hist.cooling_or_tail,
+        hyd_k_hx_wk=float(k_hx_map["wk"]),
+        hyd_k_hx_kt=float(k_hx_map["kantoor"]),
+        p_wp_raw_el_w=base_hist.p_wp_raw_el_w,
+        is_lts_row=base_hist.is_lts_row,
+        missing_prim_th=base_hist.missing_prim_th,
+        _tape_wk=cloned_tape_wk,
+        _tape_kt=cloned_tape_kt,
     )
 
 
@@ -892,6 +1637,1240 @@ def reconstruct_kalman_states(
         states.append(st)
 
     return states, q_fh_series, q_ac_series, est
+
+
+@dataclasses.dataclass(slots=True)
+class PrecomputedZoneTape:
+    """Parameter-independent 1D exogenous & sensor tape for fast calibration."""
+
+    zone: contracts.ZoneId
+    n_rows: int
+    hyd_k_hx: float
+    dt_s: list[float]
+    ts_utc: list[int]
+    t_meas: list[float]
+    valid: list[bool]
+    temp_changed: list[bool]
+    open_win: list[bool]
+    defrost_ac: list[bool]
+    ac_heat: list[bool]
+    u_pump: list[float]
+    u_zone: list[float]
+    u_prod: list[float]
+    t_sup_sec: list[float]
+    t_buf_top: list[float]
+    q_fh_hyd: list[float]
+    is_harvest: list[bool]
+    p_el_ac: list[float]
+    q_ac_base: list[float]
+    ac_net_el: list[float]
+    ac_temp_factor: list[float]
+    ac_eff_el: list[float]
+    q_ac_fixed: list[float]
+    t_out: list[float]
+    v_excess: list[float]
+    i_sol: list[float]
+    t_down: list[float]
+    q_int: list[float]
+    t_up: list[float]
+    sigma_d_w: list[float]
+    sigma_d_sq2: list[float]
+    qc11_pump_base: list[float]
+    r_v: list[float]
+    obs_slope: list[float]
+    meas_mode: list[int]
+    y_obs: list[float]
+    cold_cap_active: list[bool]
+    t_surf_meas: list[float | None]
+    has_surf_meas: bool
+    fast_300_nowind: list[bool] = dataclasses.field(default_factory=list)
+    fast_300_anywind: list[bool] = dataclasses.field(default_factory=list)
+
+
+def _cooling_rate_from_history(
+    air_obs_history: collections.deque[tuple[int, float]],
+    ts_utc: int,
+    t_meas: float,
+) -> float:
+    """Computes 15-min (`900 s`) finite-difference air cooling rate [K/h]."""
+    if not air_obs_history:
+        return 0.0
+    target_ts = ts_utc - 900
+    best_ts, best_temp = air_obs_history[0]
+    best_diff = abs(best_ts - target_ts)
+    for h_ts, h_temp in air_obs_history:
+        if h_ts >= ts_utc:
+            continue
+        diff = abs(h_ts - target_ts)
+        if diff <= best_diff:
+            best_diff = diff
+            best_ts, best_temp = h_ts, h_temp
+
+    dt_hist_s = ts_utc - best_ts
+    if dt_hist_s <= 0 or dt_hist_s > 1800:
+        return 0.0
+    denom_h = max(0.25, dt_hist_s / 3600.0)
+    return (t_meas - best_temp) / denom_h
+
+
+def build_zone_tape(
+    hist: PreprocessedHistory,
+    zone: contracts.ZoneId,
+) -> PrecomputedZoneTape:
+    """Precomputes 1D parameter-independent arrays for fast LM calibration."""
+    n = hist.n_rows
+    is_wk = zone == "wk"
+    valid_flag = const.FLAG_VALID_WK if is_wk else const.FLAG_VALID_KT
+    open_win_flag = const.FLAG_OPEN_WIN_WK if is_wk else const.FLAG_OPEN_WIN_KT
+    hyd_k_hx = hist.hyd_k_hx_wk if is_wk else hist.hyd_k_hx_kt
+
+    dt_s = list(hist.dt_s)
+    ts_utc = list(hist.ts_utc)
+    t_meas = list(hist.t_air_wk_c if is_wk else hist.t_air_kt_c)
+    u_pump = list(hist.u_pump_sec)
+    u_zone = list(hist.u_eff_wk if is_wk else hist.u_eff_kt)
+    t_sup_sec = list(hist.t_sup_sec_c)
+    t_buf_top = list(hist.t_buf_top_c)
+    q_fh_hyd = list(hist.q_fh_wk_hyd_w if is_wk else hist.q_fh_kt_hyd_w)
+    p_el_ac = list(hist.p_el_ac_kt_w)
+    q_ac_base = list(hist.q_ac_base_kt_w)
+    t_out = list(hist.t_out_c)
+    v_excess = [max(0.0, v - 3.0) for v in hist.v_wind_ms]
+    i_sol = list(hist.i_sol_wk_wm2 if is_wk else hist.i_sol_kt_wm2)
+    t_down = list(hist.t_down_wk_c if is_wk else hist.t_down_kt_c)
+    q_int = list(hist.q_int_wk_w if is_wk else hist.q_int_kt_w)
+    t_up = list(hist.t_up_wk_c) if is_wk else [0.0] * n
+    t_surf_meas: list[float | None] = (
+        list(hist.t_surf_meas_wk_c) if is_wk else [None] * n
+    )
+    has_surf_meas = is_wk and any(v is not None for v in t_surf_meas)
+
+    valid: list[bool] = [False] * n
+    temp_changed: list[bool] = [True] * n
+    open_win: list[bool] = [False] * n
+    defrost_ac: list[bool] = [False] * n
+    ac_heat: list[bool] = [False] * n
+    u_prod: list[float] = [0.0] * n
+    is_harvest: list[bool] = [False] * n
+    ac_net_el: list[float] = [0.0] * n
+    ac_temp_factor: list[float] = [1.0] * n
+    ac_eff_el: list[float] = [0.0] * n
+    q_ac_fixed: list[float] = [0.0] * n
+    sigma_d_w: list[float] = [0.0] * n
+    sigma_d_sq2: list[float] = [0.0] * n
+    qc11_pump_base: list[float] = [0.0] * n
+    r_v: list[float] = [zoh_kalman.R_MEAS_COARSE_K2] * n
+    obs_slope: list[float] = [0.0] * n
+    meas_mode: list[int] = [0] * n
+    y_obs: list[float] = [0.0] * n
+    cold_cap_active: list[bool] = [False] * n
+
+    default_sigma = 110.0 if is_wk else 75.0
+    q_idle = zoh_kalman.Q_FLOOR_IDLE_K2_S
+    q_pump_span = zoh_kalman.Q_FLOOR_PUMP_K2_S - q_idle
+    harvest_mask = const.FLAG_DHW_TANK | const.FLAG_Z1_OFF_HARVEST
+    ac_mode_heat_int = int(const.AC_MODE_HEAT)
+    tz_name = house_config.TIMEZONE_NAME
+    last_hr_key = -1
+    cached_hr_base = 0
+
+    for k in range(n):
+        fl_k = hist.flags[k]
+        val_k = bool(fl_k & valid_flag)
+        valid[k] = val_k
+        open_win[k] = bool(fl_k & open_win_flag)
+        if k > 0:
+            temp_changed[k] = abs(t_meas[k] - t_meas[k - 1]) >= 1e-4
+
+        up_k = u_pump[k]
+        uz_k = u_zone[k]
+        if up_k > 1e-4 and uz_k > 1e-4:
+            u_prod[k] = up_k * uz_k
+            is_harvest[k] = bool(fl_k & harvest_mask) or (
+                hist.f_comp_hz[k] <= 0.5 and hist.p_prim_th_w[k] <= 50.0
+            )
+        u_p_clamped = max(0.0, min(1.0, up_k))
+        qc11_pump_base[k] = q_idle + u_p_clamped * q_pump_span
+
+        if not is_wk:
+            def_k = bool(fl_k & const.FLAG_DEFROST_AC)
+            defrost_ac[k] = def_k
+            pac_k = p_el_ac[k]
+            qbase_k = q_ac_base[k]
+            am_k = hist.ac_mode_code[k]
+            if def_k:
+                q_ac_fixed[k] = (
+                    qbase_k
+                    if qbase_k < 0.0
+                    else -min(200.0, 50.0 + 0.15 * max(0.0, pac_k - 3.0))
+                )
+            elif (
+                math.isfinite(am_k)
+                and round(am_k) == ac_mode_heat_int
+                and pac_k > 25.0
+            ):
+                ac_heat[k] = True
+                net_el_k = max(0.0, pac_k - 3.0)
+                tf_k = min(1.35, max(0.60, 1.0 + 0.025 * (t_out[k] - 7.0)))
+                ac_net_el[k] = net_el_k
+                ac_temp_factor[k] = tf_k
+                ac_eff_el[k] = net_el_k * tf_k
+            else:
+                q_ac_fixed[k] = qbase_k
+
+        aanwezig_k = bool(fl_k & const.FLAG_AANWEZIG)
+        ts_k = ts_utc[k]
+        hr_key = ts_k // 3600
+        if hr_key != last_hr_key:
+            cached_hr_base, _ = solar_weather.local_hour_minute(
+                hr_key * 3600, tz_name
+            )
+            last_hr_key = hr_key
+        mins = cached_hr_base * 60 + ((ts_k % 3600) // 60)
+        if not aanwezig_k or 30 <= mins < 390:
+            sd = 20.0
+        elif is_wk and 1020 <= mins < 1230:
+            sd = 280.0
+        else:
+            sd = default_sigma
+        sigma_d_w[k] = sd
+        sigma_d_sq2[k] = 2.0 * sd * sd
+
+    if n > 0:
+        det = zoh_kalman.ResolutionDetector()
+        det.observe(t_meas[0])
+        r_v[0] = det.r_meas_k2
+        meas_mode[0] = 4
+        y_obs[0] = t_meas[0]
+        last_meas_temp_c: float | None = t_meas[0]
+        time_since_change = 0.0
+        air_obs_history: collections.deque[tuple[int, float]] = (
+            collections.deque(maxlen=12)
+        )
+        cold_rem = (
+            0.0 if u_pump[0] <= 0.5 else zoh_kalman.COLD_START_CAP_DURATION_S
+        )
+
+        for k in range(1, n):
+            dt_k = dt_s[k]
+            if dt_k > 10800.0:
+                det.observe(t_meas[k])
+                r_v[k] = det.r_meas_k2
+                meas_mode[k] = 4
+                y_obs[k] = t_meas[k]
+                last_meas_temp_c = t_meas[k]
+                time_since_change = 0.0
+                air_obs_history.clear()
+                cold_rem = (
+                    0.0
+                    if u_pump[k] <= 0.5
+                    else zoh_kalman.COLD_START_CAP_DURATION_S
+                )
+                continue
+
+            step_s = max(1.0, dt_k)
+            cold_cap_active[k] = cold_rem > 0.0
+            if not air_obs_history and last_meas_temp_c is not None:
+                air_obs_history.append(
+                    (ts_utc[k] - int(round(step_s)), last_meas_temp_c)
+                )
+
+            if valid[k]:
+                y_m = t_meas[k]
+                if temp_changed[k]:
+                    time_since_change = 0.0
+                    last_meas_temp_c = y_m
+                    det.observe(y_m)
+                    r_v[k] = det.r_meas_k2
+                    obs_slope[k] = _cooling_rate_from_history(
+                        air_obs_history, ts_utc[k], y_m
+                    )
+                    meas_mode[k] = 1
+                    y_obs[k] = y_m
+                else:
+                    time_since_change += step_s
+                    y_ref = (
+                        last_meas_temp_c
+                        if last_meas_temp_c is not None
+                        else y_m
+                    )
+                    y_obs[k] = y_ref
+                    if not det.is_fine_resolution:
+                        meas_mode[k] = 2
+                        r_v[k] = det.r_meas_k2
+                    elif (k % 6 == 0) and time_since_change >= 1800.0:
+                        meas_mode[k] = 3
+                        r_v[k] = zoh_kalman.R_MEAS_HEARTBEAT_FINE_K2
+                    else:
+                        meas_mode[k] = 0
+                        r_v[k] = det.r_meas_k2
+                air_obs_history.append((ts_utc[k], y_m))
+            else:
+                time_since_change += step_s
+                meas_mode[k] = 0
+                r_v[k] = det.r_meas_k2
+
+            if cold_rem > 0.0:
+                cold_rem = max(0.0, cold_rem - step_s)
+
+    ow_thr = zoh_kalman.OPEN_WINDOW_SLOPE_K_PER_H
+    fast_300_anywind = [
+        (
+            dt_s[k] == 300.0
+            and meas_mode[k] == 1
+            and obs_slope[k] >= ow_thr
+            and not cold_cap_active[k]
+            and not has_surf_meas
+            and not is_harvest[k]
+        )
+        for k in range(n)
+    ]
+    fast_300_nowind = [
+        fast_300_anywind[k] and v_excess[k] == 0.0 for k in range(n)
+    ]
+
+    return PrecomputedZoneTape(
+        zone=zone,
+        n_rows=n,
+        hyd_k_hx=hyd_k_hx,
+        dt_s=dt_s,
+        ts_utc=ts_utc,
+        t_meas=t_meas,
+        valid=valid,
+        temp_changed=temp_changed,
+        open_win=open_win,
+        defrost_ac=defrost_ac,
+        ac_heat=ac_heat,
+        u_pump=u_pump,
+        u_zone=u_zone,
+        u_prod=u_prod,
+        t_sup_sec=t_sup_sec,
+        t_buf_top=t_buf_top,
+        q_fh_hyd=q_fh_hyd,
+        is_harvest=is_harvest,
+        p_el_ac=p_el_ac,
+        q_ac_base=q_ac_base,
+        ac_net_el=ac_net_el,
+        ac_temp_factor=ac_temp_factor,
+        ac_eff_el=ac_eff_el,
+        q_ac_fixed=q_ac_fixed,
+        t_out=t_out,
+        v_excess=v_excess,
+        i_sol=i_sol,
+        t_down=t_down,
+        q_int=q_int,
+        t_up=t_up,
+        sigma_d_w=sigma_d_w,
+        sigma_d_sq2=sigma_d_sq2,
+        qc11_pump_base=qc11_pump_base,
+        r_v=r_v,
+        obs_slope=obs_slope,
+        meas_mode=meas_mode,
+        y_obs=y_obs,
+        cold_cap_active=cold_cap_active,
+        t_surf_meas=t_surf_meas,
+        has_surf_meas=has_surf_meas,
+        fast_300_nowind=fast_300_nowind,
+        fast_300_anywind=fast_300_anywind,
+    )
+
+
+def _cold_start_scalars(
+    params: contracts.ZoneParameters,
+    t_air: float,
+    t_out: float,
+    v_excess: float,
+    i_sol: float,
+    t_down: float,
+    q_int: float,
+    t_up: float,
+    q_fh_w: float,
+    q_ac_w: float,
+    u_pump: float,
+    t_buf_top_c: float,
+    r_v0: float,
+) -> tuple[float, float, float, float, float, float, float, float, float]:
+    """Computes scalar `(x0, x1, x2, p00..p22)` matching `cold_start`."""
+    h_fh = 1000.0 / params.r_fh_k_kw
+    v_eff = 0.0 if params.c_wind == 0.0 else v_excess
+    h_oa = params.h_loss_w_k * (1.0 + params.c_wind * v_eff)
+    h_up = params.h_up_w_k
+    h_down = params.h_down_w_k
+
+    q_air_loss = (
+        h_oa * (t_air - t_out)
+        + h_up * (t_air - t_up)
+        - q_int
+        - q_ac_w
+        - params.alpha_sol * params.a_sol_m2 * i_sol
+    )
+    c_tot_wh_k = params.c_air_wh_k + params.c_floor_wh_k
+    q_tot_net = (
+        q_air_loss
+        + h_down * (t_air - t_down)
+        - (1.0 - params.alpha_sol) * params.a_sol_m2 * i_sol
+    )
+    c_air_dot_t_slow = -(params.c_air_wh_k / c_tot_wh_k) * q_tot_net
+    t_floor_passive = t_air + (q_air_loss + c_air_dot_t_slow) / h_fh
+
+    if u_pump <= 0.5:
+        t_floor_0 = t_floor_passive
+        p11_0 = 0.25
+    else:
+        q_sol_floor = (1.0 - params.alpha_sol) * params.a_sol_m2 * i_sol
+        if math.isfinite(t_buf_top_c):
+            k_hx = params.k_hx_w_k * min(1.0, u_pump)
+            t_floor_pipe = (
+                k_hx * t_buf_top_c
+                + h_fh * t_air
+                + h_down * t_down
+                + q_sol_floor
+            ) / (k_hx + h_fh + h_down)
+        else:
+            t_floor_pipe = (
+                q_fh_w + h_fh * t_air + h_down * t_down + q_sol_floor
+            ) / (h_fh + h_down)
+        t_floor_0 = 0.5 * (t_floor_passive + t_floor_pipe)
+        p11_0 = 1.0
+
+    return t_air, t_floor_0, 0.0, r_v0, 0.0, 0.0, p11_0, 0.0, 6400.0
+
+
+def _run_kalman_on_tape(
+    tape: PrecomputedZoneTape,
+    params: contracts.ZoneParameters,
+    *,
+    end_k: int,
+    save_k0_set: set[int] | None = None,
+    record_all: bool = False,
+) -> tuple[
+    list[tuple[float, float, float]] | None,
+    dict[int, tuple[float, float]] | None,
+    zoh_kalman._Mat3,
+    zoh_kalman._Mat3x7,
+    float,
+    float,
+]:
+    """Runs unrolled scalar Kalman filter on `tape` up to `end_k` inclusive."""
+    limit_k = min(end_k, tape.n_rows - 1)
+    states_out: list[tuple[float, float, float]] | None = (
+        [(0.0, 0.0, 0.0)] * (limit_k + 1) if record_all else None
+    )
+    saved_k0: dict[int, tuple[float, float]] | None = (
+        {} if save_k0_set is not None else None
+    )
+    save_mask: list[bool] | None = None
+    if save_k0_set is not None:
+        save_mask = [False] * (limit_k + 1)
+        for kk in save_k0_set:
+            if 0 <= kk <= limit_k:
+                save_mask[kk] = True
+
+    is_kt = tape.zone == "kt"
+    khx = params.k_hx_w_k
+    base_khx = tape.hyd_k_hx
+    khx_ratio = (khx / base_khx) if base_khx > 1e-6 else 1.0
+    khx_scale_act = (
+        khx_ratio
+        if (base_khx > 1e-6 and abs(khx - base_khx) > 1e-6)
+        else 1.0
+    )
+    eta_ac = params.eta_ac
+    c_wind = params.c_wind
+    c_floor_j = 3600.0 * params.c_floor_wh_k
+    qc11_qfh_factor = (
+        (0.08 * 0.08) * zoh_kalman.TAU_HYDR_S / (c_floor_j * c_floor_j)
+    )
+    inv_tau_d = 1.0 / (3600.0 * params.tau_d_h)
+    inv_tau_d_vent = 1.0 / zoh_kalman.TAU_D_VENT_S
+
+    # Unpack standard 300s zero-wind ZOH + Q_d basis once outside the k-loop.
+    ad_std, bd_std, _, _, _ = zoh_kalman._discretize_ab_cached(
+        params, 300.0, 0.0
+    )
+    g0_std, g1_std, g2_std = zoh_kalman._discretize_qd_basis_cached(
+        params, 300.0, 0.0
+    )
+    a00, a01, a02 = ad_std[0][0], ad_std[0][1], ad_std[0][2]
+    a10, a11, a12 = ad_std[1][0], ad_std[1][1], ad_std[1][2]
+    a22 = ad_std[2][2]
+    b00, b01, b02, b03, b04, b05, b06 = bd_std[0]
+    b10, b11, b12, b13, b14, b15, b16 = bd_std[1]
+    b06_eta = b06 * eta_ac
+    b16_eta = b16 * eta_ac
+
+    g0_00, g0_01, g0_02 = g0_std[0][0], g0_std[0][1], g0_std[0][2]
+    g0_11, g0_12, g0_22 = g0_std[1][1], g0_std[1][2], g0_std[2][2]
+    g1_00, g1_01, g1_02 = g1_std[0][0], g1_std[0][1], g1_std[0][2]
+    g1_11, g1_12, g1_22 = g1_std[1][1], g1_std[1][2], g1_std[2][2]
+    g2_00, g2_01, g2_02 = g2_std[0][0], g2_std[0][1], g2_std[0][2]
+    g2_11, g2_12, g2_22 = g2_std[1][1], g2_std[1][2], g2_std[2][2]
+
+    dt_arr = tape.dt_s
+    t_meas_arr = tape.t_meas
+    u_pump_arr = tape.u_pump
+    u_prod_arr = tape.u_prod
+    t_buf_top_arr = tape.t_buf_top
+    q_fh_hyd_arr = tape.q_fh_hyd
+    is_harvest_arr = tape.is_harvest
+    ac_eff_arr = tape.ac_eff_el
+    q_ac_fixed_arr = tape.q_ac_fixed
+    t_out_arr = tape.t_out
+    v_exc_arr = tape.v_excess
+    i_sol_arr = tape.i_sol
+    t_down_arr = tape.t_down
+    q_int_arr = tape.q_int
+    t_up_arr = tape.t_up
+    sd_sq2_arr = tape.sigma_d_sq2
+    qc11_base_arr = tape.qc11_pump_base
+    r_v_arr = tape.r_v
+    obs_slope_arr = tape.obs_slope
+    meas_mode_arr = tape.meas_mode
+    y_obs_arr = tape.y_obs
+    cold_cap_arr = tape.cold_cap_active
+    has_surf = tape.has_surf_meas
+    t_surf_arr = tape.t_surf_meas
+
+    surf_gamma = 0.60
+    if has_surf:
+        area_m2 = (
+            house_config.AREA_WK_M2
+            if tape.zone == "wk"
+            else house_config.AREA_KT_M2
+        )
+        r_surf_k_kw = 1000.0 / (house_config.H_SURF_UPWARD_W_M2K * area_m2)
+        surf_gamma = max(0.10, min(0.95, r_surf_k_kw / params.r_fh_k_kw))
+
+    q_air_base = zoh_kalman.Q_AIR_BASE_K2_S
+    q_air_ow = zoh_kalman.Q_AIR_OPEN_WINDOW_K2_S
+    qg0_00 = q_air_base * g0_00
+    qg0_01 = q_air_base * g0_01
+    qg0_02 = q_air_base * g0_02
+    qg0_11 = q_air_base * g0_11
+    qg0_12 = q_air_base * g0_12
+    qg0_22 = q_air_base * g0_22
+    fast_arr = (
+        tape.fast_300_anywind if c_wind == 0.0 else tape.fast_300_nowind
+    )
+    ow_slope_thr = zoh_kalman.OPEN_WINDOW_SLOPE_K_PER_H
+    ow_hold_const = zoh_kalman.OPEN_WINDOW_HOLD_S
+    floor_cap_k = zoh_kalman.COLD_START_FLOOR_CAP_K
+    vent_params: contracts.ZoneParameters | None = None
+
+    # k = 0 cold start
+    q_ac_0 = (ac_eff_arr[0] * eta_ac + q_ac_fixed_arr[0]) if is_kt else 0.0
+    q_fh_0 = q_fh_hyd_arr[0]
+    x0, x1, x2, p00, p01, p02, p11, p12, p22 = _cold_start_scalars(
+        params,
+        t_meas_arr[0],
+        t_out_arr[0],
+        v_exc_arr[0],
+        i_sol_arr[0],
+        t_down_arr[0],
+        q_int_arr[0],
+        t_up_arr[0],
+        q_fh_0,
+        q_ac_0,
+        u_pump_arr[0],
+        t_buf_top_arr[0],
+        r_v_arr[0],
+    )
+    open_window_hold_rem_s = 0.0
+    open_window_active = False
+    if states_out is not None:
+        states_out[0] = (x0, x1, x2)
+    if save_mask is not None and saved_k0 is not None and save_mask[0]:
+        saved_k0[0] = (x0, x1)
+
+    a22_sq = a22 * a22
+    u4_fast: Sequence[float] = (
+        q_fh_hyd_arr
+        if (khx_scale_act == 1.0 and abs(khx_ratio - 1.0) <= 1e-9)
+        else [
+            ((qh * khx_ratio) if qh > 0.0 else 0.0)
+            if up == 0.0
+            else (qh * khx_scale_act)
+            for up, qh in zip(u_prod_arr, q_fh_hyd_arr)
+        ]
+    )
+
+    for k in range(1, limit_k + 1):
+        if fast_arr[k] and open_window_hold_rem_s == 0.0 and x2 >= -150.0:
+            u4 = u4_fast[k]
+            if is_kt:
+                ac_e = ac_eff_arr[k]
+                ac_f = q_ac_fixed_arr[k]
+                xm0 = (
+                    a00 * x0 + a01 * x1 + a02 * x2 + b00 * t_out_arr[k]
+                    + b01 * t_up_arr[k] + b02 * t_down_arr[k]
+                    + b03 * i_sol_arr[k] + b04 * u4 + b05 * q_int_arr[k]
+                    + b06_eta * ac_e + b06 * ac_f
+                )
+                xm1 = (
+                    a10 * x0 + a11 * x1 + a12 * x2 + b10 * t_out_arr[k]
+                    + b11 * t_up_arr[k] + b12 * t_down_arr[k]
+                    + b13 * i_sol_arr[k] + b14 * u4 + b15 * q_int_arr[k]
+                    + b16_eta * ac_e + b16 * ac_f
+                )
+            else:
+                xm0 = (
+                    a00 * x0 + a01 * x1 + a02 * x2 + b00 * t_out_arr[k]
+                    + b01 * t_up_arr[k] + b02 * t_down_arr[k]
+                    + b03 * i_sol_arr[k] + b04 * u4 + b05 * q_int_arr[k]
+                )
+                xm1 = (
+                    a10 * x0 + a11 * x1 + a12 * x2 + b10 * t_out_arr[k]
+                    + b11 * t_up_arr[k] + b12 * t_down_arr[k]
+                    + b13 * i_sol_arr[k] + b14 * u4 + b15 * q_int_arr[k]
+                )
+            xm2 = a22 * x2
+            qc11 = qc11_base_arr[k] + qc11_qfh_factor * u4 * u4
+            qc22 = sd_sq2_arr[k] * inv_tau_d
+            ap00 = a00 * p00 + a01 * p01 + a02 * p02
+            ap01 = a00 * p01 + a01 * p11 + a02 * p12
+            ap02 = a00 * p02 + a01 * p12 + a02 * p22
+            ap10 = a10 * p00 + a11 * p01 + a12 * p02
+            ap11 = a10 * p01 + a11 * p11 + a12 * p12
+            ap12 = a10 * p02 + a11 * p12 + a12 * p22
+            pm00 = ap00 * a00 + ap01 * a01 + ap02 * a02 + (
+                qg0_00 + qc11 * g1_00 + qc22 * g2_00
+            )
+            pm01 = ap00 * a10 + ap01 * a11 + ap02 * a12 + (
+                qg0_01 + qc11 * g1_01 + qc22 * g2_01
+            )
+            pm02 = ap02 * a22 + (qg0_02 + qc11 * g1_02 + qc22 * g2_02)
+            pm11 = ap10 * a10 + ap11 * a11 + ap12 * a12 + (
+                qg0_11 + qc11 * g1_11 + qc22 * g2_11
+            )
+            pm12 = ap12 * a22 + (qg0_12 + qc11 * g1_12 + qc22 * g2_12)
+            pm22 = a22_sq * p22 + (qg0_22 + qc11 * g1_22 + qc22 * g2_22)
+            rv_eff = r_v_arr[k]
+            e_innov = y_obs_arr[k] - xm0
+            inv_s = 1.0 / (pm00 + rv_eff)
+            gk0 = pm00 * inv_s
+            gk1 = pm01 * inv_s
+            gk2 = pm02 * inv_s
+            x0 = xm0 + gk0 * e_innov
+            x1 = xm1 + gk1 * e_innov
+            x2 = xm2 + gk2 * e_innov
+            p00 = rv_eff * gk0
+            p01 = rv_eff * gk1
+            p02 = rv_eff * gk2
+            p11 = pm11 - gk1 * pm01
+            p12 = pm12 - gk1 * pm02
+            p22 = pm22 - gk2 * pm02
+            if states_out is not None:
+                states_out[k] = (x0, x1, x2)
+            if save_mask is not None and saved_k0 is not None and save_mask[k]:
+                saved_k0[k] = (x0, x1)
+            continue
+
+        up_uz = u_prod_arr[k]
+        if up_uz == 0.0:
+            qh = q_fh_hyd_arr[k]
+            q_fh_k = (qh * khx_ratio) if qh > 0.0 else 0.0
+        elif is_harvest_arr[k]:
+            q_fh_k = up_uz * khx * (t_buf_top_arr[k] - x1)
+            if q_fh_k < 0.0:
+                q_fh_k = 0.0
+        else:
+            q_fh_k = q_fh_hyd_arr[k] * khx_scale_act
+
+        q_ac_k = (
+            (ac_eff_arr[k] * eta_ac + q_ac_fixed_arr[k]) if is_kt else 0.0
+        )
+
+        mm = meas_mode_arr[k]
+        if mm == 4:
+            x0, x1, x2, p00, p01, p02, p11, p12, p22 = _cold_start_scalars(
+                params,
+                t_meas_arr[k],
+                t_out_arr[k],
+                v_exc_arr[k],
+                i_sol_arr[k],
+                t_down_arr[k],
+                q_int_arr[k],
+                t_up_arr[k],
+                q_fh_k,
+                q_ac_k,
+                u_pump_arr[k],
+                t_buf_top_arr[k],
+                r_v_arr[k],
+            )
+            open_window_hold_rem_s = 0.0
+            open_window_active = False
+            if states_out is not None:
+                states_out[k] = (x0, x1, x2)
+            if save_mask is not None and saved_k0 is not None and save_mask[k]:
+                saved_k0[k] = (x0, x1)
+            continue
+
+        step_s = dt_arr[k]
+        if step_s < 1.0:
+            step_s = 1.0
+
+        if open_window_hold_rem_s > 0.0:
+            open_window_hold_rem_s -= step_s
+            if open_window_hold_rem_s <= 0.0:
+                open_window_hold_rem_s = 0.0
+                open_window_active = False
+            else:
+                open_window_active = True
+        else:
+            open_window_active = False
+
+        use_fast_vent = x2 < -1.0 and (open_window_active or x2 < -150.0)
+        v_exc_k = v_exc_arr[k]
+
+        u0 = t_out_arr[k]
+        u1 = t_up_arr[k]
+        u2 = t_down_arr[k]
+        u3 = i_sol_arr[k]
+        u4 = q_fh_k
+        u5 = q_int_arr[k]
+        u6 = q_ac_k
+
+        qc00 = q_air_base + (q_air_ow if open_window_active else 0.0)
+        qc11 = qc11_base_arr[k] + qc11_qfh_factor * q_fh_k * q_fh_k
+
+        if (
+            step_s == 300.0
+            and not use_fast_vent
+            and (c_wind == 0.0 or v_exc_k == 0.0)
+        ):
+            qc22 = sd_sq2_arr[k] * inv_tau_d
+            xm0 = (
+                a00 * x0
+                + a01 * x1
+                + a02 * x2
+                + b00 * u0
+                + b01 * u1
+                + b02 * u2
+                + b03 * u3
+                + b04 * u4
+                + b05 * u5
+                + b06 * u6
+            )
+            xm1 = (
+                a10 * x0
+                + a11 * x1
+                + a12 * x2
+                + b10 * u0
+                + b11 * u1
+                + b12 * u2
+                + b13 * u3
+                + b14 * u4
+                + b15 * u5
+                + b16 * u6
+            )
+            xm2 = a22 * x2
+
+            q00 = qc00 * g0_00 + qc11 * g1_00 + qc22 * g2_00
+            q01 = qc00 * g0_01 + qc11 * g1_01 + qc22 * g2_01
+            q02 = qc00 * g0_02 + qc11 * g1_02 + qc22 * g2_02
+            q11 = qc00 * g0_11 + qc11 * g1_11 + qc22 * g2_11
+            q12 = qc00 * g0_12 + qc11 * g1_12 + qc22 * g2_12
+            q22 = qc00 * g0_22 + qc11 * g1_22 + qc22 * g2_22
+
+            ca00, ca01, ca02 = a00, a01, a02
+            ca10, ca11, ca12 = a10, a11, a12
+            ca22 = a22
+        else:
+            v_eff_k = 0.0 if c_wind == 0.0 else v_exc_k
+            if use_fast_vent:
+                if vent_params is None:
+                    vent_params = dataclasses.replace(
+                        params, tau_d_h=zoh_kalman.TAU_D_VENT_S / 3600.0
+                    )
+                ad_k, bd_k, _, _, _ = zoh_kalman._discretize_ab_cached(
+                    vent_params, step_s, v_eff_k
+                )
+                g0_k, g1_k, g2_k = zoh_kalman._discretize_qd_basis_cached(
+                    vent_params, step_s, v_eff_k
+                )
+                ad_nom, bd_nom, _, _, _ = zoh_kalman._discretize_ab_cached(
+                    params, step_s, v_eff_k
+                )
+                af10, af11, af12 = ad_nom[1][0], ad_nom[1][1], ad_nom[1][2]
+                bf1 = bd_nom[1]
+                qc22 = sd_sq2_arr[k] * inv_tau_d_vent
+            else:
+                ad_k, bd_k, _, _, _ = zoh_kalman._discretize_ab_cached(
+                    params, step_s, v_eff_k
+                )
+                g0_k, g1_k, g2_k = zoh_kalman._discretize_qd_basis_cached(
+                    params, step_s, v_eff_k
+                )
+                af10, af11, af12 = ad_k[1][0], ad_k[1][1], ad_k[1][2]
+                bf1 = bd_k[1]
+                qc22 = sd_sq2_arr[k] * inv_tau_d
+
+            ca00, ca01, ca02 = ad_k[0][0], ad_k[0][1], ad_k[0][2]
+            ca10, ca11, ca12 = ad_k[1][0], ad_k[1][1], ad_k[1][2]
+            ca22 = ad_k[2][2]
+            bk0 = bd_k[0]
+            xm0 = (
+                ca00 * x0
+                + ca01 * x1
+                + ca02 * x2
+                + bk0[0] * u0
+                + bk0[1] * u1
+                + bk0[2] * u2
+                + bk0[3] * u3
+                + bk0[4] * u4
+                + bk0[5] * u5
+                + bk0[6] * u6
+            )
+            xm1 = (
+                af10 * x0
+                + af11 * x1
+                + af12 * x2
+                + bf1[0] * u0
+                + bf1[1] * u1
+                + bf1[2] * u2
+                + bf1[3] * u3
+                + bf1[4] * u4
+                + bf1[5] * u5
+                + bf1[6] * u6
+            )
+            xm2 = ca22 * x2
+
+            q00 = qc00 * g0_k[0][0] + qc11 * g1_k[0][0] + qc22 * g2_k[0][0]
+            q01 = qc00 * g0_k[0][1] + qc11 * g1_k[0][1] + qc22 * g2_k[0][1]
+            q02 = qc00 * g0_k[0][2] + qc11 * g1_k[0][2] + qc22 * g2_k[0][2]
+            q11 = qc00 * g0_k[1][1] + qc11 * g1_k[1][1] + qc22 * g2_k[1][1]
+            q12 = qc00 * g0_k[1][2] + qc11 * g1_k[1][2] + qc22 * g2_k[1][2]
+            q22 = qc00 * g0_k[2][2] + qc11 * g1_k[2][2] + qc22 * g2_k[2][2]
+
+        ap00 = ca00 * p00 + ca01 * p01 + ca02 * p02
+        ap01 = ca00 * p01 + ca01 * p11 + ca02 * p12
+        ap02 = ca00 * p02 + ca01 * p12 + ca02 * p22
+        ap10 = ca10 * p00 + ca11 * p01 + ca12 * p02
+        ap11 = ca10 * p01 + ca11 * p11 + ca12 * p12
+        ap12 = ca10 * p02 + ca11 * p12 + ca12 * p22
+        ap20 = ca22 * p02
+        ap21 = ca22 * p12
+        ap22 = ca22 * p22
+
+        pm00 = ap00 * ca00 + ap01 * ca01 + ap02 * ca02 + q00
+        pm01 = (
+            0.5
+            * (
+                (ap00 * ca10 + ap01 * ca11 + ap02 * ca12)
+                + (ap10 * ca00 + ap11 * ca01 + ap12 * ca02)
+            )
+            + q01
+        )
+        pm02 = 0.5 * (ap02 * ca22 + (ap20 * ca00 + ap21 * ca01 + ap22 * ca02)) + q02
+        pm11 = ap10 * ca10 + ap11 * ca11 + ap12 * ca12 + q11
+        pm12 = 0.5 * (ap12 * ca22 + (ap20 * ca10 + ap21 * ca11 + ap22 * ca12)) + q12
+        pm22 = ap22 * ca22 + q22
+
+        do_air_update = False
+        e_innov = 0.0
+        rv_eff = 0.0
+
+        if mm == 1:
+            rv_eff = r_v_arr[k]
+            e_innov = y_obs_arr[k] - xm0
+            if obs_slope_arr[k] < ow_slope_thr:
+                s_k = pm00 + rv_eff
+                gate_thresh = max(0.20, 2.5 * math.sqrt(max(1e-12, s_k)))
+                if e_innov < -gate_thresh:
+                    open_window_hold_rem_s = ow_hold_const
+                    open_window_active = True
+            do_air_update = True
+        elif mm == 2:
+            tobit = zoh_kalman._tobit_equivalent_innovation(
+                y_center=y_obs_arr[k],
+                half_width_k=0.10,
+                mu_minus=xm0,
+                p00_minus=pm00,
+                sigma_eps_k=0.03,
+            )
+            if tobit is not None:
+                e_innov, rv_eff = tobit
+                do_air_update = True
+        elif mm == 3:
+            rv_eff = r_v_arr[k]
+            e_innov = y_obs_arr[k] - xm0
+            do_air_update = True
+
+        if do_air_update:
+            s_val = pm00 + rv_eff
+            if s_val < 1e-12:
+                s_val = 1e-12
+            gk0 = pm00 / s_val
+            gk1 = 0.0 if open_window_active else (pm01 / s_val)
+            gk2 = pm02 / s_val
+
+            if (
+                cold_cap_arr[k]
+                and abs(e_innov) > 1e-12
+                and abs(gk1 * e_innov) > floor_cap_k
+            ):
+                gk1 = math.copysign(floor_cap_k / abs(e_innov), gk1)
+
+            x0 = xm0 + gk0 * e_innov
+            x1 = xm1 + gk1 * e_innov
+            x2 = xm2 + gk2 * e_innov
+
+            w00 = 1.0 - gk0
+            wp00 = w00 * pm00
+            wp01 = w00 * pm01
+            wp02 = w00 * pm02
+            wp10 = -gk1 * pm00 + pm01
+            wp11 = -gk1 * pm01 + pm11
+            wp12 = -gk1 * pm02 + pm12
+            wp20 = -gk2 * pm00 + pm02
+            wp21 = -gk2 * pm01 + pm12
+            wp22 = -gk2 * pm02 + pm22
+
+            p00 = wp00 * w00 + rv_eff * gk0 * gk0
+            if p00 < 1e-14:
+                p00 = 1e-14
+            p01 = 0.5 * (-wp00 * gk1 + wp01 + wp10 * w00) + rv_eff * gk0 * gk1
+            p02 = 0.5 * (-wp00 * gk2 + wp02 + wp20 * w00) + rv_eff * gk0 * gk2
+            p11 = -wp10 * gk1 + wp11 + rv_eff * gk1 * gk1
+            if p11 < 1e-14:
+                p11 = 1e-14
+            p12 = 0.5 * (-wp10 * gk2 + wp12 - wp20 * gk1 + wp21) + rv_eff * gk1 * gk2
+            p22 = -wp20 * gk2 + wp22 + rv_eff * gk2 * gk2
+            if p22 < 1e-14:
+                p22 = 1e-14
+        else:
+            x0, x1, x2 = xm0, xm1, xm2
+            p00, p01, p02, p11, p12, p22 = pm00, pm01, pm02, pm11, pm12, pm22
+
+        if has_surf:
+            ys_opt = t_surf_arr[k]
+            if ys_opt is not None:
+                h_surf = (1.0 - surf_gamma, surf_gamma, 0.0)
+                e_surf = ys_opt - (h_surf[0] * x0 + h_surf[1] * x1)
+                x_u, p_u = zoh_kalman._joseph_scalar_update(
+                    (x0, x1, x2),
+                    [[p00, p01, p02], [p01, p11, p12], [p02, p12, p22]],
+                    h_row=h_surf,
+                    innovation=e_surf,
+                    r_v=zoh_kalman.R_MEAS_SURF_K2,
+                )
+                x0, x1, x2 = x_u
+                p00, p01, p02 = p_u[0][0], p_u[0][1], p_u[0][2]
+                p11, p12, p22 = p_u[1][1], p_u[1][2], p_u[2][2]
+
+        if states_out is not None:
+            states_out[k] = (x0, x1, x2)
+        if save_mask is not None and saved_k0 is not None and save_mask[k]:
+            saved_k0[k] = (x0, x1)
+
+    return states_out, saved_k0, ad_std, bd_std, khx_ratio, khx_scale_act
+
+
+def evaluate_windows_on_tape(
+    tape: PrecomputedZoneTape,
+    params: contracts.ZoneParameters,
+    window_specs: Sequence[tuple[int, int, Sequence[int], float]],
+) -> list[float]:
+    """Evaluates trajectory MAP residuals via unrolled scalar Kalman + ZOH."""
+    if not window_specs or tape.n_rows == 0:
+        return []
+
+    max_k0 = max(spec[0] for spec in window_specs)
+    needed_k0 = {spec[0] for spec in window_specs}
+    _, saved_k0, ad_std, bd_std, khx_ratio, khx_scale_act = (
+        _run_kalman_on_tape(
+            tape,
+            params,
+            end_k=max_k0,
+            save_k0_set=needed_k0,
+            record_all=False,
+        )
+    )
+    assert saved_k0 is not None
+
+    is_kt = tape.zone == "kt"
+    khx = params.k_hx_w_k
+    eta_ac = params.eta_ac
+    c_wind = params.c_wind
+
+    a00, a01 = ad_std[0][0], ad_std[0][1]
+    a10, a11 = ad_std[1][0], ad_std[1][1]
+    b00, b01, b02, b03, b04, b05, b06 = bd_std[0]
+    b10, b11, b12, b13, b14, b15, b16 = bd_std[1]
+
+    dt_arr = tape.dt_s
+    t_meas_arr = tape.t_meas
+    u_prod_arr = tape.u_prod
+    t_buf_top_arr = tape.t_buf_top
+    q_fh_hyd_arr = tape.q_fh_hyd
+    is_harvest_arr = tape.is_harvest
+    ac_eff_arr = tape.ac_eff_el
+    q_ac_fixed_arr = tape.q_ac_fixed
+    t_out_arr = tape.t_out
+    v_exc_arr = tape.v_excess
+    i_sol_arr = tape.i_sol
+    t_down_arr = tape.t_down
+    q_int_arr = tape.q_int
+    t_up_arr = tape.t_up
+
+    # Open-loop ZOH rollout on all requested windows (d_est = 0 at k0).
+    residuals: list[float] = []
+    for k0_w, len_w, sample_pts, w_factor in window_specs:
+        ox0, ox1 = saved_k0[k0_w]
+        ptr = 0
+        n_pts = len(sample_pts)
+        next_pt = sample_pts[0] if n_pts > 0 else -1
+        for s in range(1, len_w + 1):
+            idx = k0_w + s
+            up_uz = u_prod_arr[idx]
+            if up_uz == 0.0:
+                qh = q_fh_hyd_arr[idx]
+                q_fh_s = (qh * khx_ratio) if qh > 0.0 else 0.0
+            elif is_harvest_arr[idx]:
+                q_fh_s = up_uz * khx * (t_buf_top_arr[idx] - ox1)
+                if q_fh_s < 0.0:
+                    q_fh_s = 0.0
+            else:
+                q_fh_s = q_fh_hyd_arr[idx] * khx_scale_act
+
+            q_ac_s = (
+                (ac_eff_arr[idx] * eta_ac + q_ac_fixed_arr[idx])
+                if is_kt
+                else 0.0
+            )
+
+            dt_idx = dt_arr[idx]
+            v_exc_idx = v_exc_arr[idx]
+            if dt_idx == 300.0 and (c_wind == 0.0 or v_exc_idx == 0.0):
+                nx0 = (
+                    a00 * ox0
+                    + a01 * ox1
+                    + b00 * t_out_arr[idx]
+                    + b01 * t_up_arr[idx]
+                    + b02 * t_down_arr[idx]
+                    + b03 * i_sol_arr[idx]
+                    + b04 * q_fh_s
+                    + b05 * q_int_arr[idx]
+                    + b06 * q_ac_s
+                )
+                nx1 = (
+                    a10 * ox0
+                    + a11 * ox1
+                    + b10 * t_out_arr[idx]
+                    + b11 * t_up_arr[idx]
+                    + b12 * t_down_arr[idx]
+                    + b13 * i_sol_arr[idx]
+                    + b14 * q_fh_s
+                    + b15 * q_int_arr[idx]
+                    + b16 * q_ac_s
+                )
+            else:
+                v_eff_idx = 0.0 if c_wind == 0.0 else v_exc_idx
+                ad_o, bd_o, _, _, _ = zoh_kalman._discretize_ab_cached(
+                    params, dt_idx, v_eff_idx
+                )
+                bo0 = bd_o[0]
+                bo1 = bd_o[1]
+                nx0 = (
+                    ad_o[0][0] * ox0
+                    + ad_o[0][1] * ox1
+                    + bo0[0] * t_out_arr[idx]
+                    + bo0[1] * t_up_arr[idx]
+                    + bo0[2] * t_down_arr[idx]
+                    + bo0[3] * i_sol_arr[idx]
+                    + bo0[4] * q_fh_s
+                    + bo0[5] * q_int_arr[idx]
+                    + bo0[6] * q_ac_s
+                )
+                nx1 = (
+                    ad_o[1][0] * ox0
+                    + ad_o[1][1] * ox1
+                    + bo1[0] * t_out_arr[idx]
+                    + bo1[1] * t_up_arr[idx]
+                    + bo1[2] * t_down_arr[idx]
+                    + bo1[3] * i_sol_arr[idx]
+                    + bo1[4] * q_fh_s
+                    + bo1[5] * q_int_arr[idx]
+                    + bo1[6] * q_ac_s
+                )
+            ox0, ox1 = nx0, nx1
+            if s == next_pt:
+                residuals.append((ox0 - t_meas_arr[idx]) * w_factor)
+                ptr += 1
+                next_pt = sample_pts[ptr] if ptr < n_pts else -1
+
+    return residuals
+
+
+def get_zone_tape(
+    hist: PreprocessedHistory,
+    zone: contracts.ZoneId,
+) -> PrecomputedZoneTape:
+    """Returns cached `PrecomputedZoneTape` attached to `hist` for `zone`."""
+    if zone == "wk":
+        if hist._tape_wk is None:
+            hist._tape_wk = build_zone_tape(hist, "wk")
+        return hist._tape_wk
+    if hist._tape_kt is None:
+        hist._tape_kt = build_zone_tape(hist, "kt")
+    return hist._tape_kt
+
+
+def _reconstruct_states_on_tape(
+    tape: PrecomputedZoneTape,
+    params: contracts.ZoneParameters,
+    end_k: int | None = None,
+) -> list[tuple[float, float, float]]:
+    """Runs unrolled scalar Kalman filter on `tape` up to `end_k` inclusive."""
+    n = tape.n_rows
+    if n == 0:
+        return []
+    limit_k = (n - 1) if end_k is None else min(end_k, n - 1)
+    states_out, _, _, _, _, _ = _run_kalman_on_tape(
+        tape,
+        params,
+        end_k=limit_k,
+        save_k0_set=None,
+        record_all=True,
+    )
+    assert states_out is not None
+    return states_out
+
+
+def reconstruct_states_tuples(
+    hist: PreprocessedHistory,
+    zone: contracts.ZoneId,
+    params: contracts.ZoneParameters,
+) -> list[tuple[float, float, float]]:
+    """Fast scalar Kalman state reconstruction returning `(t_air, t_floor, d)`."""
+    return _reconstruct_states_on_tape(get_zone_tape(hist, zone), params)
+
+
+def _rollout_open_loop_window_fast(
+    tape: PrecomputedZoneTape,
+    k0: int,
+    length_steps: int,
+    state_init: tuple[float, float, float],
+    params: contracts.ZoneParameters,
+    ad_std: zoh_kalman._Mat3,
+    bd_std: zoh_kalman._Mat3x7,
+    khx_ratio: float,
+    khx_scale_act: float,
+) -> tuple[list[float], list[float]]:
+    """Fast unrolled open-loop ZOH rollout preserving all 3 states & 7 inputs."""
+    ox0, ox1, ox2 = state_init
+    is_kt = tape.zone == "kt"
+    khx = params.k_hx_w_k
+    eta_ac = params.eta_ac
+    c_wind = params.c_wind
+
+    a00, a01, a02 = ad_std[0][0], ad_std[0][1], ad_std[0][2]
+    a10, a11, a12 = ad_std[1][0], ad_std[1][1], ad_std[1][2]
+    a22 = ad_std[2][2]
+    b00, b01, b02, b03, b04, b05, b06 = bd_std[0]
+    b10, b11, b12, b13, b14, b15, b16 = bd_std[1]
+
+    dt_arr = tape.dt_s
+    t_meas_arr = tape.t_meas
+    u_prod_arr = tape.u_prod
+    t_buf_top_arr = tape.t_buf_top
+    q_fh_hyd_arr = tape.q_fh_hyd
+    is_harvest_arr = tape.is_harvest
+    ac_eff_arr = tape.ac_eff_el
+    q_ac_fixed_arr = tape.q_ac_fixed
+    t_out_arr = tape.t_out
+    v_exc_arr = tape.v_excess
+    i_sol_arr = tape.i_sol
+    t_down_arr = tape.t_down
+    q_int_arr = tape.q_int
+    t_up_arr = tape.t_up
+
+    errs: list[float] = [0.0] * length_steps
+    q_fhs: list[float] = [0.0] * length_steps
+
+    for s in range(1, length_steps + 1):
+        idx = k0 + s
+        up_uz = u_prod_arr[idx]
+        if up_uz == 0.0:
+            qh = q_fh_hyd_arr[idx]
+            q_fh_s = (qh * khx_ratio) if qh > 0.0 else 0.0
+        elif is_harvest_arr[idx]:
+            q_fh_s = up_uz * khx * (t_buf_top_arr[idx] - ox1)
+            if q_fh_s < 0.0:
+                q_fh_s = 0.0
+        else:
+            q_fh_s = q_fh_hyd_arr[idx] * khx_scale_act
+
+        q_ac_s = (
+            (ac_eff_arr[idx] * eta_ac + q_ac_fixed_arr[idx]) if is_kt else 0.0
+        )
+
+        dt_idx = dt_arr[idx]
+        v_exc_idx = v_exc_arr[idx]
+        if dt_idx == 300.0 and (c_wind == 0.0 or v_exc_idx == 0.0):
+            nx0 = (
+                a00 * ox0
+                + a01 * ox1
+                + a02 * ox2
+                + b00 * t_out_arr[idx]
+                + b01 * t_up_arr[idx]
+                + b02 * t_down_arr[idx]
+                + b03 * i_sol_arr[idx]
+                + b04 * q_fh_s
+                + b05 * q_int_arr[idx]
+                + b06 * q_ac_s
+            )
+            nx1 = (
+                a10 * ox0
+                + a11 * ox1
+                + a12 * ox2
+                + b10 * t_out_arr[idx]
+                + b11 * t_up_arr[idx]
+                + b12 * t_down_arr[idx]
+                + b13 * i_sol_arr[idx]
+                + b14 * q_fh_s
+                + b15 * q_int_arr[idx]
+                + b16 * q_ac_s
+            )
+            ox2 = a22 * ox2
+        else:
+            v_eff_idx = 0.0 if c_wind == 0.0 else v_exc_idx
+            ad_o, bd_o, _, _, _ = zoh_kalman._discretize_ab_cached(
+                params, dt_idx, v_eff_idx
+            )
+            bo0 = bd_o[0]
+            bo1 = bd_o[1]
+            nx0 = (
+                ad_o[0][0] * ox0
+                + ad_o[0][1] * ox1
+                + ad_o[0][2] * ox2
+                + bo0[0] * t_out_arr[idx]
+                + bo0[1] * t_up_arr[idx]
+                + bo0[2] * t_down_arr[idx]
+                + bo0[3] * i_sol_arr[idx]
+                + bo0[4] * q_fh_s
+                + bo0[5] * q_int_arr[idx]
+                + bo0[6] * q_ac_s
+            )
+            nx1 = (
+                ad_o[1][0] * ox0
+                + ad_o[1][1] * ox1
+                + ad_o[1][2] * ox2
+                + bo1[0] * t_out_arr[idx]
+                + bo1[1] * t_up_arr[idx]
+                + bo1[2] * t_down_arr[idx]
+                + bo1[3] * i_sol_arr[idx]
+                + bo1[4] * q_fh_s
+                + bo1[5] * q_int_arr[idx]
+                + bo1[6] * q_ac_s
+            )
+            ox2 = ad_o[2][2] * ox2
+
+        ox0, ox1 = nx0, nx1
+        errs[s - 1] = ox0 - t_meas_arr[idx]
+        q_fhs[s - 1] = q_fh_s
+
+    return errs, q_fhs
 
 
 class LiveHindcastTracker:
@@ -1233,37 +3212,6 @@ def _compute_regime_metrics(
     )
 
 
-def _rollout_open_loop_window(
-    hist: PreprocessedHistory,
-    zone: contracts.ZoneId,
-    k0: int,
-    length_steps: int,
-    state_init: contracts.ThermalState,
-    params: contracts.ZoneParameters,
-    exog_list: Sequence[contracts.ExogenousStepInput],
-    t_meas_arr: Sequence[float],
-) -> tuple[list[float], list[float]]:
-    """Rolls out open-loop ZOH from `k0` for `length_steps`."""
-    st = state_init
-    errs: list[float] = []
-    q_fhs: list[float] = []
-    for s in range(1, length_steps + 1):
-        idx = k0 + s
-        q_fh_s = step_q_fh_for_params(hist, zone, idx, st.t_floor_c, params)
-        q_ac_s = step_q_ac_for_params(hist, zone, idx, params)
-        st = zoh_kalman.propagate_open_loop_step(
-            state=st,
-            params=params,
-            exog=exog_list[idx],
-            q_fh_w=q_fh_s,
-            q_ac_w=q_ac_s,
-            dt_s=hist.dt_s[idx],
-        )
-        errs.append(st.t_air_c - t_meas_arr[idx])
-        q_fhs.append(q_fh_s)
-    return errs, q_fhs
-
-
 def _is_valid_eval_start(
     hist: PreprocessedHistory,
     zone: contracts.ZoneId,
@@ -1345,12 +3293,15 @@ def evaluate_14d_hindcast(
     lat_deg: float = house_config.LATITUDE_DEG,
     lon_deg: float = house_config.LONGITUDE_DEG,
     _ref_d_act: Sequence[float] | None = None,
+    precomputed_hist_eval: PreprocessedHistory | None = None,
+    precomputed_hist_prior: PreprocessedHistory | None = None,
+    eval_steps: int = EVAL_14D_STEPS,
 ) -> contracts.ZoneEvaluationReport:
-    """Evaluates 14-day 6h (and `kt` 1h AC) open-loop hindcast performance.
+    """Evaluates 14-day (or custom tail) 6h & `kt` 1h AC open-loop hindcast.
 
     Runs dual parameter-consistent forward Kalman reconstructions under
-    `params_eval` and `params_prior` over up to 16 days (`48h` spin-up + `14d`
-    evaluation) so comparisons against Day-1 priors suffer zero initial-state
+    `params_eval` and `params_prior` over up to `48h` spin-up + `eval_steps`
+    evaluation so comparisons against Day-1 priors suffer zero initial-state
     enthalpy jump.
 
     Args:
@@ -1360,8 +3311,14 @@ def evaluate_14d_hindcast(
         params_prior: Reference Day-1 prior `ZoneParameters` for Skill Score.
         flow_rates_l_min: Optional manifold flow rates [L/min].
         k_hx_by_group: Optional `K_hx` [W/K] mapping per group.
+        lat_deg: Observer latitude in degrees North.
+        lon_deg: Observer longitude in degrees East.
         _ref_d_act: Optional shared disturbance series used by the holdout gate
             to guarantee identical window selection between two parameter sets.
+        precomputed_hist_eval: Optional precomputed history for `params_eval`.
+        precomputed_hist_prior: Optional precomputed history for `params_prior`.
+        eval_steps: Number of tail evaluation steps after 48h spin-up
+            (default `EVAL_14D_STEPS = 4032`).
 
     Returns:
         Complete `ZoneEvaluationReport` across `overall_6h` and all physical
@@ -1399,9 +3356,21 @@ def evaluate_14d_hindcast(
             by_regime=by_reg,
         )
 
-    start_slice = max(0, n_total - MAX_EVAL_SLICE_STEPS)
-    sub_cols = slice_columns(columns, start_slice, n_total)
+    eff_eval_steps = max(HORIZON_6H_STEPS + 1, int(eval_steps))
+    max_slice_steps = SPINUP_48H_STEPS + eff_eval_steps
+    start_slice = max(0, n_total - max_slice_steps)
     n_slice = n_total - start_slice
+    sub_cols_cache: Mapping[str, Sequence[float | int]] | None = None
+
+    def _get_sub_cols() -> Mapping[str, Sequence[float | int]]:
+        nonlocal sub_cols_cache
+        if sub_cols_cache is None:
+            sub_cols_cache = (
+                columns
+                if start_slice == 0
+                else slice_columns(columns, start_slice, n_total)
+            )
+        return sub_cols_cache
 
     if n_slice >= SPINUP_48H_STEPS + HORIZON_6H_STEPS:
         spinup_steps = SPINUP_48H_STEPS
@@ -1413,42 +3382,107 @@ def evaluate_14d_hindcast(
         for group_name, val in k_hx_by_group.items():
             target_key = "kantoor" if group_name == "kt" else group_name
             k_hx_eval_map[target_key] = float(val)
-    k_hx_eval_map["wk" if zone == "wk" else "kantoor"] = params_eval.k_hx_w_k
+    zone_khx_key = "wk" if zone == "wk" else "kantoor"
+    k_hx_eval_map[zone_khx_key] = params_eval.k_hx_w_k
 
     k_hx_prior_map = dict(house_config.DAY1_K_HX_BY_GROUP_W_K)
-    k_hx_prior_map["wk" if zone == "wk" else "kantoor"] = params_prior.k_hx_w_k
+    k_hx_prior_map[zone_khx_key] = params_prior.k_hx_w_k
 
-    hist_eval = preprocess_history_columns(
-        sub_cols,
-        flow_rates_l_min=flow_rates_l_min,
-        k_hx_by_group=k_hx_eval_map,
-        eta_ac_ref=params_eval.eta_ac,
-        lat_deg=lat_deg,
-        lon_deg=lon_deg,
-    )
-    hist_prior = preprocess_history_columns(
-        sub_cols,
-        flow_rates_l_min=flow_rates_l_min,
-        k_hx_by_group=k_hx_prior_map,
-        eta_ac_ref=params_prior.eta_ac,
-        lat_deg=lat_deg,
-        lon_deg=lon_deg,
+    def _hist_matches_khx(
+        cand_h: PreprocessedHistory | None,
+        target_khx: float,
+    ) -> bool:
+        if cand_h is None or cand_h.n_rows != n_slice:
+            return False
+        h_khx = cand_h.hyd_k_hx_wk if zone == "wk" else cand_h.hyd_k_hx_kt
+        return abs(h_khx - target_khx) <= 1e-9
+
+    if _hist_matches_khx(precomputed_hist_eval, k_hx_eval_map[zone_khx_key]):
+        assert precomputed_hist_eval is not None
+        hist_eval = precomputed_hist_eval
+    elif _hist_matches_khx(precomputed_hist_prior, k_hx_eval_map[zone_khx_key]):
+        assert precomputed_hist_prior is not None
+        hist_eval = precomputed_hist_prior
+    elif (
+        precomputed_hist_eval is not None
+        and precomputed_hist_eval.n_rows == n_slice
+    ):
+        hist_eval = recompute_history_for_khx(
+            precomputed_hist_eval,
+            _get_sub_cols(),
+            flow_rates_l_min=flow_rates_l_min,
+            k_hx_by_group=k_hx_eval_map,
+        )
+    else:
+        hist_eval = preprocess_history_columns(
+            _get_sub_cols(),
+            flow_rates_l_min=flow_rates_l_min,
+            k_hx_by_group=k_hx_eval_map,
+            eta_ac_ref=params_eval.eta_ac,
+            lat_deg=lat_deg,
+            lon_deg=lon_deg,
+        )
+
+    if _hist_matches_khx(precomputed_hist_prior, k_hx_prior_map[zone_khx_key]):
+        assert precomputed_hist_prior is not None
+        hist_prior = precomputed_hist_prior
+    elif _hist_matches_khx(hist_eval, k_hx_prior_map[zone_khx_key]):
+        hist_prior = hist_eval
+    else:
+        hist_prior = recompute_history_for_khx(
+            hist_eval,
+            _get_sub_cols(),
+            flow_rates_l_min=flow_rates_l_min,
+            k_hx_by_group=k_hx_prior_map,
+        )
+
+    tape_eval = get_zone_tape(hist_eval, zone)
+    tape_prior = (
+        tape_eval
+        if hist_prior is hist_eval
+        else get_zone_tape(hist_prior, zone)
     )
 
-    exog_eval = build_zone_exog_list(hist_eval, zone)
-    exog_prior = build_zone_exog_list(hist_prior, zone)
+    states_eval = _reconstruct_states_on_tape(tape_eval, params_eval)
+    states_prior = _reconstruct_states_on_tape(tape_prior, params_prior)
 
-    states_eval, _, _, _ = reconstruct_kalman_states(
-        hist_eval, zone, params_eval, exog_eval
+    ad_eval, bd_eval, _, _, _ = zoh_kalman._discretize_ab_cached(
+        params_eval, 300.0, 0.0
     )
-    states_prior, _, _, _ = reconstruct_kalman_states(
-        hist_prior, zone, params_prior, exog_prior
+    ad_prior, bd_prior, _, _, _ = zoh_kalman._discretize_ab_cached(
+        params_prior, 300.0, 0.0
+    )
+    eval_khx_ratio = (
+        (params_eval.k_hx_w_k / tape_eval.hyd_k_hx)
+        if tape_eval.hyd_k_hx > 1e-6
+        else 1.0
+    )
+    eval_khx_act = (
+        eval_khx_ratio
+        if (
+            tape_eval.hyd_k_hx > 1e-6
+            and abs(params_eval.k_hx_w_k - tape_eval.hyd_k_hx) > 1e-6
+        )
+        else 1.0
+    )
+    prior_khx_ratio = (
+        (params_prior.k_hx_w_k / tape_prior.hyd_k_hx)
+        if tape_prior.hyd_k_hx > 1e-6
+        else 1.0
+    )
+    prior_khx_act = (
+        prior_khx_ratio
+        if (
+            tape_prior.hyd_k_hx > 1e-6
+            and abs(params_prior.k_hx_w_k - tape_prior.hyd_k_hx) > 1e-6
+        )
+        else 1.0
     )
 
     if _ref_d_act is not None and len(_ref_d_act) == n_slice:
         d_act = list(_ref_d_act)
     else:
-        d_act = [st.d_est_w for st in states_eval]
+        d_act = [st[2] for st in states_eval]
 
     t_meas = hist_eval.t_air_wk_c if zone == "wk" else hist_eval.t_air_kt_c
     i_sol_arr = (
@@ -1479,25 +3513,27 @@ def evaluate_14d_hindcast(
         if lw < MIN_CLEAN_6H_STEPS:
             continue
 
-        e_eval, q_fh_ol = _rollout_open_loop_window(
-            hist_eval,
-            zone,
+        e_eval, q_fh_ol = _rollout_open_loop_window_fast(
+            tape_eval,
             k0,
             lw,
             states_eval[k0],
             params_eval,
-            exog_eval,
-            t_meas,
+            ad_eval,
+            bd_eval,
+            eval_khx_ratio,
+            eval_khx_act,
         )
-        e_prior, _ = _rollout_open_loop_window(
-            hist_prior,
-            zone,
+        e_prior, _ = _rollout_open_loop_window_fast(
+            tape_prior,
             k0,
             lw,
             states_prior[k0],
             params_prior,
-            exog_prior,
-            t_meas,
+            ad_prior,
+            bd_prior,
+            prior_khx_ratio,
+            prior_khx_act,
         )
 
         overall_eval.append(e_eval)
@@ -1589,28 +3625,30 @@ def evaluate_14d_hindcast(
             if lw_ac < HORIZON_AC_1H_STEPS:
                 continue
 
-            e_eval_ac, q_fh_ac = _rollout_open_loop_window(
-                hist_eval,
-                zone,
+            e_eval_ac, q_fh_ac = _rollout_open_loop_window_fast(
+                tape_eval,
                 k0,
                 HORIZON_AC_1H_STEPS,
                 states_eval[k0],
                 params_eval,
-                exog_eval,
-                t_meas,
+                ad_eval,
+                bd_eval,
+                eval_khx_ratio,
+                eval_khx_act,
             )
             if max(q_fh_ac) >= 300.0:
                 continue
 
-            e_prior_ac, _ = _rollout_open_loop_window(
-                hist_prior,
-                zone,
+            e_prior_ac, _ = _rollout_open_loop_window_fast(
+                tape_prior,
                 k0,
                 HORIZON_AC_1H_STEPS,
                 states_prior[k0],
                 params_prior,
-                exog_prior,
-                t_meas,
+                ad_prior,
+                bd_prior,
+                prior_khx_ratio,
+                prior_khx_act,
             )
             reg_eval["airco_heating_1h"].append(e_eval_ac)
             reg_prior["airco_heating_1h"].append(e_prior_ac)

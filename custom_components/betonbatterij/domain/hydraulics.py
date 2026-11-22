@@ -28,6 +28,74 @@ _LEAKING_1E_GROUPS: tuple[str, ...] = (
     "werkkamer_1e",
 )
 
+_ZERO_GROUP_POWERS: dict[str, float] = {
+    g: 0.0 for g in const.ALL_HYDRAULIC_GROUPS
+}
+
+
+def _build_proxy_specs() -> tuple[
+    tuple[str, float, float, float, float, str], ...
+]:
+    """Precomputes 300s ZOH decay factors for the 8 unmodeled slab proxies."""
+    specs: list[tuple[str, float, float, float, float, str]] = []
+    for g, (
+        c_floor_wh_k,
+        r_fh_k_kw,
+    ) in house_config.UNMODELED_GROUP_THERMAL_PROPS.items():
+        h_fh_w_k = 1000.0 / r_fh_k_kw
+        tau_s = (c_floor_wh_k * 3600.0) / h_fh_w_k
+        alpha_300 = math.exp(-300.0 / tau_s)
+        upward_share = (
+            1.0 - house_config.BETA_DOWN_1E_LEAK
+            if g in _LEAKING_1E_GROUPS
+            else 1.0
+        )
+        specs.append(
+            (
+                g,
+                tau_s,
+                alpha_300,
+                1.0 - alpha_300,
+                upward_share / h_fh_w_k,
+                f"t_air_{g}_c",
+            )
+        )
+    return tuple(specs)
+
+
+_PROXY_SPECS: tuple[tuple[str, float, float, float, float, str], ...] = (
+    _build_proxy_specs()
+)
+_NUM_PROXY_GROUPS: int = len(_PROXY_SPECS)
+
+
+def scale_k_hx_eps_ntu(
+    k_hx_old: float,
+    flow_old_l_min: float,
+    flow_new_l_min: float,
+) -> float:
+    """Scales floor pipe conductance `K_hx` via epsilon-NTU heat-exchanger law.
+
+    Args:
+        k_hx_old: Existing effective pipe conductance [W/K].
+        flow_old_l_min: Previous group rotameter flow rate [L/min].
+        flow_new_l_min: New group rotameter flow rate [L/min].
+
+    Returns:
+        Physically scaled pipe conductance `K_hx` [W/K].
+    """
+    if (
+        flow_old_l_min <= 0.0
+        or flow_new_l_min <= 0.0
+        or abs(flow_new_l_min - flow_old_l_min) < 1e-6
+    ):
+        return float(k_hx_old)
+    c_old = flow_old_l_min * house_config.WATER_POWER_FACTOR_W_PER_LMIN_K
+    c_new = flow_new_l_min * house_config.WATER_POWER_FACTOR_W_PER_LMIN_K
+    eps_old = min(0.95, max(1e-4, k_hx_old / max(1e-3, c_old)))
+    ua_pipe = -c_old * math.log(1.0 - eps_old)
+    return c_new * (1.0 - math.exp(-ua_pipe / max(1e-3, c_new)))
+
 
 def _is_valid_num(val: float | int | None) -> TypeGuard[float | int]:
     """Checks whether `val` is a finite `float` or `int`."""
@@ -121,24 +189,28 @@ class HydraulicModel:
                     v
                     if (v := self._lookup_group_val(k_hx_by_group_w_k, g))
                     is not None
-                    else house_config.DAY1_K_HX_BY_GROUP_W_K[g]
-                    * (
-                        self.flow_rates_l_min[g]
-                        / const.DEFAULT_FLOW_RATES_L_MIN[g]
+                    else scale_k_hx_eps_ntu(
+                        house_config.DAY1_K_HX_BY_GROUP_W_K[g],
+                        const.DEFAULT_FLOW_RATES_L_MIN[g],
+                        self.flow_rates_l_min[g],
                     ),
                 )
                 for g in const.ALL_HYDRAULIC_GROUPS
             }
         else:
             self.k_hx_by_group_w_k = {
-                g: house_config.DAY1_K_HX_BY_GROUP_W_K[g]
-                * (
-                    self.flow_rates_l_min[g]
-                    / const.DEFAULT_FLOW_RATES_L_MIN[g]
+                g: max(
+                    1.0,
+                    scale_k_hx_eps_ntu(
+                        house_config.DAY1_K_HX_BY_GROUP_W_K[g],
+                        const.DEFAULT_FLOW_RATES_L_MIN[g],
+                        self.flow_rates_l_min[g],
+                    ),
                 )
                 for g in const.ALL_HYDRAULIC_GROUPS
             }
 
+        self._proxy_specs = _PROXY_SPECS
         self.t_floor_proxy_c: dict[str, float] = {
             g: 19.0 for g in house_config.UNMODELED_GROUP_THERMAL_PROPS
         }
@@ -150,7 +222,7 @@ class HydraulicModel:
         ] = collections.deque(maxlen=TELESCOPE_STEPS)
 
     def update_flow_rates(self, flow_rates_l_min: Mapping[str, float]) -> None:
-        """Updates rotameter flow rates [L/min] and scales `k_hx` proportionally.
+        """Updates rotameter flow rates [L/min] and scales `k_hx` via eps-NTU.
 
         Args:
             flow_rates_l_min: Mapping from hydraulic group name to new [L/min].
@@ -161,7 +233,10 @@ class HydraulicModel:
                 old_flow = max(0.05, self.flow_rates_l_min[g])
                 new_flow = max(0.05, val)
                 self.k_hx_by_group_w_k[g] = max(
-                    1.0, self.k_hx_by_group_w_k[g] * (new_flow / old_flow)
+                    1.0,
+                    scale_k_hx_eps_ntu(
+                        self.k_hx_by_group_w_k[g], old_flow, new_flow
+                    ),
                 )
                 self.flow_rates_l_min[g] = new_flow
         self._cal_window.clear()
@@ -306,14 +381,57 @@ class HydraulicModel:
             if not _is_valid_num(u_pump_sec)
             else max(0.0, min(1.0, float(u_pump_sec)))
         )
+
+        # Fast path when secondary circulation pump is off (`u_pump == 0.0`).
+        if u_pump == 0.0:
+            if self._cal_window:
+                self._cal_window.clear()
+            proxies = self.t_floor_proxy_c
+            inited = self._proxy_initialized
+            need_seed = len(inited) < _NUM_PROXY_GROUPS
+            is_300 = step_s == 300.0
+            for g, tau_s, a300, oma300, _, alt_key in self._proxy_specs:
+                r_air = room_temps_c.get(g)
+                if r_air is None:
+                    r_air = room_temps_c.get(alt_key)
+                if r_air is not None and math.isfinite(r_air):
+                    t_air_g = float(r_air)
+                    if need_seed and g not in inited:
+                        proxies[g] = t_air_g
+                        inited.add(g)
+                    elif is_300:
+                        proxies[g] = a300 * proxies[g] + oma300 * t_air_g
+                    else:
+                        alpha = math.exp(-step_s / tau_s)
+                        proxies[g] = alpha * proxies[g] + (1.0 - alpha) * t_air_g
+
+            return HydraulicStepResult(
+                q_fh_by_group_w=_ZERO_GROUP_POWERS.copy(),
+                q_fh_wk_w=0.0,
+                q_fh_kt_w=0.0,
+                q_leak_1e_to_wk_w=0.0,
+                t_sup_sec_c=0.5
+                * (float(t_buf_top_start_c) + float(t_buf_top_end_c)),
+                q_sec_calorimetric_w=0.0,
+                gamma_cal=self.gamma_cal,
+                f_flow_wk=0.0,
+                f_flow_kt=0.0,
+            )
+
         u_eff = self._resolve_valve_openings(u_valves)
 
         # Seed unmodeled slab proxies from first valid room air measurement.
-        for g in house_config.UNMODELED_GROUP_THERMAL_PROPS:
-            r_val = room_temps_c.get(g, room_temps_c.get(f"t_air_{g}_c"))
-            if g not in self._proxy_initialized and _is_valid_num(r_val):
-                self.t_floor_proxy_c[g] = float(r_val)
-                self._proxy_initialized.add(g)
+        proxies = self.t_floor_proxy_c
+        inited = self._proxy_initialized
+        if len(inited) < _NUM_PROXY_GROUPS:
+            for g, _, _, _, _, alt_key in self._proxy_specs:
+                if g not in inited:
+                    r_val = room_temps_c.get(g)
+                    if r_val is None:
+                        r_val = room_temps_c.get(alt_key)
+                    if _is_valid_num(r_val):
+                        proxies[g] = float(r_val)
+                        inited.add(g)
 
         weighted_flows = {
             g: u_eff[g] * self.flow_rates_l_min[g]
@@ -454,27 +572,19 @@ class HydraulicModel:
         )
 
         # Advance 1-node slab proxies for the 8 unmodeled groups via exact ZOH.
-        props_map = house_config.UNMODELED_GROUP_THERMAL_PROPS
-        for g, (c_floor_wh_k, r_fh_k_kw) in props_map.items():
-            c_j_k = c_floor_wh_k * 3600.0
-            h_fh_w_k = 1000.0 / r_fh_k_kw
-            tau_s = c_j_k / h_fh_w_k
-            alpha = math.exp(-step_s / tau_s)
-
-            r_air = room_temps_c.get(g, room_temps_c.get(f"t_air_{g}_c"))
-            t_air_g = (
-                float(r_air) if _is_valid_num(r_air) else self.t_floor_proxy_c[g]
-            )
-            upward_share = (
-                1.0 - house_config.BETA_DOWN_1E_LEAK
-                if g in _LEAKING_1E_GROUPS
-                else 1.0
-            )
-            q_slab_net_w = upward_share * q_fh_by_group_w[g]
-            t_eq_g = t_air_g + q_slab_net_w / h_fh_w_k
-            self.t_floor_proxy_c[g] = (
-                alpha * self.t_floor_proxy_c[g] + (1.0 - alpha) * t_eq_g
-            )
+        is_300 = step_s == 300.0
+        for g, tau_s, a300, oma300, share_over_h, alt_key in self._proxy_specs:
+            r_air = room_temps_c.get(g)
+            if r_air is None:
+                r_air = room_temps_c.get(alt_key)
+            t_cur = proxies[g]
+            t_air_g = float(r_air) if _is_valid_num(r_air) else t_cur
+            t_eq_g = t_air_g + share_over_h * q_fh_by_group_w[g]
+            if is_300:
+                proxies[g] = a300 * t_cur + oma300 * t_eq_g
+            else:
+                alpha = math.exp(-step_s / tau_s)
+                proxies[g] = alpha * t_cur + (1.0 - alpha) * t_eq_g
 
         return HydraulicStepResult(
             q_fh_by_group_w=q_fh_by_group_w,

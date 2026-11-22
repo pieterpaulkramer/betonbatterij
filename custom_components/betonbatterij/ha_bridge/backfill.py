@@ -16,9 +16,14 @@ from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Any
 
 from ..const import (
+    AC_MODE_COOL,
+    AC_MODE_HEAT,
     AC_MODE_OFF,
+    AC_MODE_OTHER,
     DT_STEP_S,
     FLAG_AANWEZIG,
+    FLAG_AC_COOL_KT,
+    FLAG_LTS_BACKFILL,
     FLAG_OPEN_WIN_KT,
     FLAG_OPEN_WIN_WK,
     FLAG_PUMP_SEC_ON,
@@ -336,13 +341,18 @@ def _build_lts_row_at(
     if not any_out or (not math.isfinite(t_wk) and not math.isfinite(t_kt)):
         return None
 
-    v_prim = max(0.0, _s(entities.wp_pump_flow, 0.0))
+    v_prim_raw = _s(entities.wp_pump_flow)
+    v_prim = max(0.0, v_prim_raw) if math.isfinite(v_prim_raw) else 0.0
     t_wp_out = _s(entities.wp_outlet_temp)
     t_wp_in = _s(entities.wp_inlet_temp)
-    if math.isfinite(t_wp_out) and math.isfinite(t_wp_in):
+    if (
+        math.isfinite(v_prim_raw)
+        and math.isfinite(t_wp_out)
+        and math.isfinite(t_wp_in)
+    ):
         p_prim_th_w = 69.73 * v_prim * (t_wp_out - t_wp_in)
     else:
-        p_prim_th_w = 0.0
+        p_prim_th_w = float("nan")
 
     wp_el_raw = _s(entities.wp_power_consumption, 0.0)
     p_wp_el_w = max(
@@ -418,17 +428,33 @@ def _build_lts_row_at(
         prev_buf_bot if prev_buf_bot is not None else buf_bot_end
     )
 
-    heating_active = p_prim_th_w > 250.0
+    heating_active = math.isfinite(p_prim_th_w) and p_prim_th_w > 250.0
     u_pump = 1.0 if heating_active else 0.0
     u_bg = 1.0 if heating_active else 0.0
 
-    flags = FLAG_AANWEZIG
+    flags = FLAG_AANWEZIG | FLAG_LTS_BACKFILL
     if math.isfinite(t_wk):
         flags |= FLAG_VALID_WK
     if math.isfinite(t_kt):
         flags |= FLAG_VALID_KT
     if u_pump > 0.01:
         flags |= FLAG_PUMP_SEC_ON
+
+    t_out_ref = t_dak if math.isfinite(t_dak) else t_hm
+    if p_ac_w > 40.0:
+        if (math.isfinite(t_kt) and t_kt >= 22.5) or (
+            math.isfinite(t_out_ref) and t_out_ref >= 17.0
+        ):
+            ac_mode_code = AC_MODE_COOL
+            flags |= FLAG_AC_COOL_KT
+        elif (not math.isfinite(t_out_ref) or t_out_ref < 15.0) and (
+            not math.isfinite(t_kt) or t_kt < 21.5
+        ):
+            ac_mode_code = AC_MODE_HEAT
+        else:
+            ac_mode_code = AC_MODE_OTHER
+    else:
+        ac_mode_code = AC_MODE_OFF
 
     return {
         "ts_utc": ts,
@@ -476,7 +502,7 @@ def _build_lts_row_at(
         "screen_small_pos": 100.0,
         "screen_large_pos": 100.0,
         "p_el_ac_kt_w": p_ac_w,
-        "ac_mode_code": 1.0 if p_ac_w > 40.0 else AC_MODE_OFF,
+        "ac_mode_code": ac_mode_code,
         "p_desk_kt_w": p_desk_w,
         "pir_occ_kt": 0.0,
         "p_growlights_kt_w": p_grow_w,

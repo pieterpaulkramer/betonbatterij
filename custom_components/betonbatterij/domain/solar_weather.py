@@ -8,6 +8,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 import datetime
+import functools
 import math
 from typing import Any, TypeGuard
 import zoneinfo
@@ -44,15 +45,41 @@ def _is_valid_number(value: float | int | None) -> TypeGuard[float | int]:
     return value is not None and math.isfinite(value)
 
 
+@functools.lru_cache(maxsize=8)
+def _get_zoneinfo(tz_name: str) -> zoneinfo.ZoneInfo | None:
+    """Returns a cached `ZoneInfo` instance, or `None` if unavailable."""
+    try:
+        return zoneinfo.ZoneInfo(tz_name)
+    except (zoneinfo.ZoneInfoNotFoundError, KeyError, ValueError):
+        return None
+
+
+@functools.lru_cache(maxsize=16)
+def _eu_dst_bounds_utc(year: int) -> tuple[int, int]:
+    """Computes EU CEST start and end Unix UTC timestamps for `year`."""
+    utc = datetime.timezone.utc
+    mar31_wd = datetime.datetime(year, 3, 31, tzinfo=utc).weekday()
+    last_sun_mar = 31 - ((mar31_wd + 1) % 7)
+    dst_start = int(
+        datetime.datetime(year, 3, last_sun_mar, 1, 0, tzinfo=utc).timestamp()
+    )
+    oct31_wd = datetime.datetime(year, 10, 31, tzinfo=utc).weekday()
+    last_sun_oct = 31 - ((oct31_wd + 1) % 7)
+    dst_end = int(
+        datetime.datetime(year, 10, last_sun_oct, 1, 0, tzinfo=utc).timestamp()
+    )
+    return dst_start, dst_end
+
+
 def local_hour_minute(
     ts_utc: int,
     tz_name: str = house_config.TIMEZONE_NAME,
 ) -> tuple[int, int]:
     """Converts a Unix UTC timestamp to local `(hour, minute)`.
 
-    Uses `zoneinfo.ZoneInfo` when OS timezone data is available and falls back
-    to exact European Union CET/CEST transition rules on bare Windows installs
-    without the external `tzdata` package.
+    Uses cached `zoneinfo.ZoneInfo` when OS timezone data is available and falls
+    back to exact European Union CET/CEST transition rules on bare Windows
+    installs without the external `tzdata` package.
 
     Args:
         ts_utc: Unix timestamp in seconds (UTC).
@@ -61,32 +88,20 @@ def local_hour_minute(
     Returns:
         A tuple `(hour, minute)` in local wall-clock time (`0..23`, `0..59`).
     """
-    try:
-        dt_local = datetime.datetime.fromtimestamp(
-            ts_utc, tz=zoneinfo.ZoneInfo(tz_name)
-        )
+    tz_obj = _get_zoneinfo(tz_name)
+    if tz_obj is not None:
+        dt_local = datetime.datetime.fromtimestamp(ts_utc, tz=tz_obj)
         return dt_local.hour, dt_local.minute
-    except (zoneinfo.ZoneInfoNotFoundError, KeyError, ValueError):
-        utc = datetime.timezone.utc
-        dt_utc = datetime.datetime.fromtimestamp(ts_utc, tz=utc)
-        year = dt_utc.year
-        # Last Sunday of March at 01:00 UTC -> CEST (UTC+2).
-        mar31_wd = datetime.datetime(year, 3, 31, tzinfo=utc).weekday()
-        last_sun_mar = 31 - ((mar31_wd + 1) % 7)
-        dst_start = int(
-            datetime.datetime(year, 3, last_sun_mar, 1, 0, tzinfo=utc).timestamp()
-        )
-        # Last Sunday of October at 01:00 UTC -> CET (UTC+1).
-        oct31_wd = datetime.datetime(year, 10, 31, tzinfo=utc).weekday()
-        last_sun_oct = 31 - ((oct31_wd + 1) % 7)
-        dst_end = int(
-            datetime.datetime(year, 10, last_sun_oct, 1, 0, tzinfo=utc).timestamp()
-        )
-        offset_s = 7200 if dst_start <= ts_utc < dst_end else 3600
-        dt_cet = datetime.datetime.fromtimestamp(ts_utc + offset_s, tz=utc)
-        return dt_cet.hour, dt_cet.minute
+
+    utc = datetime.timezone.utc
+    dt_utc = datetime.datetime.fromtimestamp(ts_utc, tz=utc)
+    dst_start, dst_end = _eu_dst_bounds_utc(dt_utc.year)
+    offset_s = 7200 if dst_start <= ts_utc < dst_end else 3600
+    sec_of_day = math.floor(ts_utc + offset_s) % 86400
+    return sec_of_day // 3600, (sec_of_day % 3600) // 60
 
 
+@functools.lru_cache(maxsize=4096)
 def solar_position(
     ts_utc: int,
     lat_deg: float = house_config.LATITUDE_DEG,
@@ -319,8 +334,11 @@ def project_solar_irradiance(
         p_eff_w = max(0.0, float(p_pv_w))
         pv_fallback_used = False
 
+    if p_eff_w <= 0.0:
+        return 0.0, 0.0, eta_scr_dir, pv_fallback_used
+
     elev_deg, az_deg = solar_position(ts_utc, lat_deg=lat_deg, lon_deg=lon_deg)
-    if elev_deg <= 0.0 or p_eff_w <= 0.0:
+    if elev_deg <= 0.0:
         return 0.0, 0.0, eta_scr_dir, pv_fallback_used
 
     i_dak_wm2 = p_eff_w / house_config.PV_PEAK_KWP
@@ -429,14 +447,18 @@ def select_outdoor_temp(
 
     if _is_valid_number(t_dak_c):
         t_dak = float(t_dak_c)
-        elev_deg, az_deg = solar_position(
-            ts_utc, lat_deg=lat_deg, lon_deg=lon_deg
-        )
-        if 0.0 < elev_deg < 18.0 and az_deg < 130.0:
-            if _is_valid_number(t_hm_ema_c):
-                return min(t_dak, float(t_hm_ema_c) + bias + 1.0)
-            if _is_valid_number(t_weather_c):
-                return min(t_dak, float(t_weather_c) + 1.0)
+        if _is_valid_number(t_hm_ema_c):
+            clamp_ref: float | None = float(t_hm_ema_c) + bias + 1.0
+        elif _is_valid_number(t_weather_c):
+            clamp_ref = float(t_weather_c) + 1.0
+        else:
+            clamp_ref = None
+        if clamp_ref is not None and t_dak > clamp_ref:
+            elev_deg, az_deg = solar_position(
+                ts_utc, lat_deg=lat_deg, lon_deg=lon_deg
+            )
+            if 0.0 < elev_deg < 18.0 and az_deg < 130.0:
+                return clamp_ref
         return t_dak
 
     if _is_valid_number(t_weather_c):

@@ -639,3 +639,82 @@ class TestResolutionTobitAndKalmanGuards:
             t_air_meas_c=t_after_2h.t_air_c,
         )
         assert abs(bridged.t_floor_c - t_after_2h.t_floor_c) < 0.05
+
+    def test_qd_basis_cached_linearity_equivalence_and_zero_qfh_misses(
+        self,
+    ) -> None:
+        """`_discretize_qd_basis_cached` matches Van Loan (<1e-12) & caches."""
+        params = dataclasses.replace(
+            house_config.DAY1_PRIORS_WK,
+            c_wind=0.08,
+            h_loss_w_k=53.5,
+            r_fh_k_kw=2.12,
+        )
+        for dt_s, v_wind, sigma_d, u_pump, q_fh, q_vent in [
+            (300.0, 2.0, 110.0, 1.0, 2350.0, 0.0),
+            (300.0, 7.5, 280.0, 0.7, 940.0, zoh_kalman.Q_AIR_OPEN_WINDOW_K2_S),
+            (10800.0, 1.5, 20.0, 0.0, 0.0, 0.0),
+            (900.0, 5.2, 75.0, 1.0, 1825.0, 0.0),
+        ]:
+            v_exc = max(0.0, v_wind - 3.0) if params.c_wind != 0.0 else 0.0
+            g0, g1, g2 = zoh_kalman._discretize_qd_basis_cached(
+                params, dt_s, v_exc
+            )
+            for gm in (g0, g1, g2):
+                for i in range(3):
+                    for j in range(3):
+                        assert gm[i][j] == gm[j][i]
+
+            c_floor = 3600.0 * params.c_floor_wh_k
+            tau_d = 3600.0 * params.tau_d_h
+            qc00 = zoh_kalman.Q_AIR_BASE_K2_S + q_vent
+            qc11 = (
+                zoh_kalman.Q_FLOOR_IDLE_K2_S
+                + u_pump
+                * (
+                    zoh_kalman.Q_FLOOR_PUMP_K2_S
+                    - zoh_kalman.Q_FLOOR_IDLE_K2_S
+                )
+                + ((0.08 * abs(q_fh)) ** 2)
+                * zoh_kalman.TAU_HYDR_S
+                / (c_floor * c_floor)
+            )
+            qc22 = (2.0 * sigma_d * sigma_d) / tau_d
+
+            _, _, qd_fn = zoh_kalman.discretize_zoh_3x3(
+                params,
+                dt_s=dt_s,
+                v_wind_ms=v_wind,
+                sigma_d_w=sigma_d,
+                u_pump=u_pump,
+                q_fh_w=q_fh,
+                q_air_vent=q_vent,
+            )
+            for i in range(3):
+                for j in range(3):
+                    qd_lin = (
+                        qc00 * g0[i][j] + qc11 * g1[i][j] + qc22 * g2[i][j]
+                    )
+                    assert abs(qd_lin - qd_fn[i][j]) < 1e-12
+
+            if v_wind <= 3.0 and q_vent == 0.0:
+                _, _, qd_dec = _decimal_reference_zoh(
+                    params, dt_s, sigma_d, u_pump, q_fh
+                )
+                for i in range(3):
+                    for j in range(3):
+                        assert abs(qd_fn[i][j] - qd_dec[i][j]) < 1e-12
+
+        zoh_kalman._discretize_qd_basis_cached.cache_clear()
+        for step_idx in range(50):
+            zoh_kalman.discretize_zoh_3x3(
+                params,
+                dt_s=300.0,
+                v_wind_ms=2.2,
+                sigma_d_w=110.0,
+                u_pump=1.0,
+                q_fh_w=200.0 + 41.3 * step_idx,
+            )
+        info = zoh_kalman._discretize_qd_basis_cached.cache_info()
+        assert info.misses == 1
+        assert info.hits == 49

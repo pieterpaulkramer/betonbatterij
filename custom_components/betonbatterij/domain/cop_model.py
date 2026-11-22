@@ -14,8 +14,10 @@ from typing import Any, TypeAlias, TypeGuard
 from custom_components.betonbatterij import const
 from custom_components.betonbatterij import house_config
 from custom_components.betonbatterij.domain import contracts
+from custom_components.betonbatterij.domain import evaluation
 from custom_components.betonbatterij.domain import solar_weather
 
+MIN_CV_RUN_STEPS: int = 12  # >= 60 min steady CV run (incl. 15 min startup).
 DHW_COMP_MAX_TEMP_C: float = 51.0
 DHW_FIT_MAX_TEMP_C: float = 50.5
 BACKUP_HEATER_POWER_W: float = 3000.0
@@ -215,12 +217,15 @@ def calibrate_p1_power_bias(
 
     flags_col = columns.get("flags")
     p_ac_col = columns.get("p_el_ac_kt_w")
+    is_lts_row, _ = evaluation.detect_lts_and_missing_prim_rows(columns)
 
     is_off: list[bool] = [False] * n
     is_on: list[bool] = [False] * n
     p_house_minus_raw: list[float] = [math.nan] * n
 
     for i in range(n):
+        if i < len(is_lts_row) and is_lts_row[i]:
+            continue
         if ts_col is not None:
             hr, mn = solar_weather.local_hour_minute(int(ts_col[i]), tz_name)
             mins = hr * 60 + mn
@@ -233,6 +238,8 @@ def calibrate_p1_power_bias(
             if flags_col is not None and i < len(flags_col)
             else 0
         )
+        if (fl & const.FLAG_GAP_BRIDGED) != 0:
+            continue
         heater_on = (fl & const.FLAG_INTERNAL_HEATER) != 0
         defrost_on = (fl & const.FLAG_DEFROST_WP) != 0
 
@@ -465,7 +472,7 @@ def _extract_cop_runs(
     lat_deg: float = house_config.LATITUDE_DEG,
     lon_deg: float = house_config.LONGITUDE_DEG,
 ) -> tuple[list[_CvRunSample], list[_DhwRunSample]]:
-    """Extracts qualifying CV (`>= 45 min`) and DHW (`<= 50.5 °C`) runs."""
+    """Extracts qualifying CV (`>= 60 min`) and DHW (`<= 50.5 °C`) runs."""
     f_comp = columns.get("f_comp_hz", ())
     p_raw = columns.get("p_wp_raw_el_w", ())
     n = min(len(f_comp), len(p_raw))
@@ -475,6 +482,9 @@ def _extract_cop_runs(
     flags_col = columns.get("flags")
     t_sup_key = (
         "t_wp_out_c" if columns.get("t_wp_out_c") is not None else "t_buf_top_end_c"
+    )
+    is_lts_row, missing_prim_th = evaluation.detect_lts_and_missing_prim_rows(
+        columns
     )
 
     cv_runs: list[_CvRunSample] = []
@@ -488,6 +498,13 @@ def _extract_cop_runs(
             if flags_col is not None and idx < len(flags_col)
             else 0
         )
+        if (
+            (idx < len(is_lts_row) and is_lts_row[idx])
+            or (idx < len(missing_prim_th) and missing_prim_th[idx])
+            or (fl & const.FLAG_GAP_BRIDGED) != 0
+        ):
+            idx += 1
+            continue
         is_dhw = (fl & const.FLAG_DHW_TANK) != 0
         is_cool = (fl & const.FLAG_FLOOR_COOL) != 0
         is_defrost = (fl & const.FLAG_DEFROST_WP) != 0
@@ -502,6 +519,12 @@ def _extract_cop_runs(
                     if flags_col is not None and end_i < len(flags_col)
                     else 0
                 )
+                if (
+                    (end_i < len(is_lts_row) and is_lts_row[end_i])
+                    or (end_i < len(missing_prim_th) and missing_prim_th[end_i])
+                    or (fl_e & const.FLAG_GAP_BRIDGED) != 0
+                ):
+                    break
                 if (fl_e & const.FLAG_DHW_TANK) != 0 or (
                     fl_e & const.FLAG_FLOOR_COOL
                 ) != 0:
@@ -512,7 +535,7 @@ def _extract_cop_runs(
                 else:
                     break
 
-            if end_i - start_i >= 9:  # >= 45 min (skip 15 min startup peak).
+            if end_i - start_i >= MIN_CV_RUN_STEPS:  # >= 60 min (skip 15 min startup).
                 e_th_wh = 0.0
                 e_el_wh = 0.0
                 t_outs: list[float] = []
@@ -583,6 +606,12 @@ def _extract_cop_runs(
                     if flags_col is not None and end_i < len(flags_col)
                     else 0
                 )
+                if (
+                    (end_i < len(is_lts_row) and is_lts_row[end_i])
+                    or (end_i < len(missing_prim_th) and missing_prim_th[end_i])
+                    or (fl_e & const.FLAG_GAP_BRIDGED) != 0
+                ):
+                    break
                 if (fl_e & const.FLAG_DHW_TANK) == 0:
                     break
                 f_e = float(f_comp[end_i]) if _is_finite(f_comp[end_i]) else 0.0
@@ -814,6 +843,7 @@ def fit_cop_parameters(
     memory: contracts.ParameterPosteriorMemory | None = None,
     lat_deg: float = house_config.LATITUDE_DEG,
     lon_deg: float = house_config.LONGITUDE_DEG,
+    eval_columns: Mapping[str, Sequence[float | int]] | None = None,
 ) -> tuple[
     contracts.CopParameters,
     contracts.ParameterPosteriorMemory,
@@ -825,6 +855,10 @@ def fit_cop_parameters(
         columns: Columnar telemetry mapping from `ColumnarRingBuffer`.
         current_params: Currently active `CopParameters`.
         memory: Optional Choice D2 precision-weighted seasonal memory.
+        lat_deg: Observer latitude in degrees North.
+        lon_deg: Observer longitude in degrees East.
+        eval_columns: Optional full column mapping used to compute 14-day
+            run-COP RMSE diagnostics (`rmse_cop_14d`, `prior_rmse_cop_14d`).
 
     Returns:
         A tuple `(fitted_params, updated_memory, diagnostics)`, where
@@ -963,13 +997,25 @@ def fit_cop_parameters(
     )
 
     # 5. Evaluate 14-day run-COP RMSE (active fitted vs Day-1 priors).
-    all_end_ts = [r[0] for r in cv_runs] + [r[0] for r in dhw_runs]
-    cutoff_14d = (max(all_end_ts) - 14 * 86400) if all_end_ts else 0
+    eval_src = eval_columns if eval_columns is not None else columns
+    if eval_src is columns:
+        eval_cv_runs, eval_dhw_runs = cv_runs, dhw_runs
+    else:
+        eval_cv_runs, eval_dhw_runs = _extract_cop_runs(
+            eval_src, bias_ref_params, lat_deg=lat_deg, lon_deg=lon_deg
+        )
+
+    all_end_ts = [r[0] for r in eval_cv_runs] + [r[0] for r in eval_dhw_runs]
+    ts_eval_col = eval_src.get("ts_utc")
+    if ts_eval_col:
+        cutoff_14d = int(ts_eval_col[-1]) - 14 * 86400
+    else:
+        cutoff_14d = (max(all_end_ts) - 14 * 86400) if all_end_ts else 0
 
     sq_err_fit: list[float] = []
     sq_err_prior: list[float] = []
     day1 = house_config.DAY1_COP_PARAMS
-    for ts_e, t_out_r, t_sup_r, rh_r, y_obs in cv_runs:
+    for ts_e, t_out_r, t_sup_r, rh_r, y_obs in eval_cv_runs:
         if ts_e >= cutoff_14d:
             sq_err_fit.append(
                 (predict_cop_cv(fitted, t_out_r, t_sup_r, rh_r) - y_obs) ** 2
@@ -977,7 +1023,7 @@ def fit_cop_parameters(
             sq_err_prior.append(
                 (predict_cop_cv(day1, t_out_r, t_sup_r, rh_r) - y_obs) ** 2
             )
-    for ts_e, t_out_r, t_s_r, t_e_r, rh_r, y_obs in dhw_runs:
+    for ts_e, t_out_r, t_s_r, t_e_r, rh_r, y_obs in eval_dhw_runs:
         if ts_e >= cutoff_14d:
             sq_err_fit.append(
                 (
@@ -1012,3 +1058,6 @@ def fit_cop_parameters(
         },
     }
     return fitted, new_memory, diagnostics
+
+
+fit_cop_model = fit_cop_parameters

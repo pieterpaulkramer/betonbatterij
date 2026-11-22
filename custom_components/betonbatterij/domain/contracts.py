@@ -232,3 +232,4 @@ class CalibrationZoneOutcome:
     collinearity_warnings: list[str]
     holdout_before: ZoneEvaluationReport
     holdout_after: ZoneEvaluationReport
+    bound_warnings: list[str] = field(default_factory=list)

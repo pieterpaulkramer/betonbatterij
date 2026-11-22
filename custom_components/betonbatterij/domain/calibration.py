@@ -25,7 +25,6 @@ from custom_components.betonbatterij import house_config
 from custom_components.betonbatterij.domain import contracts
 from custom_components.betonbatterij.domain import evaluation
 from custom_components.betonbatterij.domain import solar_weather
-from custom_components.betonbatterij.domain import zoh_kalman
 
 # Seasonal memory & calibration constants
 MEMORY_WEEKLY_GAMMA: float = 2.0 ** (-1.0 / 52.0)  # 52-week half-life (~0.9868)
@@ -269,25 +268,27 @@ def solve_b2_box_huber_lm(
             for rv in r
         ]
 
-        # Central finite-difference Jacobian J (m x p), stored column-major
+        # Forward finite-difference Jacobian J (m x p) with backward fallback
         jac_cols: list[list[float]] = []
         for j in range(p):
             hj = max(1e-6, 1e-4 * spans[j])
-            tp = min(float(upper[j]), theta[j] + hj)
-            tm = max(float(lower[j]), theta[j] - hj)
-            denom = tp - tm
-            if denom <= 1e-12:
+            ub_j = float(upper[j])
+            lb_j = float(lower[j])
+            if theta[j] + hj <= ub_j:
+                tj = theta[j] + hj
+            else:
+                tj = max(lb_j, theta[j] - hj)
+            denom = tj - theta[j]
+            if abs(denom) <= 1e-12:
                 jac_cols.append([0.0] * m)
                 continue
             th_p = list(theta)
-            th_m = list(theta)
-            th_p[j] = tp
-            th_m[j] = tm
+            th_p[j] = tj
             rp = residual_fn(th_p)
-            rm = residual_fn(th_m)
-            n_fev += 2
+            n_fev += 1
+            inv_denom = 1.0 / denom
             jac_cols.append(
-                [(float(rp[i]) - float(rm[i])) / denom for i in range(m)]
+                [(float(rp[i]) - r[i]) * inv_denom for i in range(m)]
             )
 
         # Normal matrix J^T W J and MAP gradient
@@ -590,6 +591,7 @@ class StoredEpisode:
     window_steps: int
     quality_score: float
     columns: dict[str, list[float | int]]
+    clean_verified: bool = False
 
 
 def _build_step_hard_mask(
@@ -606,40 +608,40 @@ def _build_step_hard_mask(
     i_sol = hist.i_sol_wk_wm2 if zone == "wk" else hist.i_sol_kt_wm2
 
     masked = [False] * n
-    defrost_raw = [
-        bool(hist.flags[k] & (const.FLAG_DEFROST_WP | const.FLAG_DEFROST_AC))
-        for k in range(n)
-    ]
+    defrost_mask = const.FLAG_DEFROST_WP | const.FLAG_DEFROST_AC
+    defrost_padded = [False] * n
+    for k in range(n):
+        if hist.flags[k] & defrost_mask:
+            lo = max(0, k - DEFROST_PAD_STEPS)
+            hi = min(n, k + DEFROST_PAD_STEPS + 1)
+            for m in range(lo, hi):
+                defrost_padded[m] = True
 
+    is_kt = zone == "kt"
+    p_ac_arr = hist.p_el_ac_kt_w
     for k in range(n):
         fl = hist.flags[k]
         if (
             not (fl & valid_flag)
             or (fl & const.FLAG_GAP_BRIDGED)
             or hist.dt_s[k] > 600.0
+            or hist.cooling_or_tail[k]
+            or (fl & open_win_flag)
+            or defrost_padded[k]
         ):
             masked[k] = True
             continue
-        if hist.cooling_or_tail[k]:
-            masked[k] = True
-            continue
-        if fl & open_win_flag:
-            masked[k] = True
-            continue
         if k >= 3:
-            slope_k_h = (t_meas[k] - t_meas[k - 3]) / 0.25
-            lo_in = max(0, k - 6)
-            recent_high_input = max(i_sol[lo_in : k + 1]) > 250.0 or (
-                zone == "kt"
-                and max(hist.p_el_ac_kt_w[lo_in : k + 1]) > 80.0
-            )
-            if slope_k_h < (-2.5 if recent_high_input else -0.8):
-                masked[k] = True
-                continue
-        lo = max(0, k - DEFROST_PAD_STEPS)
-        hi = min(n, k + DEFROST_PAD_STEPS + 1)
-        if any(defrost_raw[m] for m in range(lo, hi)):
-            masked[k] = True
+            slope_k_h = (t_meas[k] - t_meas[k - 3]) * 4.0
+            if slope_k_h < -0.8:
+                lo_in = max(0, k - 6)
+                recent_high = False
+                for m in range(lo_in, k + 1):
+                    if i_sol[m] > 250.0 or (is_kt and p_ac_arr[m] > 80.0):
+                        recent_high = True
+                        break
+                if slope_k_h < (-2.5 if recent_high else -0.8):
+                    masked[k] = True
 
     return masked
 
@@ -682,6 +684,22 @@ def extract_clean_regime_windows(
     i_sol = hist.i_sol_wk_wm2 if zone == "wk" else hist.i_sol_kt_wm2
     q_fh = hist.q_fh_wk_hyd_w if zone == "wk" else hist.q_fh_kt_hyd_w
 
+    is_lts = (
+        hist.is_lts_row if len(hist.is_lts_row) == n else [False] * n
+    )
+    missing_prim = (
+        hist.missing_prim_th if len(hist.missing_prim_th) == n else [False] * n
+    )
+    lts_or_missing = [is_lts[m] or missing_prim[m] for m in range(n)]
+    has_p_wp_raw = len(hist.p_wp_raw_el_w) == n
+    active_off_ok = [
+        hist.f_comp_hz[m] <= 0.5
+        and (hist.p_wp_raw_el_w[m] <= 50.0 if has_p_wp_raw else True)
+        and hist.p_prim_th_w[m] <= 50.0
+        and hist.p_el_ac_kt_w[m] <= 40.0
+        for m in range(n)
+    ]
+
     candidates_by_reg: dict[str, list[TrainingWindow]] = {
         "night": [],
         "heat": [],
@@ -689,18 +707,51 @@ def extract_clean_regime_windows(
         "ac": [],
     }
 
+    hrs_arr: list[int] = [0] * n
+    mins_arr: list[int] = [0] * n
+    cook_slot_wk: list[bool] = [False] * n
+    is_wk = zone == "wk"
+    aanwezig_mask = const.FLAG_AANWEZIG
+    ts_arr = hist.ts_utc
+    fl_arr = hist.flags
+    last_hr_key = -1
+    cached_hr_base = 0
+    for m in range(n):
+        ts_m = ts_arr[m]
+        hr_key = ts_m // 3600
+        if hr_key != last_hr_key:
+            cached_hr_base, _ = solar_weather.local_hour_minute(hr_key * 3600)
+            last_hr_key = hr_key
+        hr_m = cached_hr_base
+        mn_m = (ts_m % 3600) // 60
+        mins_m = hr_m * 60 + mn_m
+        hrs_arr[m] = hr_m
+        mins_arr[m] = mins_m
+        if is_wk and (fl_arr[m] & aanwezig_mask) and (1050 <= mins_m <= 1230):
+            cook_slot_wk[m] = True
+
+    baseline_cache: dict[int, float] = {}
+
     def _local_d_baseline(center_idx: int) -> float:
-        lo_b = max(min_k0, center_idx - 144)
-        hi_b = min(n, center_idx + 144)
+        bucket = center_idx // 6
+        cached = baseline_cache.get(bucket)
+        if cached is not None:
+            return cached
+        center_aligned = bucket * 6
+        lo_b = max(min_k0, center_aligned - 144)
+        hi_b = min(n, center_aligned + 144)
         vals = sorted(
             float(d_init[m])
             for m in range(lo_b, hi_b, 6)
             if not masked[m]
         )
-        if not vals:
-            return 0.0
-        med = vals[len(vals) // 2]
-        return min(220.0, max(-220.0, med))
+        res = (
+            0.0
+            if not vals
+            else min(220.0, max(-220.0, vals[len(vals) // 2]))
+        )
+        baseline_cache[bucket] = res
+        return res
 
     def _is_calm_pre_excitation(pre_idx: int) -> bool:
         d_val = float(d_init[pre_idx])
@@ -710,29 +761,39 @@ def extract_clean_regime_windows(
 
     # 1. Passive cold night windows (`00:30–06:30`, Q_fh == 0, I_sol == 0)
     for k0 in range(min_k0, n - 30, 6):
-        if masked[k0] or not _is_calm_pre_excitation(k0):
+        if masked[k0] or not (30 <= mins_arr[k0] <= 240):
             continue
-        hr0, mn0 = solar_weather.local_hour_minute(hist.ts_utc[k0])
-        mins0 = hr0 * 60 + mn0
-        if not (30 <= mins0 <= 240):
+        if not _is_calm_pre_excitation(k0):
             continue
+
+        pre_off_ok = all(
+            active_off_ok[m] for m in range(max(0, k0 - 24), k0 + 1)
+        )
+        touches_lts = lts_or_missing[k0]
+        if touches_lts and not pre_off_ok:
+            continue
+        all_off = pre_off_ok
 
         lw = 0
         max_lw = min(evaluation.HORIZON_6H_STEPS, n - 1 - k0)
         for s in range(1, max_lw + 1):
             idx = k0 + s
-            hr_s, mn_s = solar_weather.local_hour_minute(hist.ts_utc[idx])
-            mins_s = hr_s * 60 + mn_s
-            if mins_s > 390 and hr_s < 12:
+            if mins_arr[idx] > 390 and hrs_arr[idx] < 12:
                 break
             if masked[idx] or q_fh[idx] > 1.0 or i_sol[idx] > 2.0:
                 break
-            if zone == "kt" and (
+            if not is_wk and (
                 hist.p_el_ac_kt_w[idx] > 15.0
                 or hist.p_desk_kt_w[idx] > 25.0
                 or hist.pir_occ_kt[idx] >= 0.5
             ):
                 break
+            next_touches = touches_lts or lts_or_missing[idx]
+            next_off = all_off and active_off_ok[idx]
+            if next_touches and not next_off:
+                break
+            touches_lts = next_touches
+            all_off = next_off
             lw = s
 
         if lw >= 30:
@@ -748,33 +809,30 @@ def extract_clean_regime_windows(
     # 2. Active floor heating + coast windows (up to 6.0h)
     heat_strict: list[TrainingWindow] = []
     heat_relaxed: list[TrainingWindow] = []
-    strict_wh = 3800.0 if zone == "wk" else 950.0
-    relaxed_wh = 2000.0 if zone == "wk" else 550.0
+    strict_wh = 3800.0 if is_wk else 950.0
+    relaxed_wh = 2000.0 if is_wk else 550.0
 
     for k0 in range(min_k0, n - 36, 6):
-        if masked[k0]:
+        if masked[k0] or is_lts[k0] or missing_prim[k0] or cook_slot_wk[k0]:
             continue
         k_pre_h = k0
         while k_pre_h > max(min_k0, k0 - 12) and q_fh[k_pre_h] > 50.0:
             k_pre_h -= 1
         if not _is_calm_pre_excitation(k_pre_h):
             continue
-        if zone == "wk" and _is_wk_evening_cooking_slot(
-            hist.ts_utc[k0], hist.flags[k0]
-        ):
-            continue
 
         lw = 0
         max_lw = min(evaluation.HORIZON_6H_STEPS, n - 1 - k0)
         for s in range(1, max_lw + 1):
             idx = k0 + s
-            if masked[idx]:
-                break
-            if zone == "wk" and _is_wk_evening_cooking_slot(
-                hist.ts_utc[idx], hist.flags[idx]
+            if (
+                masked[idx]
+                or is_lts[idx]
+                or missing_prim[idx]
+                or cook_slot_wk[idx]
             ):
                 break
-            if zone == "kt" and hist.p_el_ac_kt_w[idx] > 25.0:
+            if not is_wk and hist.p_el_ac_kt_w[idx] > 25.0:
                 break
             lw = s
 
@@ -795,19 +853,23 @@ def extract_clean_regime_windows(
     )
 
     # 3. Sunny daytime windows (`08:00–12:00` start, zero pv_fallback)
-    min_sol_wh = 550.0 if zone == "wk" else 350.0
+    min_sol_wh = 550.0 if is_wk else 350.0
     for k0 in range(min_k0, n - 36, 6):
-        if masked[k0]:
-            continue
-        hr0, mn0 = solar_weather.local_hour_minute(hist.ts_utc[k0])
-        mins0 = hr0 * 60 + mn0
-        if not (480 <= mins0 <= 720):
+        if masked[k0] or not (480 <= mins_arr[k0] <= 720):
             continue
         k_pre_s = k0
         while k_pre_s > max(min_k0, k0 - 48) and i_sol[k_pre_s] > 25.0:
             k_pre_s -= 1
         if not _is_calm_pre_excitation(k_pre_s):
             continue
+
+        pre_off_s = all(
+            active_off_ok[m] for m in range(max(0, k0 - 24), k0 + 1)
+        )
+        touches_lts_s = lts_or_missing[k0]
+        if touches_lts_s and not pre_off_s:
+            continue
+        all_off_s = pre_off_s
 
         lw = 0
         max_lw = min(evaluation.HORIZON_6H_STEPS, n - 1 - k0)
@@ -816,13 +878,16 @@ def extract_clean_regime_windows(
             if (
                 masked[idx]
                 or hist.pv_fallback[idx]
-                or bool(hist.flags[idx] & const.FLAG_PV_FALLBACK)
+                or bool(fl_arr[idx] & const.FLAG_PV_FALLBACK)
+                or cook_slot_wk[idx]
             ):
                 break
-            if zone == "wk" and _is_wk_evening_cooking_slot(
-                hist.ts_utc[idx], hist.flags[idx]
-            ):
+            next_touches_s = touches_lts_s or lts_or_missing[idx]
+            next_off_s = all_off_s and active_off_ok[idx]
+            if next_touches_s and not next_off_s:
                 break
+            touches_lts_s = next_touches_s
+            all_off_s = next_off_s
             lw = s
 
         if lw < 36:
@@ -839,7 +904,7 @@ def extract_clean_regime_windows(
     # 4. Split-AC heating windows on `kt` (1.5h..2.0h = 18..24 steps)
     if zone == "kt":
         for k0 in range(min_k0, n - 18, 2):
-            if masked[k0]:
+            if masked[k0] or is_lts[k0]:
                 continue
             k_pre_ac = k0
             while (
@@ -853,7 +918,7 @@ def extract_clean_regime_windows(
             max_lw = min(24, n - 1 - k0)
             for s in range(1, max_lw + 1):
                 idx = k0 + s
-                if masked[idx] or q_fh[idx] > 250.0:
+                if masked[idx] or is_lts[idx] or q_fh[idx] > 250.0:
                     break
                 if hist.p_el_ac_kt_w[idx] > 25.0 and round(
                     hist.ac_mode_code[idx]
@@ -917,19 +982,60 @@ class SeasonalEpisodeBank:
             "wk": {"night": [], "heat": [], "solar": []},
             "kt": {"night": [], "heat": [], "solar": [], "ac": []},
         }
+        self._cached_dict: dict[str, Any] | None = None
+
+    def clone(self) -> SeasonalEpisodeBank:
+        """Returns an isolated shallow copy of all regime episode buckets."""
+        copy_bank = SeasonalEpisodeBank(max_per_regime=self._max_per_regime)
+        for zone in ("wk", "kt"):
+            z_id: contracts.ZoneId = "wk" if zone == "wk" else "kt"
+            copy_bank._buckets[z_id] = {
+                reg: list(ep_list)
+                for reg, ep_list in self._buckets[z_id].items()
+            }
+        return copy_bank
+
+    def clear(self) -> None:
+        """Empties all episode buckets and invalidates the serialized cache."""
+        for reg_map in self._buckets.values():
+            for ep_list in reg_map.values():
+                ep_list.clear()
+        self._cached_dict = None
+
+    @staticmethod
+    def _is_episode_clean_for_regime(ep: StoredEpisode) -> bool:
+        """Filters out active-heating episodes contaminated by LTS/missing prim."""
+        if ep.clean_verified or ep.regime not in ("heat", "ac", "airco_heat"):
+            return True
+        is_lts, missing_prim = evaluation.detect_lts_and_missing_prim_rows(
+            ep.columns
+        )
+        if any(is_lts):
+            return False
+        if ep.regime == "heat" and any(missing_prim):
+            return False
+        ep.clean_verified = True
+        return True
 
     def get_episodes(
         self,
         zone: contracts.ZoneId,
         regime: str | None = None,
     ) -> list[StoredEpisode]:
-        """Returns stored episodes for `zone` (and optional `regime`)."""
+        """Returns clean stored episodes for `zone` (and optional `regime`)."""
         z_map = self._buckets[zone]
         if regime is not None:
-            return list(z_map.get(regime, ()))
+            reg_key = "ac" if regime == "airco_heat" else regime
+            return [
+                ep
+                for ep in z_map.get(reg_key, ())
+                if self._is_episode_clean_for_regime(ep)
+            ]
         out: list[StoredEpisode] = []
         for ep_list in z_map.values():
-            out.extend(ep_list)
+            out.extend(
+                ep for ep in ep_list if self._is_episode_clean_for_regime(ep)
+            )
         return out
 
     def update_from_columns(
@@ -939,6 +1045,8 @@ class SeasonalEpisodeBank:
         k_hx_by_group: Mapping[str, float] | None = None,
         lat_deg: float = house_config.LATITUDE_DEG,
         lon_deg: float = house_config.LONGITUDE_DEG,
+        *,
+        precomputed_hist: evaluation.PreprocessedHistory | None = None,
     ) -> int:
         """Scans `columns` and retains top-K cleanest episodes over 365 days.
 
@@ -946,6 +1054,9 @@ class SeasonalEpisodeBank:
             columns: RingBuffer training-split column dictionary.
             flow_rates_l_min: Optional manifold rotameter flow rates [L/min].
             k_hx_by_group: Optional `K_hx` [W/K] per hydraulic group.
+            lat_deg: Observer latitude in degrees North.
+            lon_deg: Observer longitude in degrees East.
+            precomputed_hist: Optional precomputed `PreprocessedHistory`.
 
         Returns:
             Number of candidate episodes merged into the reservoir buckets.
@@ -958,13 +1069,16 @@ class SeasonalEpisodeBank:
         latest_ts = int(ts_seq[-1])
         cutoff_ts = latest_ts - EPISODE_RETENTION_S
 
-        hist = evaluation.preprocess_history_columns(
-            columns,
-            flow_rates_l_min=flow_rates_l_min,
-            k_hx_by_group=k_hx_by_group,
-            lat_deg=lat_deg,
-            lon_deg=lon_deg,
-        )
+        if precomputed_hist is not None and precomputed_hist.n_rows == n:
+            hist = precomputed_hist
+        else:
+            hist = evaluation.preprocess_history_columns(
+                columns,
+                flow_rates_l_min=flow_rates_l_min,
+                k_hx_by_group=k_hx_by_group,
+                lat_deg=lat_deg,
+                lon_deg=lon_deg,
+            )
         min_spinup = (
             EPISODE_SPINUP_STEPS
             if n >= EPISODE_SPINUP_STEPS + 72
@@ -979,10 +1093,8 @@ class SeasonalEpisodeBank:
                 if z_id == "wk"
                 else house_config.DAY1_PRIORS_KT
             )
-            states_0, _, _, _ = evaluation.reconstruct_kalman_states(
-                hist, z_id, day1
-            )
-            d_init = [st.d_est_w for st in states_0]
+            states_0 = evaluation.reconstruct_states_tuples(hist, z_id, day1)
+            d_init = [st[2] for st in states_0]
 
             wins = extract_clean_regime_windows(
                 hist,
@@ -993,25 +1105,49 @@ class SeasonalEpisodeBank:
             )
             by_reg = self._buckets[z_id]
 
-            # Prune expired episodes (>365d)
+            # Prune expired (>365d) or legacy LTS-contaminated episodes
             for reg_key in list(by_reg.keys()):
-                by_reg[reg_key] = [
+                old_list = by_reg[reg_key]
+                pruned = [
                     ep
-                    for ep in by_reg[reg_key]
+                    for ep in old_list
                     if ep.start_ts_utc >= cutoff_ts
+                    and self._is_episode_clean_for_regime(ep)
                 ]
+                if len(pruned) != len(old_list):
+                    self._cached_dict = None
+                by_reg[reg_key] = pruned
+
+            has_hist_lts = len(hist.is_lts_row) == n
+            has_hist_miss = len(hist.missing_prim_th) == n
 
             for w in wins:
                 if w.regime not in by_reg:
                     continue
                 spin = min(EPISODE_SPINUP_STEPS, w.k0)
                 s_idx = w.k0 - spin
+                if w.regime in ("heat", "ac"):
+                    for m in range(w.k0 - 1, s_idx - 1, -1):
+                        if hist.is_lts_row[m] or (
+                            w.regime == "heat" and hist.missing_prim_th[m]
+                        ):
+                            s_idx = m + 1
+                            spin = w.k0 - s_idx
+                            break
+                    if spin < 96:
+                        continue
                 w_len = (
                     min(EPISODE_WINDOW_STEPS, n - 1 - w.k0)
                     if w.regime != "ac"
                     else w.length_steps
                 )
                 e_idx = min(n, w.k0 + w_len + 1)
+                if w.regime in ("heat", "ac") and has_hist_lts and has_hist_miss:
+                    if any(hist.is_lts_row[s_idx:e_idx]) or (
+                        w.regime == "heat"
+                        and any(hist.missing_prim_th[s_idx:e_idx])
+                    ):
+                        continue
                 ep_cols = evaluation.slice_columns(columns, s_idx, e_idx)
                 ep = StoredEpisode(
                     zone=z_id,
@@ -1022,7 +1158,12 @@ class SeasonalEpisodeBank:
                     window_steps=e_idx - 1 - w.k0,
                     quality_score=w.quality_score,
                     columns=ep_cols,
+                    clean_verified=(has_hist_lts and has_hist_miss),
                 )
+                if not (has_hist_lts and has_hist_miss) and not (
+                    self._is_episode_clean_for_regime(ep)
+                ):
+                    continue
                 merged = list(by_reg[w.regime]) + [ep]
                 merged.sort(key=lambda item: item.quality_score, reverse=True)
 
@@ -1036,6 +1177,7 @@ class SeasonalEpisodeBank:
                         if len(deduped) >= self._max_per_regime:
                             break
                 by_reg[w.regime] = deduped
+                self._cached_dict = None
                 added_or_kept += 1
 
         return added_or_kept
@@ -1046,15 +1188,20 @@ class SeasonalEpisodeBank:
     ) -> dict[str, list[float | int | None]]:
         """Sanitizes `NaN`/`Inf` floats to `None` for strict `orjson` Store."""
         out: dict[str, list[float | int | None]] = {}
+        pos_inf = math.inf
+        neg_inf = -math.inf
         for col_name, seq in columns.items():
             if col_name in const.RINGBUFFER_INT_COLS:
-                out[col_name] = [
-                    0 if v is None else int(v) for v in seq
-                ]
+                out[col_name] = [0 if v is None else int(v) for v in seq]
             else:
                 out[col_name] = [
                     None
-                    if (v is None or not math.isfinite(float(v)))
+                    if (
+                        v is None
+                        or v != v
+                        or v == pos_inf
+                        or v == neg_inf
+                    )
                     else float(v)
                     for v in seq
                 ]
@@ -1066,17 +1213,23 @@ class SeasonalEpisodeBank:
     ) -> dict[str, list[float | int]]:
         """Restores `None` float sentinels back to `math.nan` for replay."""
         out: dict[str, list[float | int]] = {}
+        nan_val = math.nan
+        pos_inf = math.inf
+        neg_inf = -math.inf
         for col_name, seq in raw_columns.items():
             if not isinstance(seq, Sequence):
                 continue
             if col_name in const.RINGBUFFER_INT_COLS:
-                out[col_name] = [
-                    0 if v is None else int(v) for v in seq
-                ]
+                out[col_name] = [0 if v is None else int(v) for v in seq]
             else:
                 out[col_name] = [
-                    math.nan
-                    if (v is None or not math.isfinite(float(v)))
+                    nan_val
+                    if (
+                        v is None
+                        or v != v
+                        or v == pos_inf
+                        or v == neg_inf
+                    )
                     else float(v)
                     for v in seq
                 ]
@@ -1084,34 +1237,36 @@ class SeasonalEpisodeBank:
 
     def to_dict(self) -> dict[str, Any]:
         """Serializes episode bank for `betonbatterij.episode_bank` HA Store."""
-        return {
-            "max_per_regime": self._max_per_regime,
-            "buckets": {
-                zone: {
-                    reg: [
-                        {
-                            "zone": ep.zone,
-                            "regime": ep.regime,
-                            "start_ts_utc": int(ep.start_ts_utc),
-                            "end_ts_utc": int(ep.end_ts_utc),
-                            "spinup_steps": int(ep.spinup_steps),
-                            "window_steps": int(ep.window_steps),
-                            "quality_score": (
-                                float(ep.quality_score)
-                                if math.isfinite(ep.quality_score)
-                                else 0.0
-                            ),
-                            "columns": self._serialize_episode_columns(
-                                ep.columns
-                            ),
-                        }
-                        for ep in ep_list
-                    ]
-                    for reg, ep_list in reg_map.items()
-                }
-                for zone, reg_map in self._buckets.items()
-            },
-        }
+        if self._cached_dict is None:
+            self._cached_dict = {
+                "max_per_regime": self._max_per_regime,
+                "buckets": {
+                    zone: {
+                        reg: [
+                            {
+                                "zone": ep.zone,
+                                "regime": ep.regime,
+                                "start_ts_utc": int(ep.start_ts_utc),
+                                "end_ts_utc": int(ep.end_ts_utc),
+                                "spinup_steps": int(ep.spinup_steps),
+                                "window_steps": int(ep.window_steps),
+                                "quality_score": (
+                                    float(ep.quality_score)
+                                    if math.isfinite(ep.quality_score)
+                                    else 0.0
+                                ),
+                                "columns": self._serialize_episode_columns(
+                                    ep.columns
+                                ),
+                            }
+                            for ep in ep_list
+                        ]
+                        for reg, ep_list in reg_map.items()
+                    }
+                    for zone, reg_map in self._buckets.items()
+                },
+            }
+        return self._cached_dict
 
     @classmethod
     def from_dict(cls, data: Mapping[str, Any]) -> SeasonalEpisodeBank:
@@ -1128,7 +1283,8 @@ class SeasonalEpisodeBank:
             if not isinstance(z_raw, Mapping):
                 continue
             for reg, ep_list in z_raw.items():
-                if reg not in bank._buckets[z_id] or not isinstance(
+                reg_bucket = "ac" if reg == "airco_heat" else reg
+                if reg_bucket not in bank._buckets[z_id] or not isinstance(
                     ep_list, Sequence
                 ):
                     continue
@@ -1145,21 +1301,23 @@ class SeasonalEpisodeBank:
                         if raw_qs is not None and math.isfinite(float(raw_qs))
                         else 0.0
                     )
-                    restored.append(
-                        StoredEpisode(
-                            zone=z_id,
-                            regime=str(item["regime"]),
-                            start_ts_utc=int(item["start_ts_utc"]),
-                            end_ts_utc=int(item["end_ts_utc"]),
-                            spinup_steps=int(item["spinup_steps"]),
-                            window_steps=int(item["window_steps"]),
-                            quality_score=qs_val,
-                            columns=cls._deserialize_episode_columns(
-                                item["columns"]
-                            ),
-                        )
+                    cand_ep = StoredEpisode(
+                        zone=z_id,
+                        regime=reg_bucket,
+                        start_ts_utc=int(item["start_ts_utc"]),
+                        end_ts_utc=int(item["end_ts_utc"]),
+                        spinup_steps=int(item["spinup_steps"]),
+                        window_steps=int(item["window_steps"]),
+                        quality_score=qs_val,
+                        columns=cls._deserialize_episode_columns(
+                            item["columns"]
+                        ),
                     )
-                bank._buckets[z_id][reg] = restored[: bank._max_per_regime]
+                    if cls._is_episode_clean_for_regime(cand_ep):
+                        restored.append(cand_ep)
+                bank._buckets[z_id][reg_bucket] = (
+                    list(bank._buckets[z_id][reg_bucket]) + restored
+                )[: bank._max_per_regime]
         return bank
 
 
@@ -1292,6 +1450,8 @@ def calibrate_k_hx_robust(
     current_k_hx: Mapping[str, float],
     lat_deg: float = house_config.LATITUDE_DEG,
     lon_deg: float = house_config.LONGITUDE_DEG,
+    *,
+    precomputed_hist: evaluation.PreprocessedHistory | None = None,
 ) -> dict[str, float]:
     """Calibrates `K_hx` [W/K] on steady `18..25 Hz` runs (`>= 40 min`, `dT >= 2 K`).
 
@@ -1299,6 +1459,9 @@ def calibrate_k_hx_robust(
         columns: RingBuffer training-split column dictionary.
         flow_rates_l_min: Manifold rotameter flow rates [L/min] per group.
         current_k_hx: Active `K_hx` [W/K] dictionary per hydraulic group.
+        lat_deg: Observer latitude in degrees North.
+        lon_deg: Observer longitude in degrees East.
+        precomputed_hist: Optional precomputed `PreprocessedHistory`.
 
     Returns:
         Updated dictionary mapping all 10 hydraulic groups to `K_hx` [W/K].
@@ -1315,37 +1478,52 @@ def calibrate_k_hx_robust(
     flows = dict(const.DEFAULT_FLOW_RATES_L_MIN)
     flows.update({k: float(v) for k, v in flow_rates_l_min.items()})
 
-    hist = evaluation.preprocess_history_columns(
-        columns,
-        flow_rates_l_min=flows,
-        k_hx_by_group=out_khx,
-        lat_deg=lat_deg,
-        lon_deg=lon_deg,
-    )
+    if (
+        precomputed_hist is not None
+        and precomputed_hist.n_rows == n
+        and abs(precomputed_hist.hyd_k_hx_wk - out_khx["wk"]) <= 1e-9
+        and abs(precomputed_hist.hyd_k_hx_kt - out_khx["kantoor"]) <= 1e-9
+    ):
+        hist = precomputed_hist
+    else:
+        hist = evaluation.preprocess_history_columns(
+            columns,
+            flow_rates_l_min=flows,
+            k_hx_by_group=out_khx,
+            lat_deg=lat_deg,
+            lon_deg=lon_deg,
+        )
 
-    st_wk, _, _, _ = evaluation.reconstruct_kalman_states(
+    st_wk = evaluation.reconstruct_states_tuples(
         hist,
         "wk",
         dataclasses.replace(
             house_config.DAY1_PRIORS_WK, k_hx_w_k=out_khx["wk"]
         ),
     )
-    tf_wk = [s.t_floor_c for s in st_wk]
+    tf_wk = [s[1] for s in st_wk]
 
-    st_kt, _, _, _ = evaluation.reconstruct_kalman_states(
+    st_kt = evaluation.reconstruct_states_tuples(
         hist,
         "kt",
         dataclasses.replace(
             house_config.DAY1_PRIORS_KT, k_hx_w_k=out_khx["kantoor"]
         ),
     )
-    tf_kt = [s.t_floor_c for s in st_kt]
+    tf_kt = [s[1] for s in st_kt]
 
     steady_indices: list[int] = []
     q_sec_cal_map: dict[int, float] = {}
     run_len = 0
+    is_lts = hist.is_lts_row if len(hist.is_lts_row) == n else [False] * n
+    missing_prim = (
+        hist.missing_prim_th if len(hist.missing_prim_th) == n else [False] * n
+    )
 
     for k in range(n):
+        if is_lts[k] or missing_prim[k]:
+            run_len = 0
+            continue
         fl = hist.flags[k]
         room_active = (
             (fl & const.FLAG_DHW_TANK) == 0
@@ -1439,7 +1617,7 @@ def calibrate_k_hx_robust(
             if 0.35 * day1_wk <= cand <= 2.3 * day1_wk:
                 wk_solo_vals.append(cand)
                 wk_solo_wts.append(dt_wk * dt_wk)
-        else:
+        elif other_u <= 1.5:
             q_mod_tot = sum(
                 hist.u_pump_sec[k]
                 * uv[g]
@@ -1457,16 +1635,24 @@ def calibrate_k_hx_robust(
                     wk_mix_vals.append(cand)
                     wk_mix_wts.append(dt_wk * dt_wk)
 
+    def _clamp_khx(group_name: str, raw_val: float) -> float:
+        day1_g = house_config.DAY1_K_HX_BY_GROUP_W_K[group_name]
+        cap_g = min(
+            1.45 * day1_g,
+            0.75 * flows[group_name] * house_config.WATER_POWER_FACTOR_W_PER_LMIN_K,
+        )
+        return max(1.0, min(cap_g, max(0.4 * day1_g, raw_val)))
+
     if len(wk_solo_vals) >= 6:
         est_wk = _weighted_median_and_trimmed_mean(wk_solo_vals, wk_solo_wts)
-        out_khx["wk"] = min(2.2 * day1_wk, max(0.4 * day1_wk, est_wk))
-        out_khx["gang"] = out_khx["wk"] * gang_to_wk_ratio
+        out_khx["wk"] = _clamp_khx("wk", est_wk)
+        out_khx["gang"] = _clamp_khx("gang", out_khx["wk"] * gang_to_wk_ratio)
     elif len(wk_solo_vals) + len(wk_mix_vals) >= 6:
         est_wk = _weighted_median_and_trimmed_mean(
             wk_solo_vals + wk_mix_vals, wk_solo_wts + wk_mix_wts
         )
-        out_khx["wk"] = min(2.2 * day1_wk, max(0.4 * day1_wk, est_wk))
-        out_khx["gang"] = out_khx["wk"] * gang_to_wk_ratio
+        out_khx["wk"] = _clamp_khx("wk", est_wk)
+        out_khx["gang"] = _clamp_khx("gang", out_khx["wk"] * gang_to_wk_ratio)
 
     # Pass 2: Calibrate `kantoor` (`kt`) using updated BG `K_hx`
     kt_vals: list[float] = []
@@ -1510,7 +1696,7 @@ def calibrate_k_hx_robust(
 
     if len(kt_vals) >= 6:
         est_kt = _weighted_median_and_trimmed_mean(kt_vals, kt_wts)
-        out_khx["kantoor"] = min(2.2 * day1_kt, max(0.4 * day1_kt, est_kt))
+        out_khx["kantoor"] = _clamp_khx("kantoor", est_kt)
 
     return out_khx
 
@@ -1699,6 +1885,11 @@ def calibrate_zone_a2(
     k_hx_by_group: Mapping[str, float] | None = None,
     lat_deg: float = house_config.LATITUDE_DEG,
     lon_deg: float = house_config.LONGITUDE_DEG,
+    *,
+    precomputed_train_hist: evaluation.PreprocessedHistory | None = None,
+    precomputed_holdout_hist: evaluation.PreprocessedHistory | None = None,
+    precomputed_holdout_prior_hist: evaluation.PreprocessedHistory | None = None,
+    is_lts_row: Sequence[bool] | None = None,
 ) -> tuple[contracts.CalibrationZoneOutcome, contracts.ParameterPosteriorMemory]:
     """Runs Choice A2 Multi-Horizon Trajectory MAP + Out-of-Sample Holdout Gate.
 
@@ -1815,21 +2006,25 @@ def calibrate_zone_a2(
                 fallback_mem,
             )
 
-    # Chronological Train / Holdout split (14d holdout when >= 28d; 70/30 < 28d)
-    if n_total >= 28 * const.STEPS_PER_DAY:
-        train_end = n_total - evaluation.EVAL_14D_STEPS
-    else:
-        train_end = max(2 * const.STEPS_PER_DAY, int(0.70 * n_total))
-        if n_total - train_end < evaluation.HORIZON_6H_STEPS + 24:
-            train_end = n_total - (evaluation.HORIZON_6H_STEPS + 24)
-
-    holdout_slice_start = max(0, train_end - evaluation.SPINUP_48H_STEPS)
-    train_cols = evaluation.slice_columns(columns, 0, train_end)
-    holdout_cols = evaluation.slice_columns(
-        columns, holdout_slice_start, n_total
+    # Shared raw-aware chronological Train / Holdout split (F1)
+    train_end = evaluation.compute_train_holdout_split(
+        columns, is_lts_row=is_lts_row
     )
+    holdout_steps = n_total - train_end
+    holdout_slice_start = max(0, train_end - evaluation.SPINUP_48H_STEPS)
+    n_hold = n_total - holdout_slice_start
     holdout_start_ts = int(ts_all[train_end])
     train_start_ts = int(ts_all[0])
+
+    holdout_cols_cache: Mapping[str, Sequence[float | int]] | None = None
+
+    def _get_holdout_cols() -> Mapping[str, Sequence[float | int]]:
+        nonlocal holdout_cols_cache
+        if holdout_cols_cache is None:
+            holdout_cols_cache = evaluation.slice_columns(
+                columns, holdout_slice_start, n_total
+            )
+        return holdout_cols_cache
 
     cand_khx = current_params.k_hx_w_k
     if k_hx_by_group:
@@ -1841,19 +2036,25 @@ def calibrate_zone_a2(
         if key_khx in k_hx_by_group:
             cand_khx = float(k_hx_by_group[key_khx])
 
-    hist_train = evaluation.preprocess_history_columns(
-        train_cols,
-        flow_rates_l_min=flow_rates_l_min,
-        k_hx_by_group=k_hx_by_group,
-        eta_ac_ref=current_params.eta_ac,
-        lat_deg=lat_deg,
-        lon_deg=lon_deg,
+    if (
+        precomputed_train_hist is not None
+        and precomputed_train_hist.n_rows == train_end
+    ):
+        hist_train = precomputed_train_hist
+    else:
+        train_cols = evaluation.slice_columns(columns, 0, train_end)
+        hist_train = evaluation.preprocess_history_columns(
+            train_cols,
+            flow_rates_l_min=flow_rates_l_min,
+            k_hx_by_group=k_hx_by_group,
+            eta_ac_ref=current_params.eta_ac,
+            lat_deg=lat_deg,
+            lon_deg=lon_deg,
+        )
+    states_init = evaluation.reconstruct_states_tuples(
+        hist_train, zone, current_params
     )
-    exog_train = evaluation.build_zone_exog_list(hist_train, zone)
-    states_init, _, _, _ = evaluation.reconstruct_kalman_states(
-        hist_train, zone, current_params, exog_train
-    )
-    d_init = [st.d_est_w for st in states_init]
+    d_init = [st[2] for st in states_init]
 
     min_spin_train = min(EPISODE_SPINUP_STEPS, max(96, hist_train.n_rows // 5))
     train_windows = extract_clean_regime_windows(
@@ -1864,8 +2065,7 @@ def calibrate_zone_a2(
     ext_episodes: list[
         tuple[
             StoredEpisode,
-            evaluation.PreprocessedHistory,
-            list[contracts.ExogenousStepInput],
+            evaluation.PrecomputedZoneTape,
         ]
     ] = []
     if episode_bank is not None:
@@ -1888,16 +2088,12 @@ def calibrate_zone_a2(
             )
             if ep_hist.n_rows > ep.spinup_steps + 12:
                 ext_episodes.append(
-                    (
-                        ep,
-                        ep_hist,
-                        evaluation.build_zone_exog_list(ep_hist, zone),
-                    )
+                    (ep, evaluation.get_zone_tape(ep_hist, zone))
                 )
 
     if not train_windows and not ext_episodes:
         rep = evaluation.evaluate_14d_hindcast(
-            holdout_cols,
+            columns,
             zone,
             current_params,
             day1_prior,
@@ -1905,6 +2101,9 @@ def calibrate_zone_a2(
             k_hx_by_group,
             lat_deg=lat_deg,
             lon_deg=lon_deg,
+            precomputed_hist_eval=precomputed_holdout_hist,
+            precomputed_hist_prior=precomputed_holdout_prior_hist,
+            eval_steps=holdout_steps,
         )
         return (
             contracts.CalibrationZoneOutcome(
@@ -1935,111 +2134,94 @@ def calibrate_zone_a2(
     reg_counts: dict[str, int] = {"night": 0, "heat": 0, "solar": 0, "ac": 0}
     for w in train_windows:
         reg_counts[w.regime] = reg_counts.get(w.regime, 0) + 1
-    for ep, _, _ in ext_episodes:
+    for ep, _ in ext_episodes:
         reg_counts[ep.regime] = reg_counts.get(ep.regime, 0) + 1
+
+    # F4.1: Freeze weakly excited seasonal/actuator parameters at aged prior
+    frozen_params: dict[str, float] = {}
+    fit_param_names: list[str] = []
+    for name in param_names:
+        if name == "eta_ac" and reg_counts.get("ac", 0) < 4:
+            frozen_params[name] = prior_mean_init[name]
+        elif name == "a_sol_m2" and reg_counts.get("solar", 0) < 2:
+            frozen_params[name] = prior_mean_init[name]
+        else:
+            fit_param_names.append(name)
 
     reg_scale: dict[str, float] = {
         reg: (1.0 / math.sqrt(max(1.0, cnt / 6.0))) if cnt > 0 else 1.0
         for reg, cnt in reg_counts.items()
     }
 
-    t_meas_train = (
-        hist_train.t_air_wk_c if zone == "wk" else hist_train.t_air_kt_c
+    # Precompute 1D parameter-independent tapes & window specs once before LM
+    train_tape = (
+        evaluation.get_zone_tape(hist_train, zone) if train_windows else None
     )
-    win_sample_pts = [
-        _sample_rollout_steps(w.regime, w.length_steps) for w in train_windows
+    train_specs: list[tuple[int, int, Sequence[int], float]] = [
+        (
+            w.k0,
+            w.length_steps,
+            _sample_rollout_steps(w.regime, w.length_steps),
+            reg_scale[w.regime] / RESIDUAL_SIGMA_C,
+        )
+        for w in train_windows
     ]
-    ep_sample_pts = [
-        _sample_rollout_steps(ep.regime, ep.window_steps)
-        for ep, _, _ in ext_episodes
-    ]
+    ext_specs: list[
+        tuple[
+            evaluation.PrecomputedZoneTape,
+            list[tuple[int, int, Sequence[int], float]],
+        ]
+    ] = []
+    for ep, ep_tape in ext_episodes:
+        k0_ep = ep.spinup_steps
+        max_s = min(ep.window_steps, ep_tape.n_rows - 1 - k0_ep)
+        s_pts = [
+            pt
+            for pt in _sample_rollout_steps(ep.regime, ep.window_steps)
+            if pt <= max_s
+        ]
+        ext_specs.append(
+            (
+                ep_tape,
+                [
+                    (
+                        k0_ep,
+                        max_s,
+                        s_pts,
+                        reg_scale[ep.regime] / RESIDUAL_SIGMA_C,
+                    )
+                ],
+            )
+        )
+
+    base_for_lm = (
+        dataclasses.replace(current_params, **frozen_params)
+        if frozen_params
+        else current_params
+    )
 
     def _residual_fn(theta_vec: Sequence[float]) -> list[float]:
         cand_p = _apply_theta_to_params(
-            current_params, param_names, theta_vec, cand_khx
+            base_for_lm, fit_param_names, theta_vec, cand_khx
         )
         residuals: list[float] = []
-
-        if train_windows:
-            states_cand, _, _, _ = evaluation.reconstruct_kalman_states(
-                hist_train, zone, cand_p, exog_train
-            )
-            for w, s_pts in zip(train_windows, win_sample_pts):
-                st_k0 = states_cand[w.k0]
-                # Start open-loop rollout with d_est=0 so physics explains curve
-                st = contracts.ThermalState(
-                    t_air_c=st_k0.t_air_c,
-                    t_floor_c=st_k0.t_floor_c,
-                    d_est_w=0.0,
+        if train_tape is not None and train_specs:
+            residuals.extend(
+                evaluation.evaluate_windows_on_tape(
+                    train_tape, cand_p, train_specs
                 )
-                w_factor = reg_scale[w.regime] / RESIDUAL_SIGMA_C
-                ptr = 0
-                for s in range(1, w.length_steps + 1):
-                    idx = w.k0 + s
-                    q_fh_s = evaluation.step_q_fh_for_params(
-                        hist_train, zone, idx, st.t_floor_c, cand_p
-                    )
-                    q_ac_s = evaluation.step_q_ac_for_params(
-                        hist_train, zone, idx, cand_p
-                    )
-                    st = zoh_kalman.propagate_open_loop_step(
-                        state=st,
-                        params=cand_p,
-                        exog=exog_train[idx],
-                        q_fh_w=q_fh_s,
-                        q_ac_w=q_ac_s,
-                        dt_s=hist_train.dt_s[idx],
-                    )
-                    if ptr < len(s_pts) and s == s_pts[ptr]:
-                        residuals.append(
-                            (st.t_air_c - t_meas_train[idx]) * w_factor
-                        )
-                        ptr += 1
-
-        for (ep, ep_hist, ep_exog), s_pts in zip(ext_episodes, ep_sample_pts):
-            ep_states, _, _, _ = evaluation.reconstruct_kalman_states(
-                ep_hist, zone, cand_p, ep_exog
             )
-            k0_ep = ep.spinup_steps
-            st_k0 = ep_states[k0_ep]
-            st = contracts.ThermalState(
-                t_air_c=st_k0.t_air_c,
-                t_floor_c=st_k0.t_floor_c,
-                d_est_w=0.0,
+        for ep_tape, ep_spec in ext_specs:
+            residuals.extend(
+                evaluation.evaluate_windows_on_tape(ep_tape, cand_p, ep_spec)
             )
-            ep_t_meas = (
-                ep_hist.t_air_wk_c if zone == "wk" else ep_hist.t_air_kt_c
-            )
-            w_factor = reg_scale[ep.regime] / RESIDUAL_SIGMA_C
-            ptr = 0
-            max_s = min(ep.window_steps, ep_hist.n_rows - 1 - k0_ep)
-            for s in range(1, max_s + 1):
-                idx = k0_ep + s
-                q_fh_s = evaluation.step_q_fh_for_params(
-                    ep_hist, zone, idx, st.t_floor_c, cand_p
-                )
-                q_ac_s = evaluation.step_q_ac_for_params(
-                    ep_hist, zone, idx, cand_p
-                )
-                st = zoh_kalman.propagate_open_loop_step(
-                    state=st,
-                    params=cand_p,
-                    exog=ep_exog[idx],
-                    q_fh_w=q_fh_s,
-                    q_ac_w=q_ac_s,
-                    dt_s=ep_hist.dt_s[idx],
-                )
-                if ptr < len(s_pts) and s == s_pts[ptr]:
-                    residuals.append((st.t_air_c - ep_t_meas[idx]) * w_factor)
-                    ptr += 1
-
         return residuals
 
-    theta0 = [float(getattr(current_params, k)) for k in param_names]
-    lower = [active_bounds[k].lower for k in param_names]
-    upper = [active_bounds[k].upper for k in param_names]
-    p_mean = [prior_mean_init[k] for k in param_names]
-    p_prec = [prior_prec_init[k] for k in param_names]
+    theta0 = [float(getattr(current_params, k)) for k in fit_param_names]
+    lower = [active_bounds[k].lower for k in fit_param_names]
+    upper = [active_bounds[k].upper for k in fit_param_names]
+    p_mean = [prior_mean_init[k] for k in fit_param_names]
+    p_prec = [prior_prec_init[k] for k in fit_param_names]
 
     sol = solve_b2_box_huber_lm(
         residual_fn=_residual_fn,
@@ -2053,15 +2235,11 @@ def calibrate_zone_a2(
         tol=1e-4,
     )
 
-    raw_fitted = {name: sol.theta[i] for i, name in enumerate(param_names)}
-    fisher_map = {
-        name: sol.fisher_diag[i] for i, name in enumerate(param_names)
-    }
-    # Zero Fisher info when a seasonal parameter's identifying regime is absent
-    if reg_counts.get("solar", 0) == 0 and "a_sol_m2" in fisher_map:
-        fisher_map["a_sol_m2"] = 0.0
-    if zone == "kt" and reg_counts.get("ac", 0) == 0 and "eta_ac" in fisher_map:
-        fisher_map["eta_ac"] = 0.0
+    raw_fitted: dict[str, float] = dict(frozen_params)
+    fisher_map: dict[str, float] = {name: 0.0 for name in frozen_params}
+    for i, name in enumerate(fit_param_names):
+        raw_fitted[name] = sol.theta[i]
+        fisher_map[name] = sol.fisher_diag[i]
 
     gated_mean, _, cand_memory = update_posterior_memory(
         memory, active_bounds, raw_fitted, fisher_map
@@ -2080,21 +2258,45 @@ def calibrate_zone_a2(
         )
 
     # Out-of-sample evaluation on unseen holdout slice with shared ref d_act
-    hist_hold = evaluation.preprocess_history_columns(
-        holdout_cols,
-        flow_rates_l_min=flow_rates_l_min,
-        k_hx_by_group=k_hx_by_group,
-        eta_ac_ref=current_params.eta_ac,
-        lat_deg=lat_deg,
-        lon_deg=lon_deg,
-    )
-    states_hold_ref, _, _, _ = evaluation.reconstruct_kalman_states(
+    if (
+        precomputed_holdout_hist is not None
+        and precomputed_holdout_hist.n_rows == n_hold
+    ):
+        hist_hold = precomputed_holdout_hist
+    else:
+        hist_hold = evaluation.preprocess_history_columns(
+            _get_holdout_cols(),
+            flow_rates_l_min=flow_rates_l_min,
+            k_hx_by_group=k_hx_by_group,
+            eta_ac_ref=current_params.eta_ac,
+            lat_deg=lat_deg,
+            lon_deg=lon_deg,
+        )
+    states_hold_ref = evaluation.reconstruct_states_tuples(
         hist_hold, zone, params_map_raw
     )
-    ref_d_hold = [s.d_est_w for s in states_hold_ref]
+    ref_d_hold = [s[2] for s in states_hold_ref]
 
+    k_hx_prior_hold = dict(house_config.DAY1_K_HX_BY_GROUP_W_K)
+    k_hx_prior_hold["wk" if zone == "wk" else "kantoor"] = day1_prior.k_hx_w_k
+    if (
+        precomputed_holdout_prior_hist is not None
+        and precomputed_holdout_prior_hist.n_rows == n_hold
+    ):
+        hist_hold_prior = precomputed_holdout_prior_hist
+    else:
+        hist_hold_prior = evaluation.recompute_history_for_khx(
+            hist_hold,
+            _get_holdout_cols(),
+            flow_rates_l_min=flow_rates_l_min,
+            k_hx_by_group=k_hx_prior_hold,
+        )
+
+    eval_cols_arg = (
+        holdout_cols_cache if holdout_cols_cache is not None else columns
+    )
     holdout_before = evaluation.evaluate_14d_hindcast(
-        holdout_cols,
+        eval_cols_arg,
         zone,
         current_params,
         day1_prior,
@@ -2103,9 +2305,12 @@ def calibrate_zone_a2(
         lat_deg=lat_deg,
         lon_deg=lon_deg,
         _ref_d_act=ref_d_hold,
+        precomputed_hist_eval=hist_hold,
+        precomputed_hist_prior=hist_hold_prior,
+        eval_steps=holdout_steps,
     )
     holdout_after = evaluation.evaluate_14d_hindcast(
-        holdout_cols,
+        eval_cols_arg,
         zone,
         params_candidate,
         day1_prior,
@@ -2114,6 +2319,9 @@ def calibrate_zone_a2(
         lat_deg=lat_deg,
         lon_deg=lon_deg,
         _ref_d_act=ref_d_hold,
+        precomputed_hist_eval=hist_hold,
+        precomputed_hist_prior=hist_hold_prior,
+        eval_steps=holdout_steps,
     )
 
     accepted = True
@@ -2132,6 +2340,46 @@ def calibrate_zone_a2(
     for reg_key, m_before in holdout_before.by_regime.items():
         m_after = holdout_after.by_regime.get(reg_key)
         if m_after is None or m_before.n_windows == 0 or m_after.n_windows == 0:
+            continue
+        if (
+            reg_key == "heating_and_coast"
+            and m_before.n_windows >= 5
+            and m_after.n_windows >= 5
+        ):
+            if (
+                m_before.j_eval_c is not None
+                and m_after.j_eval_c is not None
+                and m_after.j_eval_c > m_before.j_eval_c + 0.010
+            ):
+                diff_j = m_after.j_eval_c - m_before.j_eval_c
+                accepted = False
+                reject_reasons.append(
+                    f"Regime 'heating_and_coast' J_eval degraded by "
+                    f"+{diff_j:.4f} °C (> +0.010 °C)"
+                )
+            elif (
+                m_before.rmse_end_c is not None
+                and m_after.rmse_end_c is not None
+                and m_after.rmse_end_c > m_before.rmse_end_c + 0.015
+            ):
+                diff_r = m_after.rmse_end_c - m_before.rmse_end_c
+                accepted = False
+                reject_reasons.append(
+                    f"Regime 'heating_and_coast' RMSE_end degraded by "
+                    f"+{diff_r:.4f} °C (> +0.015 °C)"
+                )
+            elif (
+                m_before.bias_end_c is not None
+                and m_after.bias_end_c is not None
+                and abs(m_after.bias_end_c) > 0.15
+                and abs(m_after.bias_end_c) > abs(m_before.bias_end_c) + 0.03
+            ):
+                accepted = False
+                reject_reasons.append(
+                    f"Regime 'heating_and_coast' |bias_end| degraded "
+                    f"({abs(m_before.bias_end_c):.4f} -> "
+                    f"{abs(m_after.bias_end_c):.4f} °C)"
+                )
             continue
         if (
             m_before.rmse_end_c is not None
@@ -2171,22 +2419,54 @@ def calibrate_zone_a2(
         final_mem = fallback_mem
         reason = "; ".join(reject_reasons)
 
-    post_std_dict = {
-        name: round(sol.posterior_std[i], 6)
-        for i, name in enumerate(param_names)
-    }
-    corr_dict = {
-        param_names[i]: {
-            param_names[j]: round(sol.correlation_matrix[i][j], 4)
-            for j in range(len(param_names))
-        }
-        for i in range(len(param_names))
-    }
+    fit_idx_map = {name: i for i, name in enumerate(fit_param_names)}
+    post_std_dict: dict[str, float] = {}
+    for name in param_names:
+        if name in fit_idx_map:
+            post_std_dict[name] = round(
+                sol.posterior_std[fit_idx_map[name]], 6
+            )
+        else:
+            post_std_dict[name] = round(
+                1.0 / math.sqrt(max(1e-12, prior_prec_init[name])), 6
+            )
+
+    corr_dict: dict[str, dict[str, float]] = {}
+    for name_i in param_names:
+        row_corr: dict[str, float] = {}
+        for name_j in param_names:
+            if name_i == name_j:
+                row_corr[name_j] = 1.0
+            elif name_i in fit_idx_map and name_j in fit_idx_map:
+                row_corr[name_j] = round(
+                    sol.correlation_matrix[fit_idx_map[name_i]][
+                        fit_idx_map[name_j]
+                    ],
+                    4,
+                )
+            else:
+                row_corr[name_j] = 0.0
+        corr_dict[name_i] = row_corr
+
     collin_warns = [
-        f"High collinearity between {param_names[i]} and {param_names[j]}: "
-        f"rho={rho:.3f}"
+        f"High collinearity between {fit_param_names[i]} and "
+        f"{fit_param_names[j]}: rho={rho:.3f}"
         for i, j, rho in sol.collinearity_pairs
     ]
+
+    bound_warns: list[str] = []
+    for name in fit_param_names:
+        b = active_bounds[name]
+        val_applied = float(getattr(params_applied, name))
+        tol_b = 1e-3 * (b.upper - b.lower)
+        if val_applied <= b.lower + tol_b:
+            bound_warns.append(
+                f"{name} at lower bound ({val_applied:.4g} <= {b.lower:.4g})"
+            )
+        elif val_applied >= b.upper - tol_b:
+            bound_warns.append(
+                f"{name} at upper bound ({val_applied:.4g} >= {b.upper:.4g})"
+            )
 
     outcome = contracts.CalibrationZoneOutcome(
         zone=zone,
@@ -2203,6 +2483,7 @@ def calibrate_zone_a2(
         collinearity_warnings=collin_warns,
         holdout_before=holdout_before,
         holdout_after=holdout_after,
+        bound_warnings=bound_warns,
     )
     return outcome, final_mem
 

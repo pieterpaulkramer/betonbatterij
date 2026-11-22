@@ -7,20 +7,98 @@ import logging
 import math
 from pathlib import Path
 import time
-from collections.abc import Callable, Mapping
-from datetime import datetime
-from typing import Any
+from collections.abc import Callable, Mapping, Sequence
+from datetime import datetime, timezone
+from typing import TYPE_CHECKING, Any, Literal
 
-from homeassistant.config_entries import ConfigEntry
-from homeassistant.const import EVENT_HOMEASSISTANT_STOP
-from homeassistant.core import Event, HomeAssistant, callback
-from homeassistant.helpers.event import (
-    async_track_time_change,
-    async_track_utc_time_change,
-)
-from homeassistant.helpers.storage import Store
-from homeassistant.helpers.update_coordinator import DataUpdateCoordinator
-from homeassistant.util import dt as dt_util
+if TYPE_CHECKING:
+    from homeassistant.config_entries import ConfigEntry
+    from homeassistant.core import Event, HomeAssistant
+
+try:
+    from homeassistant.config_entries import ConfigEntry
+    from homeassistant.const import EVENT_HOMEASSISTANT_STOP
+    from homeassistant.core import Event, HomeAssistant, callback
+    from homeassistant.helpers.event import (
+        async_track_time_change,
+        async_track_utc_time_change,
+    )
+    from homeassistant.helpers.storage import Store
+    from homeassistant.helpers.update_coordinator import DataUpdateCoordinator
+    from homeassistant.util import dt as dt_util
+except ModuleNotFoundError:  # Offline pytest fallback stubs
+    ConfigEntry = Any  # type: ignore[assignment,misc]
+    Event = Any  # type: ignore[assignment,misc]
+    HomeAssistant = Any  # type: ignore[assignment,misc]
+    EVENT_HOMEASSISTANT_STOP = "homeassistant_stop"
+
+    def callback(
+        func: Callable[..., Any],
+    ) -> Callable[..., Any]:  # type: ignore[misc]
+        return func
+
+    def async_track_time_change(
+        *args: Any, **kwargs: Any
+    ) -> Callable[[], None]:
+        del args, kwargs  # Unused.
+        return lambda: None
+
+    def async_track_utc_time_change(
+        *args: Any, **kwargs: Any
+    ) -> Callable[[], None]:
+        del args, kwargs  # Unused.
+        return lambda: None
+
+    class Store:  # type: ignore[no-redef]
+        def __class_getitem__(cls, item: Any) -> type:
+            del item  # Unused.
+            return cls
+
+        def __init__(self, *args: Any, **kwargs: Any) -> None:
+            del args, kwargs  # Unused.
+            self.saved_data: Any = None
+
+        async def async_load(self) -> Any:
+            return self.saved_data
+
+        async def async_save(self, data: Any) -> None:
+            self.saved_data = data
+
+    class DataUpdateCoordinator:  # type: ignore[no-redef]
+        def __class_getitem__(cls, item: Any) -> type:
+            del item  # Unused.
+            return cls
+
+        def __init__(
+            self,
+            hass: Any,
+            logger: logging.Logger,
+            *,
+            name: str,
+            config_entry: Any = None,
+            update_interval: Any = None,
+            always_update: bool = True,
+        ) -> None:
+            del update_interval, always_update  # Unused.
+            self.hass = hass
+            self.logger = logger
+            self.name = name
+            self.config_entry = config_entry
+            self.data: Any = None
+
+        def async_set_updated_data(self, data: Any) -> None:
+            self.data = data
+
+    class _DtUtilStub:
+        @staticmethod
+        def utcnow() -> datetime:
+            return datetime.now(timezone.utc)
+
+        @staticmethod
+        def as_local(dt_val: datetime) -> datetime:
+            return dt_val
+
+    dt_util = _DtUtilStub()  # type: ignore[assignment]
 
 from ..const import (
     ALL_HYDRAULIC_GROUPS,
@@ -37,8 +115,12 @@ from ..const import (
     STORAGE_KEY_STATE,
     STORAGE_VERSION,
 )
+from ..domain.contracts import ZoneEvaluationReport, ZoneParameters
 from ..domain.engine import DigitalTwinEngine
+from ..domain.evaluation import SPINUP_48H_STEPS, evaluate_14d_hindcast
 from ..house_config import (
+    DAY1_PRIORS_KT,
+    DAY1_PRIORS_WK,
     HOUSE_ENTITIES,
     LOCAL_CONFIG_FILENAME,
     ROOM_SENSORS,
@@ -63,6 +145,52 @@ def _load_local_config_sync(
         return HOUSE_ENTITIES, dict(ROOM_SENSORS), False
     entities, room_sensors = load_house_config(cfg_path)
     return entities, room_sensors, True
+
+
+class _OfflineRingStoreStub:
+    """In-memory no-op ring store stub when Home Assistant is not installed."""
+
+    async def async_load_all(self) -> int:
+        return 0
+
+    async def async_save_dirty(self) -> int:
+        return 0
+
+
+def _compute_14d_eval_reports_sync(
+    cols: Mapping[str, Sequence[float | int]],
+    params_wk: ZoneParameters,
+    params_kt: ZoneParameters,
+    flow_rates_l_min: Mapping[str, float],
+    lat_deg: float,
+    lon_deg: float,
+    k_hx_by_group: Mapping[str, float] | None = None,
+) -> tuple[ZoneEvaluationReport, ZoneEvaluationReport]:
+    """Compute 14-day hindcast evaluation reports without mutating `engine`."""
+    k_hx_map = dict(k_hx_by_group) if k_hx_by_group else {}
+    k_hx_map["wk"] = params_wk.k_hx_w_k
+    k_hx_map["kantoor"] = params_kt.k_hx_w_k
+    rep_wk = evaluate_14d_hindcast(
+        cols,
+        "wk",
+        params_wk,
+        DAY1_PRIORS_WK,
+        flow_rates_l_min=flow_rates_l_min,
+        k_hx_by_group=k_hx_map,
+        lat_deg=lat_deg,
+        lon_deg=lon_deg,
+    )
+    rep_kt = evaluate_14d_hindcast(
+        cols,
+        "kt",
+        params_kt,
+        DAY1_PRIORS_KT,
+        flow_rates_l_min=flow_rates_l_min,
+        k_hx_by_group=k_hx_map,
+        lat_deg=lat_deg,
+        lon_deg=lon_deg,
+    )
+    return rep_wk, rep_kt
 
 
 def extract_flow_rates_from_entry(entry: ConfigEntry) -> dict[str, float]:
@@ -118,7 +246,10 @@ class BetonBatterijCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             longitude_deg=lon_deg,
         )
         self.ringbuffer = ColumnarRingBuffer()
-        self.ring_store = HARingBufferStore(hass, self.ringbuffer)
+        try:
+            self.ring_store = HARingBufferStore(hass, self.ringbuffer)
+        except ModuleNotFoundError:
+            self.ring_store = _OfflineRingStoreStub()  # type: ignore[assignment]
 
         self._state_store: Store[dict[str, Any]] = Store(
             hass,
@@ -149,6 +280,7 @@ class BetonBatterijCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self.last_raw_row: dict[str, float | int] = {}
 
         self._processing_lock = asyncio.Lock()
+        self._calibration_lock = asyncio.Lock()
         self._unsubs: list[Callable[[], None]] = []
         self._stop_unsub: Callable[[], None] | None = None
         self._backfill_task: asyncio.Task[None] | None = None
@@ -360,16 +492,104 @@ class BetonBatterijCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 self.fit_sensor_generation += 1
                 self.async_set_updated_data(self._build_snapshot_payload())
 
+    async def _async_refresh_14d_eval(self, *, flush: bool) -> None:
+        """Refresh 14-day hindcast evaluation reports outside `_processing_lock`."""
+        async with self._calibration_lock:
+            rep_wk: ZoneEvaluationReport | None = None
+            rep_kt: ZoneEvaluationReport | None = None
+            async with self._processing_lock:
+                if self._is_shut_down:
+                    return
+                if self.ringbuffer.row_count == 0:
+                    if flush:
+                        await self.async_flush_storage()
+                        self.fit_sensor_generation += 1
+                        self.async_set_updated_data(
+                            self._build_snapshot_payload()
+                        )
+                    return
+                cols = self.ringbuffer.get_columns(RINGBUFFER_ROWS)
+                is_real_engine = isinstance(self.engine, DigitalTwinEngine)
+                has_pure_eval = hasattr(
+                    self.engine, "compute_14d_evaluation_reports"
+                )
+                ctx: dict[str, Any] = {}
+                params_wk: ZoneParameters | None = None
+                params_kt: ZoneParameters | None = None
+                flows: dict[str, float] = {}
+                k_hx_map: dict[str, float] = {}
+                lat_deg = 0.0
+                lon_deg = 0.0
+
+                if has_pure_eval and hasattr(
+                    self.engine, "capture_calibration_context"
+                ):
+                    ctx = self.engine.capture_calibration_context()
+                elif is_real_engine:
+                    if hasattr(self.engine, "capture_calibration_context"):
+                        ctx = self.engine.capture_calibration_context()
+                        params_wk = ctx["params_wk"]
+                        params_kt = ctx["params_kt"]
+                        flows = dict(ctx["flow_rates_l_min"])
+                        k_hx_map = dict(ctx["k_hx_by_group_w_k"])
+                        lat_deg = float(ctx["latitude_deg"])
+                        lon_deg = float(ctx["longitude_deg"])
+                    else:
+                        params_wk = self.engine.get_zone_snapshot("wk").params
+                        params_kt = self.engine.get_zone_snapshot("kt").params
+                        flows = dict(self.flow_rates_l_min)
+                        k_hx_map = dict(
+                            getattr(self.engine, "_k_hx_by_group_w_k", {})
+                        )
+                        lat_deg = self.engine.latitude_deg
+                        lon_deg = self.engine.longitude_deg
+
+            if has_pure_eval:
+                eval_res = await self.hass.async_add_executor_job(
+                    self.engine.compute_14d_evaluation_reports,
+                    cols,
+                    ctx if ctx else None,
+                )
+                if isinstance(eval_res, Mapping):
+                    rep_wk = eval_res.get("wk")
+                    rep_kt = eval_res.get("kt")
+                else:
+                    rep_wk, rep_kt = eval_res
+            elif (
+                is_real_engine
+                and params_wk is not None
+                and params_kt is not None
+            ):
+                rep_wk, rep_kt = await self.hass.async_add_executor_job(
+                    _compute_14d_eval_reports_sync,
+                    cols,
+                    params_wk,
+                    params_kt,
+                    flows,
+                    lat_deg,
+                    lon_deg,
+                    k_hx_map,
+                )
+            else:
+                await self.hass.async_add_executor_job(
+                    self.engine.refresh_14d_evaluation, cols
+                )
+
+            async with self._processing_lock:
+                if self._is_shut_down:
+                    return
+                if rep_wk is not None and rep_kt is not None:
+                    self.engine.eval_report_wk = rep_wk
+                    self.engine.eval_report_kt = rep_kt
+                    if hasattr(self.engine, "_refresh_cached_snapshots"):
+                        self.engine._refresh_cached_snapshots()
+                if flush:
+                    await self.async_flush_storage()
+                self.fit_sensor_generation += 1
+                self.async_set_updated_data(self._build_snapshot_payload())
+
     async def _async_refresh_eval_only(self) -> None:
-        async with self._processing_lock:
-            if self.ringbuffer.row_count == 0:
-                return
-            cols = self.ringbuffer.get_columns(RINGBUFFER_ROWS)
-            await self.hass.async_add_executor_job(
-                self.engine.refresh_14d_evaluation, cols
-            )
-            self.fit_sensor_generation += 1
-            self.async_set_updated_data(self._build_snapshot_payload())
+        await self._async_refresh_14d_eval(flush=False)
 
     async def _async_on_5m_tick(self, now: datetime) -> None:
         async with self._processing_lock:
@@ -456,17 +676,7 @@ class BetonBatterijCoordinator(DataUpdateCoordinator[dict[str, Any]]):
 
     async def _async_on_6h_maintenance(self, now: datetime) -> None:
         del now  # Unused.
-        async with self._processing_lock:
-            if self._is_shut_down:
-                return
-            if self.ringbuffer.row_count > 0:
-                cols = self.ringbuffer.get_columns(RINGBUFFER_ROWS)
-                await self.hass.async_add_executor_job(
-                    self.engine.refresh_14d_evaluation, cols
-                )
-            await self.async_flush_storage()
-            self.fit_sensor_generation += 1
-            self.async_set_updated_data(self._build_snapshot_payload())
+        await self._async_refresh_14d_eval(flush=True)
 
     async def _async_on_weekly_calibration_slot(self, now: datetime) -> None:
         local_now = dt_util.as_local(now)
@@ -477,17 +687,80 @@ class BetonBatterijCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 "Skipping Sunday 03:15 auto-calibration (switch is off)."
             )
             return
+        await self._async_run_calibration("auto_weekly")
 
-        async with self._processing_lock:
-            if self._is_shut_down or self.ringbuffer.row_count == 0:
-                return
-            cols = self.ringbuffer.get_columns(RINGBUFFER_ROWS)
-            await self.hass.async_add_executor_job(
-                self._sync_calibrate_and_eval, cols, "auto_weekly"
+    async def _async_run_calibration(
+        self, mode: Literal["manual", "auto_weekly"]
+    ) -> dict[str, Any]:
+        """Run 3-phase MAP calibration with solver outside `_processing_lock`.
+
+        Args:
+            mode: Trigger mode (`"manual"` or `"auto_weekly"`).
+
+        Returns:
+            Calibration outcome dictionary from `DigitalTwinEngine`.
+        """
+        async with self._calibration_lock:
+            async with self._processing_lock:
+                if self._is_shut_down:
+                    return {
+                        "accepted_wk": False,
+                        "accepted_kt": False,
+                        "reason": "Coordinator shut down.",
+                    }
+                if mode == "auto_weekly" and self.ringbuffer.row_count == 0:
+                    return {
+                        "accepted_wk": False,
+                        "accepted_kt": False,
+                        "reason": "Empty ringbuffer.",
+                    }
+                cols = self.ringbuffer.get_columns(RINGBUFFER_ROWS)
+                use_three_phase = (
+                    hasattr(self.engine, "capture_calibration_context")
+                    and hasattr(self.engine, "compute_calibration_plan")
+                    and hasattr(self.engine, "apply_calibration_plan")
+                )
+                ctx: dict[str, Any] = (
+                    self.engine.capture_calibration_context()
+                    if use_three_phase
+                    else {}
+                )
+
+            t0 = time.perf_counter()
+            plan: dict[str, Any] = {}
+            fallback_outcome: dict[str, Any] = {}
+            if use_three_phase:
+                plan = await self.hass.async_add_executor_job(
+                    self.engine.compute_calibration_plan, cols, ctx, mode
+                )
+            else:
+                fallback_outcome = await self.hass.async_add_executor_job(
+                    self._sync_calibrate_and_eval, cols, mode
+                )
+            _LOGGER.info(
+                "BetonBatterij %s calibration solver completed in %.2f s",
+                mode,
+                time.perf_counter() - t0,
             )
-            await self.async_flush_storage()
-            self.fit_sensor_generation += 1
-            self.async_set_updated_data(self._build_snapshot_payload())
+
+            async with self._processing_lock:
+                if self._is_shut_down:
+                    return {
+                        "accepted_wk": False,
+                        "accepted_kt": False,
+                        "reason": "Coordinator shut down.",
+                    }
+                if use_three_phase:
+                    recent_cols = self.ringbuffer.get_columns(SPINUP_48H_STEPS)
+                    outcome = self.engine.apply_calibration_plan(
+                        plan, recent_cols
+                    )
+                else:
+                    outcome = fallback_outcome
+                await self.async_flush_storage()
+                self.fit_sensor_generation += 1
+                self.async_set_updated_data(self._build_snapshot_payload())
+                return outcome
 
     def _sync_calibrate_and_eval(
         self, cols: dict[str, list[float | int]], mode: str
@@ -519,38 +792,36 @@ class BetonBatterijCoordinator(DataUpdateCoordinator[dict[str, Any]]):
 
     async def async_trigger_manual_calibration(self) -> dict[str, Any]:
         """Run manual MAP calibration in executor and refresh fit sensors."""
-        async with self._processing_lock:
-            cols = self.ringbuffer.get_columns(RINGBUFFER_ROWS)
-            outcome = await self.hass.async_add_executor_job(
-                self._sync_calibrate_and_eval, cols, "manual"
-            )
-            await self.async_flush_storage()
-            self.fit_sensor_generation += 1
-            self.async_set_updated_data(self._build_snapshot_payload())
-            return outcome
+        return await self._async_run_calibration("manual")
 
     async def async_trigger_rollback(self) -> bool:
         """Restore previous parameter snapshot from stack."""
-        async with self._processing_lock:
-            cols = self.ringbuffer.get_columns(RINGBUFFER_ROWS)
-            rolled_back = await self.hass.async_add_executor_job(
-                self._sync_rollback_and_eval, cols
-            )
-            await self.async_flush_storage()
-            self.fit_sensor_generation += 1
-            self.async_set_updated_data(self._build_snapshot_payload())
-            return rolled_back
+        async with self._calibration_lock:
+            async with self._processing_lock:
+                if self._is_shut_down:
+                    return False
+                cols = self.ringbuffer.get_columns(RINGBUFFER_ROWS)
+                rolled_back = await self.hass.async_add_executor_job(
+                    self._sync_rollback_and_eval, cols
+                )
+                await self.async_flush_storage()
+                self.fit_sensor_generation += 1
+                self.async_set_updated_data(self._build_snapshot_payload())
+                return rolled_back
 
     async def async_trigger_reset(self) -> None:
         """Reset parameters to Day-1 building priors."""
-        async with self._processing_lock:
-            cols = self.ringbuffer.get_columns(RINGBUFFER_ROWS)
-            await self.hass.async_add_executor_job(
-                self._sync_reset_and_eval, cols
-            )
-            await self.async_flush_storage()
-            self.fit_sensor_generation += 1
-            self.async_set_updated_data(self._build_snapshot_payload())
+        async with self._calibration_lock:
+            async with self._processing_lock:
+                if self._is_shut_down:
+                    return
+                cols = self.ringbuffer.get_columns(RINGBUFFER_ROWS)
+                await self.hass.async_add_executor_job(
+                    self._sync_reset_and_eval, cols
+                )
+                await self.async_flush_storage()
+                self.fit_sensor_generation += 1
+                self.async_set_updated_data(self._build_snapshot_payload())
 
     async def async_trigger_export_csv(
         self, export_dir: str = EXPORT_DIR_DEFAULT

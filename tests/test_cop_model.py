@@ -8,6 +8,7 @@ and Choice D2 frost-memory retention across warm spring weeks.
 from __future__ import annotations
 
 import datetime
+import math
 
 import pytest
 
@@ -323,3 +324,207 @@ class TestP1FlankAndCopCalibration:
         assert fitted_s.beta_defrost == pytest.approx(
             fitted_w.beta_defrost, abs=1e-6
         )
+
+    def test_cv_requires_60min_steady_run_while_dhw_keeps_20min_min(
+        self,
+    ) -> None:
+        """CV runs < 60 min (9 steps = 45m) are rejected; >= 12 steps fit."""
+        assert cop_model.MIN_CV_RUN_STEPS == 12
+        true_params = contracts.CopParameters(
+            eta_carnot_cv=0.55,
+            beta_defrost=0.18,
+            eta_carnot_dhw=0.41,
+            delta_p_wp_bias_w=145.0,
+        )
+
+        def _build_runs(
+            cv_steps: int,
+            dhw_steps: int = 5,
+            start_ts: int | None = None,
+        ) -> dict[str, list[float | int]]:
+            t_cur = start_ts or _utc_ts(2026, 1, 18, 8, 0)
+            cols: dict[str, list[float | int]] = {
+                "ts_utc": [],
+                "flags": [],
+                "f_comp_hz": [],
+                "p_wp_raw_el_w": [],
+                "p_prim_th_w": [],
+                "t_out_dak_c": [],
+                "t_out_weather_c": [],
+                "rh_out_pct": [],
+                "t_wp_out_c": [],
+                "t_dhw_top_c": [],
+                "p_p1_net_w": [],
+            }
+            for run_i in range(6):
+                for _ in range(3):
+                    cols["ts_utc"].append(t_cur)
+                    cols["flags"].append(0)
+                    cols["f_comp_hz"].append(0.0)
+                    cols["p_wp_raw_el_w"].append(0.0)
+                    cols["p_prim_th_w"].append(0.0)
+                    cols["t_out_dak_c"].append(6.0)
+                    cols["t_out_weather_c"].append(6.0)
+                    cols["rh_out_pct"].append(75.0)
+                    cols["t_wp_out_c"].append(25.0)
+                    cols["t_dhw_top_c"].append(44.0)
+                    cols["p_p1_net_w"].append(200.0)
+                    t_cur += const.DT_STEP_S
+
+                t_o = 4.0 + run_i
+                cop_c = cop_model.predict_cop_cv(true_params, t_o, 28.5, 75.0)
+                p_el = 600.0 + true_params.delta_p_wp_bias_w
+                for _ in range(cv_steps):
+                    cols["ts_utc"].append(t_cur)
+                    cols["flags"].append(0)
+                    cols["f_comp_hz"].append(20.0)
+                    cols["p_wp_raw_el_w"].append(600.0)
+                    cols["p_prim_th_w"].append(cop_c * p_el)
+                    cols["t_out_dak_c"].append(t_o)
+                    cols["t_out_weather_c"].append(t_o)
+                    cols["rh_out_pct"].append(75.0)
+                    cols["t_wp_out_c"].append(28.5)
+                    cols["t_dhw_top_c"].append(44.0)
+                    cols["p_p1_net_w"].append(200.0 + p_el)
+                    t_cur += const.DT_STEP_S
+
+            for d_i in range(3):
+                t_o = 5.0 + d_i
+                cop_d = cop_model.predict_cop_dhw(
+                    true_params, t_o, 42.0, 49.0, 75.0
+                )
+                p_el = 1000.0 + true_params.delta_p_wp_bias_w
+                for s_i in range(dhw_steps):
+                    t_tk = 41.0 + 1.6 * s_i
+                    cols["ts_utc"].append(t_cur)
+                    cols["flags"].append(const.FLAG_DHW_TANK)
+                    cols["f_comp_hz"].append(32.0)
+                    cols["p_wp_raw_el_w"].append(1000.0)
+                    cols["p_prim_th_w"].append(cop_d * p_el)
+                    cols["t_out_dak_c"].append(t_o)
+                    cols["t_out_weather_c"].append(t_o)
+                    cols["rh_out_pct"].append(75.0)
+                    cols["t_wp_out_c"].append(t_tk + 8.5)
+                    cols["t_dhw_top_c"].append(t_tk)
+                    cols["p_p1_net_w"].append(250.0 + p_el)
+                    t_cur += const.DT_STEP_S
+                for _ in range(2):
+                    cols["ts_utc"].append(t_cur)
+                    cols["flags"].append(0)
+                    cols["f_comp_hz"].append(0.0)
+                    cols["p_wp_raw_el_w"].append(0.0)
+                    cols["p_prim_th_w"].append(0.0)
+                    cols["t_out_dak_c"].append(t_o)
+                    cols["t_out_weather_c"].append(t_o)
+                    cols["rh_out_pct"].append(75.0)
+                    cols["t_wp_out_c"].append(25.0)
+                    cols["t_dhw_top_c"].append(49.0)
+                    cols["p_p1_net_w"].append(200.0)
+                    t_cur += const.DT_STEP_S
+            return cols
+
+        cols_45m = _build_runs(cv_steps=9, dhw_steps=5)
+        fit_short, _, diag_short = cop_model.fit_cop_model(
+            cols_45m, house_config.DAY1_COP_PARAMS
+        )
+        assert diag_short["n_cv_runs"] == 0
+        assert diag_short["n_dhw_runs"] == 3
+        assert fit_short.eta_carnot_cv == pytest.approx(
+            house_config.DAY1_COP_PARAMS.eta_carnot_cv, abs=1e-9
+        )
+        assert fit_short.eta_carnot_dhw == pytest.approx(
+            true_params.eta_carnot_dhw, abs=0.025
+        )
+
+        cols_60m = _build_runs(cv_steps=12, dhw_steps=5)
+        fit_steady, _, diag_steady = cop_model.fit_cop_model(
+            cols_60m, house_config.DAY1_COP_PARAMS
+        )
+        assert diag_steady["n_cv_runs"] == 6
+        assert fit_steady.eta_carnot_cv == pytest.approx(
+            true_params.eta_carnot_cv, abs=0.02
+        )
+
+        # Verify `eval_columns` computes 14d RMSE on recent evaluation slice
+        old_train = _build_runs(
+            cv_steps=12, start_ts=_utc_ts(2025, 11, 1, 8, 0)
+        )
+        eval_recent = _build_runs(
+            cv_steps=12, start_ts=_utc_ts(2026, 1, 20, 8, 0)
+        )
+        combined = {
+            k: list(old_train[k]) + list(eval_recent[k]) for k in old_train
+        }
+        _, _, diag_eval = cop_model.fit_cop_model(
+            old_train,
+            house_config.DAY1_COP_PARAMS,
+            eval_columns=combined,
+        )
+        assert diag_eval["rmse_cop_14d"] is not None
+        assert diag_eval["prior_rmse_cop_14d"] is not None
+        assert diag_eval["rmse_cop_14d"] < diag_eval["prior_rmse_cop_14d"]
+
+    def test_lts_rows_and_gap_bridged_skipped_in_cop_and_p1_bias(self) -> None:
+        """Both `FLAG_LTS_BACKFILL` & legacy `v0.1.0` LTS rows are skipped."""
+        t0 = _utc_ts(2026, 1, 12, 1, 0)  # Aligned to 3600s & nocturnal
+        n = 37  # 3 full hours (`0..12`, `12..24`, `24..36`)
+        ts_utc = [t0 + k * 300 for k in range(n)]
+
+        # Construct legacy v0.1.0 hourly interpolated LTS block:
+        # Hour 0 & Hour 2 change linearly in >=2 channels; Hour 1 is flat
+        # sandwiched between Hour 0 & Hour 2 with NaN weather & 0 upstairs.
+        def _lin_3h(v0: float, v1: float, v2: float, v3: float) -> list[float]:
+            arr = [0.0] * n
+            for j in range(13):
+                arr[j] = v0 + (v1 - v0) * (j / 12.0)
+            for j in range(13):
+                arr[12 + j] = v1 + (v2 - v1) * (j / 12.0)
+            for j in range(13):
+                arr[24 + j] = v2 + (v3 - v2) * (j / 12.0)
+            return arr
+
+        legacy_lts_cols: dict[str, list[float | int]] = {
+            "ts_utc": ts_utc,
+            "flags": [const.FLAG_VALID_WK | const.FLAG_VALID_KT] * n,
+            "f_comp_hz": [0.0] * 4 + [22.0] * 20 + [0.0] * 13,
+            "p_wp_raw_el_w": [0.0] * 4 + [600.0] * 20 + [0.0] * 13,
+            "p_prim_th_w": [0.0] * 4 + [3200.0] * 20 + [0.0] * 13,
+            "t_wp_out_c": [29.0] * n,
+            "t_out_weather_c": [math.nan] * n,
+            "u_eff_slaapkamer": [0.0] * n,
+            "u_eff_badkamer": [0.0] * n,
+            "t_out_dak_c": _lin_3h(2.0, 2.6, 2.6, 3.2),
+            "t_out_hm_c": _lin_3h(2.2, 2.8, 2.8, 3.4),
+            "t_air_wk_c": _lin_3h(19.6, 19.4, 19.4, 19.2),
+            "p_p1_net_w": _lin_3h(200.0, 960.0, 960.0, 200.0),
+        }
+
+        assert cop_model.calibrate_p1_power_bias(legacy_lts_cols) is None
+        _, _, diag_leg = cop_model.fit_cop_model(
+            legacy_lts_cols, house_config.DAY1_COP_PARAMS
+        )
+        assert diag_leg["n_cv_runs"] == 0
+
+        # Explicit v0.1.1 `FLAG_LTS_BACKFILL` and `FLAG_GAP_BRIDGED`
+        explicit_cols = dict(
+            legacy_lts_cols,
+            t_out_weather_c=[2.5] * n,
+            t_out_dak_c=[2.5 + 0.03 * math.sin(k) for k in range(n)],
+            p_p1_net_w=[
+                150.0 + (760.0 if 4 <= k < 24 else 0.0) for k in range(n)
+            ],
+            flags=[const.FLAG_LTS_BACKFILL] * n,
+        )
+        assert cop_model.calibrate_p1_power_bias(explicit_cols) is None
+        _, _, diag_exp = cop_model.fit_cop_model(
+            explicit_cols, house_config.DAY1_COP_PARAMS
+        )
+        assert diag_exp["n_cv_runs"] == 0
+
+        gap_cols = dict(explicit_cols, flags=[0] * n)
+        gap_cols["flags"][10] = const.FLAG_GAP_BRIDGED
+        _, _, diag_gap = cop_model.fit_cop_model(
+            gap_cols, house_config.DAY1_COP_PARAMS
+        )
+        # Splitting a 20-step run at step 10 leaves 6 + 13 steps (1 valid run)
+        assert diag_gap["n_cv_runs"] == 1

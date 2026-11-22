@@ -15,6 +15,7 @@ import pytest
 
 from custom_components.betonbatterij import const
 from custom_components.betonbatterij import house_config
+from custom_components.betonbatterij.domain import engine
 from custom_components.betonbatterij.domain import hydraulics
 from custom_components.betonbatterij.domain import solar_weather
 
@@ -518,3 +519,100 @@ class TestChoiceC3Hydraulics:
         restored = hydraulics.HydraulicModel.from_dict(hyd.to_dict())
         assert restored.gamma_cal == pytest.approx(hyd.gamma_cal)
         assert restored.t_floor_proxy_c == pytest.approx(hyd.t_floor_proxy_c)
+
+    def test_eps_ntu_flow_scaling_and_engine_update_flow_rates_sync(
+        self,
+    ) -> None:
+        """Verifies eps-NTU flow scaling (never linear 2x) and engine sync."""
+        k_old = house_config.DAY1_K_HX_BY_GROUP_W_K["wk"]  # 245.0 @ 5 L/min
+        k_doubled_flow = hydraulics.scale_k_hx_eps_ntu(k_old, 5.0, 10.0)
+        # Doubling flow increases K_hx physically by ~10..35%, never 2.0x (490)
+        assert k_old * 1.10 < k_doubled_flow < k_old * 1.35
+        assert (
+            k_doubled_flow
+            < 0.75 * 10.0 * house_config.WATER_POWER_FACTOR_W_PER_LMIN_K
+        )
+        # Round-trip reversibility
+        assert hydraulics.scale_k_hx_eps_ntu(
+            k_doubled_flow, 10.0, 5.0
+        ) == pytest.approx(k_old, rel=1e-9)
+        # No-op on identical or non-positive flow
+        assert hydraulics.scale_k_hx_eps_ntu(k_old, 5.0, 5.0) == pytest.approx(
+            k_old
+        )
+        assert hydraulics.scale_k_hx_eps_ntu(k_old, 0.0, 5.0) == pytest.approx(
+            k_old
+        )
+
+        hyd_init = hydraulics.HydraulicModel(flow_rates_l_min={"wk": 10.0})
+        assert hyd_init.k_hx_by_group_w_k["wk"] == pytest.approx(
+            k_doubled_flow, rel=1e-9
+        )
+
+        # Pump-off fast-path decays unmodeled proxies identically to exact ZOH
+        hyd_idle = hydraulics.HydraulicModel()
+        rooms_init = {g: 18.0 for g in const.ALL_HYDRAULIC_GROUPS}
+        res_seed = hyd_idle.step(
+            dt_s=300.0,
+            u_pump_sec=0.0,
+            u_valves={},
+            threeway_room=True,
+            wp_defrost=False,
+            v_prim_l_min=0.0,
+            p_prim_th_w=0.0,
+            f_comp_hz=0.0,
+            t_buf_top_start_c=24.0,
+            t_buf_top_end_c=25.0,
+            t_buf_bot_start_c=22.0,
+            t_buf_bot_end_c=23.0,
+            t_floor_wk_c=21.0,
+            t_floor_kt_c=19.0,
+            room_temps_c=rooms_init,
+        )
+        assert res_seed.q_fh_wk_w == 0.0
+        assert res_seed.t_sup_sec_c == pytest.approx(24.5)
+        assert hyd_idle.t_floor_proxy_c["slaapkamer"] == pytest.approx(18.0)
+
+        rooms_warm = {g: 22.0 for g in const.ALL_HYDRAULIC_GROUPS}
+        hyd_idle.step(
+            dt_s=300.0,
+            u_pump_sec=0.0,
+            u_valves={},
+            threeway_room=True,
+            wp_defrost=False,
+            v_prim_l_min=0.0,
+            p_prim_th_w=0.0,
+            f_comp_hz=0.0,
+            t_buf_top_start_c=24.0,
+            t_buf_top_end_c=24.0,
+            t_buf_bot_start_c=22.0,
+            t_buf_bot_end_c=22.0,
+            t_floor_wk_c=21.0,
+            t_floor_kt_c=19.0,
+            room_temps_c=rooms_warm,
+        )
+        assert 18.0 < hyd_idle.t_floor_proxy_c["slaapkamer"] < 22.0
+
+        # DigitalTwinEngine.update_flow_rates syncs params, estimators & epoch
+        eng = engine.DigitalTwinEngine()
+        epoch_before = eng.param_epoch
+        eng.update_flow_rates({"wk": 10.0, "kantoor": 2.0})
+        assert eng.param_epoch == epoch_before + 1
+        assert eng.hydraulics.k_hx_by_group_w_k["wk"] == pytest.approx(
+            k_doubled_flow, rel=1e-9
+        )
+        assert eng.get_zone_snapshot("wk").params.k_hx_w_k == pytest.approx(
+            k_doubled_flow, rel=1e-9
+        )
+        assert eng.estimator_wk.params.k_hx_w_k == pytest.approx(
+            k_doubled_flow, rel=1e-9
+        )
+        expected_kt = hydraulics.scale_k_hx_eps_ntu(
+            house_config.DAY1_K_HX_BY_GROUP_W_K["kantoor"], 1.0, 2.0
+        )
+        assert eng.get_zone_snapshot("kt").params.k_hx_w_k == pytest.approx(
+            expected_kt, rel=1e-9
+        )
+        assert eng.estimator_kt.params.k_hx_w_k == pytest.approx(
+            expected_kt, rel=1e-9
+        )

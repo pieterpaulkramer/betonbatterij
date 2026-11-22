@@ -160,7 +160,7 @@ def _effective_wind_excess(
     return float(v_wind_ms) - 3.0
 
 
-@functools.lru_cache(maxsize=256)
+@functools.lru_cache(maxsize=512)
 def _discretize_ab_cached(
     params: contracts.ZoneParameters,
     dt_s: float,
@@ -255,38 +255,18 @@ def _discretize_ab_cached(
     return a_d, b_d, a_tilde_c, s_steps, h
 
 
-@functools.lru_cache(maxsize=256)
-def _discretize_full_cached(
-    params: contracts.ZoneParameters,
-    dt_s: float,
-    v_wind_excess_ms: float,
-    sigma_d_w: float,
-    u_pump: float,
-    q_fh_w: float,
-    q_air_vent: float,
-) -> tuple[_Mat3, _Mat3x7, _Mat3]:
-    """Computes cached `(A_d, B_d, Q_d)` via 12-term Lyapunov-Taylor."""
-    a_d, b_d, a_tilde_c, s_steps, h = _discretize_ab_cached(
-        params, dt_s, v_wind_excess_ms
-    )
-
-    c_floor = 3600.0 * params.c_floor_wh_k
-    tau_d = 3600.0 * params.tau_d_h
-
-    qc00 = Q_AIR_BASE_K2_S + max(0.0, q_air_vent)
-    u_p = max(0.0, min(1.0, u_pump))
-    qc11 = (
-        Q_FLOOR_IDLE_K2_S
-        + u_p * (Q_FLOOR_PUMP_K2_S - Q_FLOOR_IDLE_K2_S)
-        + ((0.08 * abs(q_fh_w)) ** 2) * TAU_HYDR_S / (c_floor * c_floor)
-    )
-    qc22 = (2.0 * sigma_d_w * sigma_d_w) / tau_d
-
-    # Scaled Q_tilde_c = S * Q_c * S with S = diag(1, 1, 1e-3).
+def _lyapunov_van_loan_3x3(
+    a_tilde_c: _Mat3,
+    s_steps: int,
+    h: float,
+    c_diag_scaled: tuple[float, float, float],
+    a_h_init: _Mat3 | None = None,
+) -> _Mat3:
+    """Integrates `Q_d` for scaled diagonal spectral density `c_diag_scaled`."""
     c_term: _Mat3 = (
-        (h * qc00, 0.0, 0.0),
-        (0.0, h * qc11, 0.0),
-        (0.0, 0.0, h * qc22 * 1.0e-6),
+        (h * c_diag_scaled[0], 0.0, 0.0),
+        (0.0, h * c_diag_scaled[1], 0.0),
+        (0.0, 0.0, h * c_diag_scaled[2]),
     )
     q_h: _Mat3 = c_term
 
@@ -295,13 +275,16 @@ def _discretize_full_cached(
         q_h = _add3(q_h, c_term)
 
     if s_steps > 0:
-        m_h = _scale3(a_tilde_c, h)
-        ident: _Mat3 = ((1.0, 0.0, 0.0), (0.0, 1.0, 0.0), (0.0, 0.0, 1.0))
-        a_h: _Mat3 = ident
-        term: _Mat3 = ident
-        for k in range(1, 13):
-            term = _scale3(_matmul3(m_h, term), 1.0 / k)
-            a_h = _add3(a_h, term)
+        if a_h_init is not None:
+            a_h = a_h_init
+        else:
+            m_h = _scale3(a_tilde_c, h)
+            ident: _Mat3 = ((1.0, 0.0, 0.0), (0.0, 1.0, 0.0), (0.0, 0.0, 1.0))
+            a_h = ident
+            term: _Mat3 = ident
+            for k in range(1, 13):
+                term = _scale3(_matmul3(m_h, term), 1.0 / k)
+                a_h = _add3(a_h, term)
 
         for _ in range(s_steps):
             aq = _matmul3(a_h, q_h)
@@ -309,16 +292,68 @@ def _discretize_full_cached(
             a_next = _matmul3(a_h, a_h)
             a_h, q_h = a_next, q_next
 
-    # Unscale Q_d = S^-1 * Q_tilde * S^-1.
     q01 = 0.5 * (q_h[0][1] + q_h[1][0])
     q02 = 0.5 * (q_h[0][2] + q_h[2][0]) * 1.0e3
     q12 = 0.5 * (q_h[1][2] + q_h[2][1]) * 1.0e3
-    q_d: _Mat3 = (
+    return (
         (q_h[0][0], q01, q02),
         (q01, q_h[1][1], q12),
         (q02, q12, q_h[2][2] * 1.0e6),
     )
-    return a_d, b_d, q_d
+
+
+@functools.lru_cache(maxsize=512)
+def _discretize_qd_basis_cached(
+    params: contracts.ZoneParameters,
+    dt_s: float,
+    v_wind_excess_ms: float,
+) -> tuple[_Mat3, _Mat3, _Mat3]:
+    """Computes cached unit-basis discrete covariance matrices `(G_0, G_1, G_2)`."""
+    _, _, a_tilde_c, s_steps, h = _discretize_ab_cached(
+        params, dt_s, v_wind_excess_ms
+    )
+    a_h_base: _Mat3 | None = None
+    if s_steps > 0:
+        m_h = _scale3(a_tilde_c, h)
+        ident: _Mat3 = ((1.0, 0.0, 0.0), (0.0, 1.0, 0.0), (0.0, 0.0, 1.0))
+        a_h_base = ident
+        term: _Mat3 = ident
+        for k in range(1, 13):
+            term = _scale3(_matmul3(m_h, term), 1.0 / k)
+            a_h_base = _add3(a_h_base, term)
+
+    g0 = _lyapunov_van_loan_3x3(
+        a_tilde_c, s_steps, h, (1.0, 0.0, 0.0), a_h_base
+    )
+    g1 = _lyapunov_van_loan_3x3(
+        a_tilde_c, s_steps, h, (0.0, 1.0, 0.0), a_h_base
+    )
+    g2 = _lyapunov_van_loan_3x3(
+        a_tilde_c, s_steps, h, (0.0, 0.0, 1.0e-6), a_h_base
+    )
+    return g0, g1, g2
+
+
+def _combine_qd_from_basis(
+    g0: _Mat3,
+    g1: _Mat3,
+    g2: _Mat3,
+    qc00: float,
+    qc11: float,
+    qc22: float,
+) -> _Mat3:
+    """Linearly combines `(G_0, G_1, G_2)` into symmetric `Q_d`."""
+    q00 = qc00 * g0[0][0] + qc11 * g1[0][0] + qc22 * g2[0][0]
+    q01 = qc00 * g0[0][1] + qc11 * g1[0][1] + qc22 * g2[0][1]
+    q02 = qc00 * g0[0][2] + qc11 * g1[0][2] + qc22 * g2[0][2]
+    q11 = qc00 * g0[1][1] + qc11 * g1[1][1] + qc22 * g2[1][1]
+    q12 = qc00 * g0[1][2] + qc11 * g1[1][2] + qc22 * g2[1][2]
+    q22 = qc00 * g0[2][2] + qc11 * g1[2][2] + qc22 * g2[2][2]
+    return (
+        (q00, q01, q02),
+        (q01, q11, q12),
+        (q02, q12, q22),
+    )
 
 
 def discretize_zoh_3x3(
@@ -336,8 +371,8 @@ def discretize_zoh_3x3(
 ]:
     """Computes exact simultaneous ZOH matrices `(A_d, B_d, Q_d)` for `dt_s > 0`.
 
-    Balances coordinates via `S = diag(1, 1, 1e-3)` and evaluates the 12-term
-    Lyapunov-Taylor series followed by `s` out-of-place fast-doubling steps.
+    Balances coordinates via `S = diag(1, 1, 1e-3)` and combines cached unit
+    Lyapunov-Taylor basis integrals `(G_0, G_1, G_2)` linearly in scalar floats.
 
     Args:
         params: Physical `ZoneParameters` for `wk` or `kt`.
@@ -356,15 +391,26 @@ def discretize_zoh_3x3(
     if dt_clean <= 0.0:
         raise ValueError(f"Expected positive dt_s, got {dt_s=}")
     v_excess = _effective_wind_excess(params, float(v_wind_ms))
-    return _discretize_full_cached(
-        params,
-        dt_clean,
-        v_excess,
-        float(sigma_d_w),
-        float(u_pump),
-        float(q_fh_w),
-        float(q_air_vent),
+    a_d, b_d, _, _, _ = _discretize_ab_cached(params, dt_clean, v_excess)
+    g0, g1, g2 = _discretize_qd_basis_cached(params, dt_clean, v_excess)
+
+    c_floor = 3600.0 * params.c_floor_wh_k
+    tau_d = 3600.0 * params.tau_d_h
+    qc00 = Q_AIR_BASE_K2_S + max(0.0, float(q_air_vent))
+    u_p = max(0.0, min(1.0, float(u_pump)))
+    qf = float(q_fh_w)
+    qc11 = (
+        Q_FLOOR_IDLE_K2_S
+        + u_p * (Q_FLOOR_PUMP_K2_S - Q_FLOOR_IDLE_K2_S)
+        + ((0.08 * abs(qf)) ** 2) * TAU_HYDR_S / (c_floor * c_floor)
     )
+    sd = float(sigma_d_w)
+    qc22 = (2.0 * sd * sd) / tau_d
+    q_d = _combine_qd_from_basis(g0, g1, g2, qc00, qc11, qc22)
+    return a_d, b_d, q_d
+
+
+discretize_zoh_step = discretize_zoh_3x3
 
 
 def propagate_open_loop_step(
@@ -915,26 +961,40 @@ class ZoneKalmanEstimator:
             a_d_floor_row = a_d[1]
             b_d_floor_row = b_d[1]
 
-        u_vec = (
-            exog.t_out_c,
-            exog.t_up_c,
-            exog.t_down_c,
-            exog.i_sol_wm2,
-            q_fh_w,
-            exog.q_int_known_w,
-            q_ac_w,
-        )
-        x_old = (self.state.t_air_c, self.state.t_floor_c, self.state.d_est_w)
+        u0 = exog.t_out_c
+        u1 = exog.t_up_c
+        u2 = exog.t_down_c
+        u3 = exog.i_sol_wm2
+        u4 = q_fh_w
+        u5 = exog.q_int_known_w
+        u6 = q_ac_w
+        b0 = b_d[0]
+        bf = b_d_floor_row
+        x0_old = self.state.t_air_c
+        x1_old = self.state.t_floor_c
+        x2_old = self.state.d_est_w
         x_minus = (
-            a_d[0][0] * x_old[0]
-            + a_d[0][1] * x_old[1]
-            + a_d[0][2] * x_old[2]
-            + sum(b_d[0][j] * u_vec[j] for j in range(7)),
-            a_d_floor_row[0] * x_old[0]
-            + a_d_floor_row[1] * x_old[1]
-            + a_d_floor_row[2] * x_old[2]
-            + sum(b_d_floor_row[j] * u_vec[j] for j in range(7)),
-            a_d[2][2] * x_old[2],
+            a_d[0][0] * x0_old
+            + a_d[0][1] * x1_old
+            + a_d[0][2] * x2_old
+            + b0[0] * u0
+            + b0[1] * u1
+            + b0[2] * u2
+            + b0[3] * u3
+            + b0[4] * u4
+            + b0[5] * u5
+            + b0[6] * u6,
+            a_d_floor_row[0] * x0_old
+            + a_d_floor_row[1] * x1_old
+            + a_d_floor_row[2] * x2_old
+            + bf[0] * u0
+            + bf[1] * u1
+            + bf[2] * u2
+            + bf[3] * u3
+            + bf[4] * u4
+            + bf[5] * u5
+            + bf[6] * u6,
+            a_d[2][2] * x2_old,
         )
 
         p_tup: _Mat3 = (
@@ -1140,26 +1200,40 @@ class ZoneKalmanEstimator:
             q_air_vent=0.0,
         )
 
-        u_vec = (
-            exog_mid.t_out_c,
-            exog_mid.t_up_c,
-            exog_mid.t_down_c,
-            exog_mid.i_sol_wm2,
-            q_fh_mid,
-            exog_mid.q_int_known_w,
-            q_ac_mid,
-        )
-        x_old = (self.state.t_air_c, self.state.t_floor_c, self.state.d_est_w)
+        u0 = exog_mid.t_out_c
+        u1 = exog_mid.t_up_c
+        u2 = exog_mid.t_down_c
+        u3 = exog_mid.i_sol_wm2
+        u4 = q_fh_mid
+        u5 = exog_mid.q_int_known_w
+        u6 = q_ac_mid
+        b0 = b_d[0]
+        b1 = b_d[1]
+        x0_old = self.state.t_air_c
+        x1_old = self.state.t_floor_c
+        x2_old = self.state.d_est_w
         x_minus = (
-            a_d[0][0] * x_old[0]
-            + a_d[0][1] * x_old[1]
-            + a_d[0][2] * x_old[2]
-            + sum(b_d[0][j] * u_vec[j] for j in range(7)),
-            a_d[1][0] * x_old[0]
-            + a_d[1][1] * x_old[1]
-            + a_d[1][2] * x_old[2]
-            + sum(b_d[1][j] * u_vec[j] for j in range(7)),
-            a_d[2][2] * x_old[2],
+            a_d[0][0] * x0_old
+            + a_d[0][1] * x1_old
+            + a_d[0][2] * x2_old
+            + b0[0] * u0
+            + b0[1] * u1
+            + b0[2] * u2
+            + b0[3] * u3
+            + b0[4] * u4
+            + b0[5] * u5
+            + b0[6] * u6,
+            a_d[1][0] * x0_old
+            + a_d[1][1] * x1_old
+            + a_d[1][2] * x2_old
+            + b1[0] * u0
+            + b1[1] * u1
+            + b1[2] * u2
+            + b1[3] * u3
+            + b1[4] * u4
+            + b1[5] * u5
+            + b1[6] * u6,
+            a_d[2][2] * x2_old,
         )
 
         p_tup: _Mat3 = (

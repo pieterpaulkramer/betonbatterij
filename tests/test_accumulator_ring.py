@@ -5,17 +5,29 @@ Runs 100% offline on standard Python without `homeassistant` installed.
 
 from __future__ import annotations
 
+import asyncio
 import base64
+from collections.abc import Callable, Mapping, Sequence
+from datetime import datetime, timezone
 import json
 import math
 from pathlib import Path
+import threading
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
 
 from custom_components.betonbatterij.const import (
+    AC_MODE_COOL,
+    AC_MODE_HEAT,
+    AC_MODE_OFF,
+    AC_MODE_OTHER,
     DEFAULT_FLOW_RATES_L_MIN,
     DT_STEP_S,
+    FLAG_AC_COOL_KT,
+    FLAG_DHW_TANK,
+    FLAG_LTS_BACKFILL,
     FLAG_VALID_KT,
     FLAG_VALID_WK,
     RINGBUFFER_ALL_COLS,
@@ -34,7 +46,12 @@ from custom_components.betonbatterij.ha_bridge.accumulator import (
 )
 from custom_components.betonbatterij.ha_bridge.backfill import (
     HistoricalStateEvent,
+    _LtsSeriesLookup,
+    _build_lts_row_at,
     replay_backfill_into_engine,
+)
+from custom_components.betonbatterij.ha_bridge.coordinator import (
+    BetonBatterijCoordinator,
 )
 from custom_components.betonbatterij.ha_bridge.storage_ring import (
     ColumnarRingBuffer,
@@ -49,7 +66,9 @@ from custom_components.betonbatterij.house_config import (
     load_house_config,
 )
 from custom_components.betonbatterij.domain.engine import DigitalTwinEngine
+from custom_components.betonbatterij import sensor as sensor_mod
 from custom_components.betonbatterij.sensor import (
+    BetonBatterijCopFitSensor,
     BetonBatterijZoneFitSensor,
     SmartThrottledSensor,
 )
@@ -825,3 +844,664 @@ def test_load_house_config_defaults_example_and_override(
     assert (cc_dir / "strings.json").read_bytes() == (
         cc_dir / "translations" / "en.json"
     ).read_bytes()
+
+
+def test_cop_fit_sensor_dhw_tank_and_post_dhw_idle_supply_temp() -> None:
+    """Verify CV-COP supply temperature selection during & right after DHW runs."""
+    eng = DigitalTwinEngine()
+
+    class _CopCoordStub:
+        def __init__(self, raw_row: dict[str, float | int]) -> None:
+            self.fit_sensor_generation = 1
+            self.engine = eng
+            self.last_raw_row = raw_row
+
+    def _eval_cop(raw_row: dict[str, float | int]) -> tuple[float, float]:
+        coord = _CopCoordStub(raw_row)
+        sensor = BetonBatterijCopFitSensor(
+            coordinator=coord,  # type: ignore[arg-type]
+            entry_id="test_entry",
+        )
+        sensor._refresh_from_engine(force=True)
+        live = sensor._compute_live_expected_cop({}, {})
+        assert sensor.native_value == round(live, 2)
+        return live, float(sensor.native_value)
+
+    # 1. Normal CV-run: uses t_wp_out_c (29.0 °C) over t_buf_top_end_c (28.0 °C).
+    cop_cv, _ = _eval_cop(
+        {
+            "flags": FLAG_VALID_WK,
+            "t_out_dak_c": 7.0,
+            "rh_out_pct": 80.0,
+            "f_comp_hz": 24.0,
+            "t_wp_out_c": 29.0,
+            "t_buf_top_end_c": 28.0,
+        }
+    )
+    assert math.isclose(
+        cop_cv, eng.predict_cop_cv(7.0, 29.0, 80.0), rel_tol=1e-9
+    )
+
+    # 2. Active DHW/Tank-run: ignores 58.5 °C boiler water, uses 28.5 °C buffer.
+    cop_dhw_buf, _ = _eval_cop(
+        {
+            "flags": FLAG_VALID_WK | FLAG_DHW_TANK,
+            "t_out_dak_c": 7.0,
+            "rh_out_pct": 80.0,
+            "f_comp_hz": 48.0,
+            "t_wp_out_c": 58.5,
+            "t_buf_top_end_c": 28.5,
+        }
+    )
+    cop_at_boiler_58_5 = eng.predict_cop_cv(7.0, 58.5, 80.0)
+    assert math.isclose(
+        cop_dhw_buf, eng.predict_cop_cv(7.0, 28.5, 80.0), rel_tol=1e-9
+    )
+    assert cop_dhw_buf > cop_at_boiler_58_5 + 1.5
+
+    # 3. Active DHW/Tank-run with NaN buffer sensors: falls back to 30.0 °C.
+    cop_dhw_nan, _ = _eval_cop(
+        {
+            "flags": FLAG_VALID_WK | FLAG_DHW_TANK,
+            "t_out_dak_c": 7.0,
+            "rh_out_pct": 80.0,
+            "f_comp_hz": 48.0,
+            "t_wp_out_c": 58.5,
+            "t_buf_top_end_c": float("nan"),
+            "t_buf_top_start_c": float("nan"),
+        }
+    )
+    assert math.isclose(
+        cop_dhw_nan, eng.predict_cop_cv(7.0, 30.0, 80.0), rel_tol=1e-9
+    )
+    assert not math.isclose(cop_dhw_nan, cop_at_boiler_58_5, abs_tol=0.5)
+
+    # 4. Post-DHW stationary WP (f_comp_hz <= 0.5, hot t_wp_out_c > 40.0):
+    #    prefers buffer top (28.0 °C) over stagnant 52.0 °C outlet sensor.
+    cop_post_dhw, _ = _eval_cop(
+        {
+            "flags": FLAG_VALID_WK,
+            "t_out_dak_c": 7.0,
+            "rh_out_pct": 80.0,
+            "f_comp_hz": 0.0,
+            "t_wp_out_c": 52.0,
+            "t_buf_top_end_c": 28.0,
+        }
+    )
+    assert math.isclose(
+        cop_post_dhw, eng.predict_cop_cv(7.0, 28.0, 80.0), rel_tol=1e-9
+    )
+
+    # 5. Post-DHW stationary WP with NaN buffer sensors: falls back to 30.0 °C
+    #    and never leaks hot 52.0 °C outlet temperature into CV COP.
+    cop_post_dhw_nan, _ = _eval_cop(
+        {
+            "flags": FLAG_VALID_WK,
+            "t_out_dak_c": 7.0,
+            "rh_out_pct": 80.0,
+            "f_comp_hz": 0.0,
+            "t_wp_out_c": 52.0,
+            "t_buf_top_end_c": float("nan"),
+            "t_buf_top_start_c": float("nan"),
+        }
+    )
+    assert math.isclose(
+        cop_post_dhw_nan, eng.predict_cop_cv(7.0, 30.0, 80.0), rel_tol=1e-9
+    )
+    assert cop_post_dhw_nan > eng.predict_cop_cv(7.0, 52.0, 80.0) + 1.0
+
+    # 6. Running compressor (22 Hz) right after DHW with residual t_wp_out_c =
+    #    45.0 °C (> 40.0 °C): still uses buffer top (or 30.0 °C fallback).
+    cop_hot_running_buf, _ = _eval_cop(
+        {
+            "flags": FLAG_VALID_WK,
+            "t_out_dak_c": 7.0,
+            "rh_out_pct": 80.0,
+            "f_comp_hz": 22.0,
+            "t_wp_out_c": 45.0,
+            "t_buf_top_end_c": 29.0,
+        }
+    )
+    assert math.isclose(
+        cop_hot_running_buf, eng.predict_cop_cv(7.0, 29.0, 80.0), rel_tol=1e-9
+    )
+
+    cop_hot_running_nan, _ = _eval_cop(
+        {
+            "flags": FLAG_VALID_WK,
+            "t_out_dak_c": 7.0,
+            "rh_out_pct": 80.0,
+            "f_comp_hz": 22.0,
+            "t_wp_out_c": 45.0,
+            "t_buf_top_end_c": float("nan"),
+            "t_buf_top_start_c": float("nan"),
+        }
+    )
+    assert math.isclose(
+        cop_hot_running_nan, eng.predict_cop_cv(7.0, 30.0, 80.0), rel_tol=1e-9
+    )
+
+
+def test_cop_fit_sensor_live_5m_deadband_heartbeat_and_gen_refresh(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Verify live 5m COP recomputation, 0.05 deadband, 60m heartbeat, & gen."""
+    eng = DigitalTwinEngine()
+    eng.cop_diagnostics = {"n_cv_samples": 12}
+    mono_now = 1000.0
+    monkeypatch.setattr(sensor_mod.time, "monotonic", lambda: mono_now)
+
+    class _LiveCopCoordStub:
+        def __init__(self) -> None:
+            self.fit_sensor_generation = 1
+            self.engine = eng
+            self.last_raw_row: dict[str, float | int] = {
+                "flags": FLAG_VALID_WK,
+                "t_out_dak_c": 7.0,
+                "rh_out_pct": 80.0,
+                "f_comp_hz": 24.0,
+                "t_wp_out_c": 29.0,
+            }
+
+    coord = _LiveCopCoordStub()
+    writes: list[float] = []
+
+    class _TrackedCopSensor(BetonBatterijCopFitSensor):
+        def async_write_ha_state(self) -> None:
+            assert self._attr_native_value is not None
+            writes.append(float(self._attr_native_value))
+
+    sensor = _TrackedCopSensor(
+        coordinator=coord,  # type: ignore[arg-type]
+        entry_id="test_entry",
+    )
+
+    # Initial forced publish
+    sensor._refresh_from_engine(force=True)
+    assert len(writes) == 1
+    initial_cop = float(sensor.native_value)
+    assert sensor._attr_extra_state_attributes is not None
+    assert sensor._attr_extra_state_attributes["cop_diagnostics"] == {
+        "n_cv_samples": 12
+    }
+
+    # Tiny outdoor-temp nudge (< 0.05 COP delta), same generation -> suppressed
+    mono_now = 1300.0
+    coord.last_raw_row = {
+        "flags": FLAG_VALID_WK,
+        "t_out_dak_c": 7.1,
+        "rh_out_pct": 80.0,
+        "f_comp_hz": 24.0,
+        "t_wp_out_c": 29.0,
+    }
+    small_cop = round(eng.predict_cop_cv(7.1, 29.0, 80.0), 2)
+    assert abs(small_cop - initial_cop) < 0.05
+    sensor._refresh_from_engine(force=False)
+    assert len(writes) == 1
+
+    # Significant outdoor-temp drop (>= 0.05 COP delta), same gen -> writes now
+    mono_now = 1600.0
+    coord.last_raw_row = {
+        "flags": FLAG_VALID_WK,
+        "t_out_dak_c": 4.0,
+        "rh_out_pct": 80.0,
+        "f_comp_hz": 24.0,
+        "t_wp_out_c": 29.0,
+    }
+    expected_drop_cop = round(eng.predict_cop_cv(4.0, 29.0, 80.0), 2)
+    assert abs(expected_drop_cop - initial_cop) >= 0.05
+    sensor._refresh_from_engine(force=False)
+    assert len(writes) == 2
+    assert sensor.native_value == expected_drop_cop
+    assert (
+        sensor._attr_extra_state_attributes["live_expected_cop"]
+        == expected_drop_cop
+    )
+
+    # Unchanged COP before 3600 s -> still suppressed; at >= 3600 s -> heartbeat
+    mono_now = 5199.0
+    sensor._refresh_from_engine(force=False)
+    assert len(writes) == 2
+
+    mono_now = 5200.0  # 5200 - 1600 == 3600 s
+    sensor._refresh_from_engine(force=False)
+    assert len(writes) == 3
+
+    # Diagnostics mutated without generation increment remain cached until gen++
+    eng.cop_diagnostics = {"n_cv_samples": 48, "cop_cv_7c_27c": 3.82}
+    mono_now = 5500.0
+    sensor._refresh_from_engine(force=False)
+    assert len(writes) == 3
+    assert sensor._attr_extra_state_attributes["cop_diagnostics"] == {
+        "n_cv_samples": 12
+    }
+
+    coord.fit_sensor_generation = 2
+    sensor._refresh_from_engine(force=False)
+    assert len(writes) == 4
+    assert sensor._attr_extra_state_attributes["cop_diagnostics"] == {
+        "n_cv_samples": 48,
+        "cop_cv_7c_27c": 3.82,
+    }
+
+
+def test_zone_fit_sensor_exposes_bound_warnings() -> None:
+    """Verify `BetonBatterijZoneFitSensor` forwards `bound_warnings`."""
+    base_eng = DigitalTwinEngine()
+
+    class _BoundWarnEngine:
+        def __init__(self) -> None:
+            self.eval_report_wk = None
+            self.eval_report_kt = None
+            self.calibration_history: list[dict[str, Any]] = []
+
+        def get_zone_snapshot(self, zone: str) -> Any:
+            return base_eng.get_zone_snapshot(zone)  # type: ignore[arg-type]
+
+        def get_zone_fit_diagnostics(self, zone: str) -> dict[str, Any]:
+            assert zone == "kt"
+            return {
+                "posterior_std": {"h_loss_w_k": 2.1},
+                "correlation_matrix": {"h_loss_w_k": {"h_loss_w_k": 1.0}},
+                "collinearity_warnings": [],
+                "bound_warnings": ["h_loss_w_k at lower bound (25.0 W/K)"],
+            }
+
+    class _StubCoord:
+        fit_sensor_generation = 1
+        engine = _BoundWarnEngine()
+        ringbuffer = ColumnarRingBuffer()
+
+    sensor = BetonBatterijZoneFitSensor(
+        coordinator=_StubCoord(),  # type: ignore[arg-type]
+        entry_id="test_entry",
+        zone="kt",
+        object_id="betonbatterij_fit_kantoor",
+        translation_key="fit_kantoor",
+    )
+    sensor._refresh_from_engine(force=True)
+    attrs = sensor._attr_extra_state_attributes
+    assert attrs is not None
+    assert "bound_warnings" in BetonBatterijZoneFitSensor._unrecorded_attributes
+    assert attrs["bound_warnings"] == ["h_loss_w_k at lower bound (25.0 W/K)"]
+    json.dumps(attrs, allow_nan=False)
+
+
+def test_build_lts_row_at_flag_and_p_prim_th_nan_vs_finite() -> None:
+    """Verify LTS backfill rows carry `FLAG_LTS_BACKFILL` and honest `p_prim_th_w`."""
+    ts = 1_763_000_300
+    wk_eid = ROOM_SENSORS["wk"].temp_entity_id
+    dak_eid = HOUSE_ENTITIES.outdoor_temp_dak
+
+    base_lookups = {
+        wk_eid: _LtsSeriesLookup([(ts - 300, 19.8), (ts, 19.8)]),
+        dak_eid: _LtsSeriesLookup([(ts - 300, 6.0), (ts, 6.0)]),
+    }
+
+    # Missing WP flow / outlet / inlet -> FLAG_LTS_BACKFILL set, p_prim_th_w is NaN
+    row_missing_all = _build_lts_row_at(
+        ts=ts,
+        lookups=base_lookups,
+        lts_units={},
+        entities=HOUSE_ENTITIES,
+        room_sensors=ROOM_SENSORS,
+        prev_buf_top=None,
+        prev_buf_bot=None,
+    )
+    assert row_missing_all is not None
+    assert bool(int(row_missing_all["flags"]) & FLAG_LTS_BACKFILL) is True
+    assert math.isnan(float(row_missing_all["p_prim_th_w"]))
+
+    # Missing wp_inlet_temp -> p_prim_th_w must still be NaN
+    partial_inlet_missing = dict(base_lookups)
+    partial_inlet_missing[HOUSE_ENTITIES.wp_pump_flow] = _LtsSeriesLookup(
+        [(ts, 15.0)]
+    )
+    partial_inlet_missing[HOUSE_ENTITIES.wp_outlet_temp] = _LtsSeriesLookup(
+        [(ts, 30.5)]
+    )
+    row_missing_inlet = _build_lts_row_at(
+        ts=ts,
+        lookups=partial_inlet_missing,
+        lts_units={},
+        entities=HOUSE_ENTITIES,
+        room_sensors=ROOM_SENSORS,
+        prev_buf_top=None,
+        prev_buf_bot=None,
+    )
+    assert row_missing_inlet is not None
+    assert bool(int(row_missing_inlet["flags"]) & FLAG_LTS_BACKFILL) is True
+    assert math.isnan(float(row_missing_inlet["p_prim_th_w"]))
+
+    # Missing wp_pump_flow while temps present -> p_prim_th_w must be NaN
+    partial_flow_missing = dict(base_lookups)
+    partial_flow_missing[HOUSE_ENTITIES.wp_outlet_temp] = _LtsSeriesLookup(
+        [(ts, 30.5)]
+    )
+    partial_flow_missing[HOUSE_ENTITIES.wp_inlet_temp] = _LtsSeriesLookup(
+        [(ts, 27.5)]
+    )
+    row_missing_flow = _build_lts_row_at(
+        ts=ts,
+        lookups=partial_flow_missing,
+        lts_units={},
+        entities=HOUSE_ENTITIES,
+        room_sensors=ROOM_SENSORS,
+        prev_buf_top=None,
+        prev_buf_bot=None,
+    )
+    assert row_missing_flow is not None
+    assert bool(int(row_missing_flow["flags"]) & FLAG_LTS_BACKFILL) is True
+    assert math.isnan(float(row_missing_flow["p_prim_th_w"]))
+
+    # All three primary sensors present -> finite p_prim_th_w & FLAG_LTS_BACKFILL
+    complete_lookups = dict(partial_inlet_missing)
+    complete_lookups[HOUSE_ENTITIES.wp_inlet_temp] = _LtsSeriesLookup(
+        [(ts, 27.5)]
+    )
+    row_complete = _build_lts_row_at(
+        ts=ts,
+        lookups=complete_lookups,
+        lts_units={},
+        entities=HOUSE_ENTITIES,
+        room_sensors=ROOM_SENSORS,
+        prev_buf_top=28.0,
+        prev_buf_bot=26.5,
+    )
+    assert row_complete is not None
+    assert bool(int(row_complete["flags"]) & FLAG_LTS_BACKFILL) is True
+    expected_w = 69.73 * 15.0 * (30.5 - 27.5)
+    assert math.isfinite(float(row_complete["p_prim_th_w"]))
+    assert math.isclose(
+        float(row_complete["p_prim_th_w"]), expected_w, rel_tol=1e-9
+    )
+
+    # End-to-end backfill replay preserves FLAG_LTS_BACKFILL only on LTS rows
+    rb = ColumnarRingBuffer()
+    stub_eng = _StubEngine()
+    lts_start = 1_763_000_100
+    raw_start = 1_763_000_700
+    end_ts = 1_763_001_000
+    added = replay_backfill_into_engine(
+        engine=stub_eng,  # type: ignore[arg-type]
+        ringbuffer=rb,
+        lts_series={
+            wk_eid: [(lts_start, 19.5), (raw_start, 19.5)],
+            dak_eid: [(lts_start, 6.0), (raw_start, 6.0)],
+        },
+        lts_units={},
+        raw_events=[
+            HistoricalStateEvent(
+                ts_utc=raw_start,
+                entity_id=dak_eid,
+                state_str="6.0",
+                attributes={},
+                last_changed_utc=raw_start,
+                last_reported_utc=raw_start,
+            ),
+            HistoricalStateEvent(
+                ts_utc=raw_start,
+                entity_id=wk_eid,
+                state_str="19.6",
+                attributes={},
+                last_changed_utc=raw_start,
+                last_reported_utc=raw_start,
+            ),
+        ],
+        lts_start_ts=lts_start,
+        raw_start_ts=raw_start,
+        end_ts=end_ts,
+    )
+    assert added == 2
+    cols = rb.get_columns()
+    assert bool(int(cols["flags"][0]) & FLAG_LTS_BACKFILL) is True
+    assert math.isnan(float(cols["p_prim_th_w"][0]))
+    assert bool(int(cols["flags"][1]) & FLAG_LTS_BACKFILL) is False
+
+
+def test_build_lts_row_at_ac_mode_summer_winter_and_shoulder() -> None:
+    """Verify LTS backfill AC mode distinguishes cooling, heating, & shoulder."""
+    ts = 1_763_000_300
+    kt_eid = ROOM_SENSORS["kantoor"].temp_entity_id
+    dak_eid = HOUSE_ENTITIES.outdoor_temp_dak
+    ac_eid = HOUSE_ENTITIES.ac_kantoor_power_w
+
+    def _row_for(t_out: float, t_kt: float, p_ac_w: float) -> dict[str, Any]:
+        lookups = {
+            kt_eid: _LtsSeriesLookup([(ts - 300, t_kt), (ts, t_kt)]),
+            dak_eid: _LtsSeriesLookup([(ts - 300, t_out), (ts, t_out)]),
+            ac_eid: _LtsSeriesLookup([(ts - 300, p_ac_w), (ts, p_ac_w)]),
+        }
+        row = _build_lts_row_at(
+            ts=ts,
+            lookups=lookups,
+            lts_units={},
+            entities=HOUSE_ENTITIES,
+            room_sensors=ROOM_SENSORS,
+            prev_buf_top=None,
+            prev_buf_bot=None,
+        )
+        assert row is not None
+        return row
+
+    # Summer cooling: t_out=26.0, t_kt=24.5, p_ac_w=450.0 -> COOL + flag
+    row_summer = _row_for(26.0, 24.5, 450.0)
+    assert row_summer["ac_mode_code"] == AC_MODE_COOL
+    assert bool(int(row_summer["flags"]) & FLAG_AC_COOL_KT) is True
+
+    # Winter heating: t_out=5.0, t_kt=18.0, p_ac_w=450.0 -> HEAT, no cool flag
+    row_winter = _row_for(5.0, 18.0, 450.0)
+    assert row_winter["ac_mode_code"] == AC_MODE_HEAT
+    assert bool(int(row_winter["flags"]) & FLAG_AC_COOL_KT) is False
+
+    # Shoulder / uncertain: t_out=16.0, t_kt=21.8, p_ac_w=450.0 -> OTHER
+    row_shoulder = _row_for(16.0, 21.8, 450.0)
+    assert row_shoulder["ac_mode_code"] == AC_MODE_OTHER
+    assert bool(int(row_shoulder["flags"]) & FLAG_AC_COOL_KT) is False
+
+    # Idle standby (<= 40 W) -> OFF
+    row_idle = _row_for(26.0, 24.5, 15.0)
+    assert row_idle["ac_mode_code"] == AC_MODE_OFF
+    assert bool(int(row_idle["flags"]) & FLAG_AC_COOL_KT) is False
+
+
+def test_coordinator_manual_calibration_releases_processing_lock() -> None:
+    """Prove `_processing_lock` is free during executor solver & 48h sees live rows."""
+    real_eng_for_snaps = DigitalTwinEngine()
+
+    class _DelayedThreePhaseEngine:
+        def __init__(self) -> None:
+            self.solver_started = threading.Event()
+            self.allow_solver_finish = threading.Event()
+            self.context_calls = 0
+            self.solver_input_ts: list[int] = []
+            self.solver_modes: list[str] = []
+            self.applied_recent_ts: list[int] = []
+            self.applied_plans: list[Mapping[str, Any]] = []
+
+        def capture_calibration_context(self) -> dict[str, Any]:
+            self.context_calls += 1
+            return {"ctx_version": self.context_calls}
+
+        def compute_calibration_plan(
+            self,
+            columns: Mapping[str, Sequence[float | int]],
+            context: Mapping[str, Any],
+            mode: str = "manual",
+        ) -> dict[str, Any]:
+            self.solver_input_ts = [int(ts) for ts in columns["ts_utc"]]
+            self.solver_modes.append(mode)
+            self.solver_started.set()
+            finished = self.allow_solver_finish.wait(timeout=5.0)
+            assert finished, "Timed out waiting for allow_solver_finish"
+            return {
+                "ctx_version": context["ctx_version"],
+                "mode": mode,
+                "n_train_rows": len(self.solver_input_ts),
+            }
+
+        def apply_calibration_plan(
+            self,
+            plan: Mapping[str, Any],
+            recent_columns: Mapping[str, Sequence[float | int]],
+        ) -> dict[str, Any]:
+            self.applied_plans.append(dict(plan))
+            self.applied_recent_ts = [
+                int(ts) for ts in recent_columns["ts_utc"]
+            ]
+            return {
+                "accepted_any": True,
+                "accepted_wk": True,
+                "accepted_kt": True,
+                "mode": plan["mode"],
+            }
+
+        def get_zone_snapshot(self, zone: str) -> Any:
+            return real_eng_for_snaps.get_zone_snapshot(zone)  # type: ignore[arg-type]
+
+        def to_state_dict(self) -> dict[str, Any]:
+            return {"episode_bank": {}}
+
+    class _ExecutorHassStub:
+        def __init__(self) -> None:
+            self.config = SimpleNamespace(latitude=51.4, longitude=5.5)
+
+        async def async_add_executor_job(
+            self, target: Callable[..., Any], *args: Any
+        ) -> Any:
+            loop = asyncio.get_running_loop()
+            return await loop.run_in_executor(None, target, *args)
+
+    async def _run_scenario() -> None:
+        hass_stub = _ExecutorHassStub()
+        entry_stub = SimpleNamespace(entry_id="test_entry", options={})
+        coord = BetonBatterijCoordinator(
+            hass_stub,  # type: ignore[arg-type]
+            entry_stub,  # type: ignore[arg-type]
+        )
+
+        fake_engine = _DelayedThreePhaseEngine()
+        coord.engine = fake_engine  # type: ignore[assignment]
+
+        # Sunday 03:15 auto_weekly with empty ringbuffer exits cleanly
+        sunday_dt = datetime(2026, 11, 22, 3, 15, 0, tzinfo=timezone.utc)
+        assert sunday_dt.weekday() == 6
+        await coord._async_on_weekly_calibration_slot(sunday_dt)
+        assert fake_engine.context_calls == 0
+        assert coord.fit_sensor_generation == 0
+
+        # Seed 3 initial 5-minute rows
+        t0 = 1_763_670_000
+        for idx in range(3):
+            coord.ringbuffer.append_row(_sample_row(t0 + idx * DT_STEP_S, idx))
+
+        cal_task = asyncio.create_task(coord.async_trigger_manual_calibration())
+
+        # Wait until compute_calibration_plan is actively running in executor
+        started = await asyncio.get_running_loop().run_in_executor(
+            None, fake_engine.solver_started.wait, 5.0
+        )
+        assert started is True
+        assert coord._calibration_lock.locked() is True
+        assert coord._processing_lock.locked() is False
+        assert cal_task.done() is False
+
+        # Simulate a live 5-minute tick acquiring _processing_lock immediately
+        ts_live_tick = t0 + 3 * DT_STEP_S
+
+        async def _concurrent_5m_tick() -> None:
+            async with coord._processing_lock:
+                coord.ringbuffer.append_row(_sample_row(ts_live_tick, 3))
+
+        await asyncio.wait_for(_concurrent_5m_tick(), timeout=0.5)
+        assert cal_task.done() is False
+
+        # Unblock solver and verify Phase 3 receives the live tick in recent_cols
+        fake_engine.allow_solver_finish.set()
+        outcome = await asyncio.wait_for(cal_task, timeout=5.0)
+
+        assert outcome["accepted_wk"] is True
+        assert outcome["accepted_kt"] is True
+        assert fake_engine.solver_input_ts == [
+            t0,
+            t0 + DT_STEP_S,
+            t0 + 2 * DT_STEP_S,
+        ]
+        assert fake_engine.applied_recent_ts == [
+            t0,
+            t0 + DT_STEP_S,
+            t0 + 2 * DT_STEP_S,
+            ts_live_tick,
+        ]
+        assert coord.fit_sensor_generation == 1
+        assert coord.data is not None
+        assert coord.data["ringbuffer_rows"] == 4
+
+    asyncio.run(_run_scenario())
+
+
+def test_coordinator_refresh_14d_eval_preserves_gang_k_hx() -> None:
+    """Verify 6h evaluation forwards full context including calibrated `gang`."""
+    base_eng = DigitalTwinEngine(k_hx_by_group_w_k={"gang": 142.5})
+
+    class _PureEvalEngineStub:
+        def __init__(self) -> None:
+            self.eval_report_wk: Any = None
+            self.eval_report_kt: Any = None
+            self.captured_ctx: Mapping[str, Any] | None = None
+            self.refreshed_snapshots = False
+
+        def capture_calibration_context(self) -> dict[str, Any]:
+            return base_eng.capture_calibration_context()
+
+        def compute_14d_evaluation_reports(
+            self,
+            cols: Mapping[str, Sequence[float | int]],
+            ctx: Mapping[str, Any] | None = None,
+        ) -> tuple[Any, Any]:
+            del cols  # Unused in stub.
+            self.captured_ctx = ctx
+            return ("rep_wk_stub", "rep_kt_stub")
+
+        def _refresh_cached_snapshots(self) -> None:
+            self.refreshed_snapshots = True
+
+        def get_zone_snapshot(self, zone: str) -> Any:
+            return base_eng.get_zone_snapshot(zone)  # type: ignore[arg-type]
+
+        def to_state_dict(self) -> dict[str, Any]:
+            return {"episode_bank": {}}
+
+    class _ExecutorHassStub:
+        def __init__(self) -> None:
+            self.config = SimpleNamespace(latitude=51.4, longitude=5.5)
+
+        async def async_add_executor_job(
+            self, target: Callable[..., Any], *args: Any
+        ) -> Any:
+            loop = asyncio.get_running_loop()
+            return await loop.run_in_executor(None, target, *args)
+
+    async def _run() -> None:
+        coord = BetonBatterijCoordinator(
+            _ExecutorHassStub(),  # type: ignore[arg-type]
+            SimpleNamespace(entry_id="test_entry", options={}),  # type: ignore[arg-type]
+        )
+        stub_eng = _PureEvalEngineStub()
+        coord.engine = stub_eng  # type: ignore[assignment]
+        coord.ringbuffer.append_row(_sample_row(1_763_670_000, 0))
+
+        await coord._async_refresh_14d_eval(flush=False)
+
+        assert stub_eng.captured_ctx is not None
+        assert math.isclose(
+            float(stub_eng.captured_ctx["k_hx_by_group_w_k"]["gang"]),
+            142.5,
+            abs_tol=1e-9,
+        )
+        assert stub_eng.eval_report_wk == "rep_wk_stub"
+        assert stub_eng.eval_report_kt == "rep_kt_stub"
+        assert stub_eng.refreshed_snapshots is True
+        assert coord.fit_sensor_generation == 1
+
+    asyncio.run(_run())

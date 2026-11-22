@@ -8,7 +8,7 @@ bitmask flags, and the canonical 58-column RingBuffer schema. Contains zero
 from __future__ import annotations
 
 DOMAIN: str = "betonbatterij"
-VERSION: str = "0.1.0"
+VERSION: str = "0.1.1"
 
 DT_STEP_S: int = 300
 STEPS_PER_HOUR: int = 12
@@ -90,6 +90,7 @@ FLAG_PV_FALLBACK: int = 1 << 12
 FLAG_DEFROST_WP: int = 1 << 13
 FLAG_DEFROST_AC: int = 1 << 14
 FLAG_INTERNAL_HEATER: int = 1 << 15
+FLAG_LTS_BACKFILL: int = 1 << 16
 
 AC_MODE_OFF: float = 0.0
 AC_MODE_HEAT: float = 1.0

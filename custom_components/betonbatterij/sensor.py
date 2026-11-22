@@ -14,7 +14,7 @@ from dataclasses import asdict, is_dataclass
 from typing import TYPE_CHECKING, Any
 
 from . import BetonBatterijConfigEntry, build_device_info
-from .const import DOMAIN
+from .const import DOMAIN, FLAG_DHW_TANK
 from .domain.contracts import ZoneId, ZoneSnapshot
 from .house_config import DAY1_COP_PARAMS, DAY1_PRIORS_KT, DAY1_PRIORS_WK
 
@@ -374,6 +374,7 @@ class BetonBatterijZoneFitSensor(
             "fisher_1sigma_std",
             "correlation_matrix",
             "collinearity_warnings",
+            "bound_warnings",
             "regime_rmses",
             "overall_6h",
             "last_calibration",
@@ -451,6 +452,7 @@ class BetonBatterijZoneFitSensor(
         fisher_std: dict[str, Any] = {}
         corr_matrix: dict[str, Any] = {}
         collinearity_warnings: list[str] = []
+        bound_warnings: list[str] = []
         if hasattr(engine, "get_zone_fit_diagnostics"):
             fit_diag = _to_plain_dict(
                 engine.get_zone_fit_diagnostics(self._zone)
@@ -460,6 +462,7 @@ class BetonBatterijZoneFitSensor(
             collinearity_warnings = list(
                 fit_diag.get("collinearity_warnings") or []
             )
+            bound_warnings = list(fit_diag.get("bound_warnings") or [])
 
         last_cal_summary: dict[str, Any] = {}
         acc_key = f"accepted_{self._zone}"
@@ -494,6 +497,8 @@ class BetonBatterijZoneFitSensor(
                     collinearity_warnings = list(
                         d_item.get("collinearity_warnings") or []
                     )
+                if not bound_warnings:
+                    bound_warnings = list(d_item.get("bound_warnings") or [])
                 last_cal_summary = {
                     "accepted": d_item.get("accepted"),
                     "reason": d_item.get("reason"),
@@ -508,6 +513,7 @@ class BetonBatterijZoneFitSensor(
             "fisher_1sigma_std": fisher_std,
             "correlation_matrix": corr_matrix,
             "collinearity_warnings": collinearity_warnings,
+            "bound_warnings": bound_warnings,
             "regime_rmses": regime_dict,
             "overall_6h": overall_dict,
             "last_calibration": last_cal_summary,
@@ -522,7 +528,13 @@ class BetonBatterijZoneFitSensor(
 class BetonBatterijCopFitSensor(
     CoordinatorEntity["BetonBatterijCoordinator"], SensorEntity
 ):
-    """Diagnostic Panasonic 9 kW T-CAP COP curve sensor (`4x/day` + on button)."""
+    """Diagnostic Panasonic 9 kW T-CAP COP curve sensor.
+
+    Recomputes the live expected space-heating COP on every 5-minute tick with
+    a `0.05` deadband and 60-minute heartbeat to limit Recorder writes, while
+    refreshing fitted COP curve parameters and diagnostics `4x/day` or after
+    calibration.
+    """
 
     _attr_has_entity_name = True
     _attr_entity_category = EntityCategory.DIAGNOSTIC
@@ -553,6 +565,10 @@ class BetonBatterijCopFitSensor(
         self._attr_translation_key = "fit_warmtepomp_cop"
         self._attr_device_info = build_device_info(entry_id)
         self._last_fit_gen: int | None = None
+        self._cached_cop_params: dict[str, Any] = {}
+        self._cached_cop_diag: dict[str, Any] = {}
+        self._last_published_cop: float | None = None
+        self._last_write_mono: float | None = None
 
     async def async_added_to_hass(self) -> None:
         """Populate initial COP readout on startup."""
@@ -570,24 +586,67 @@ class BetonBatterijCopFitSensor(
         t_out = 7.0
         for col in ("t_out_dak_c", "t_out_weather_c", "t_out_hm_c"):
             cand = row.get(col)
-            if isinstance(cand, (int, float)) and math.isfinite(cand):
+            if (
+                isinstance(cand, (int, float))
+                and not isinstance(cand, bool)
+                and math.isfinite(cand)
+            ):
                 t_out = float(cand)
                 break
 
+        raw_flags = row.get("flags", 0)
+        flags_val = (
+            int(raw_flags)
+            if isinstance(raw_flags, (int, float))
+            and not isinstance(raw_flags, bool)
+            and math.isfinite(raw_flags)
+            else 0
+        )
+        is_dhw_tank = bool(flags_val & FLAG_DHW_TANK)
+
+        wp_out_raw = row.get("t_wp_out_c")
+        t_wp_out_is_finite = (
+            isinstance(wp_out_raw, (int, float))
+            and not isinstance(wp_out_raw, bool)
+            and math.isfinite(wp_out_raw)
+        )
+        wp_out_hot_dhw = t_wp_out_is_finite and float(wp_out_raw) > 40.0
+
         t_sup = 30.0
-        for col in ("t_wp_out_c", "t_buf_top_end_c"):
-            cand = row.get(col)
-            if (
-                isinstance(cand, (int, float))
-                and math.isfinite(cand)
-                and cand > 15.0
+        if is_dhw_tank or wp_out_hot_dhw:
+            for col in ("t_buf_top_end_c", "t_buf_top_start_c"):
+                cand = row.get(col)
+                if (
+                    isinstance(cand, (int, float))
+                    and not isinstance(cand, bool)
+                    and math.isfinite(cand)
+                    and 15.0 < float(cand) <= 40.0
+                ):
+                    t_sup = float(cand)
+                    break
+        else:
+            for col in (
+                "t_wp_out_c",
+                "t_buf_top_end_c",
+                "t_buf_top_start_c",
             ):
-                t_sup = float(cand)
-                break
+                cand = row.get(col)
+                if (
+                    isinstance(cand, (int, float))
+                    and not isinstance(cand, bool)
+                    and math.isfinite(cand)
+                    and float(cand) > 15.0
+                ):
+                    t_sup = float(cand)
+                    break
 
         rh_out = 80.0
         cand_rh = row.get("rh_out_pct")
-        if isinstance(cand_rh, (int, float)) and math.isfinite(cand_rh):
+        if (
+            isinstance(cand_rh, (int, float))
+            and not isinstance(cand_rh, bool)
+            and math.isfinite(cand_rh)
+        ):
             rh_out = float(cand_rh)
 
         engine = self.coordinator.engine
@@ -612,23 +671,40 @@ class BetonBatterijCopFitSensor(
 
     def _refresh_from_engine(self, *, force: bool) -> None:
         gen = self.coordinator.fit_sensor_generation
-        if (
-            not force
-            and self._last_fit_gen is not None
-            and gen == self._last_fit_gen
-        ):
-            return
-        self._last_fit_gen = gen
+        gen_changed = self._last_fit_gen is None or gen != self._last_fit_gen
+        if force or gen_changed:
+            engine = self.coordinator.engine
+            self._cached_cop_params = _to_plain_dict(
+                getattr(engine, "cop_params", DAY1_COP_PARAMS)
+            )
+            self._cached_cop_diag = _to_plain_dict(
+                getattr(engine, "cop_diagnostics", None)
+            )
+            self._last_fit_gen = gen
 
-        engine = self.coordinator.engine
-        cop_params = _to_plain_dict(
-            getattr(engine, "cop_params", DAY1_COP_PARAMS)
+        live_cop = round(
+            self._compute_live_expected_cop(
+                self._cached_cop_params, self._cached_cop_diag
+            ),
+            2,
         )
-        cop_diag = _to_plain_dict(getattr(engine, "cop_diagnostics", None))
-        live_cop = self._compute_live_expected_cop(cop_params, cop_diag)
+        now_mono = time.monotonic()
+        should_write = (
+            force
+            or gen_changed
+            or self._last_published_cop is None
+            or abs(live_cop - self._last_published_cop) >= (0.05 - 1e-9)
+            or self._last_write_mono is None
+            or (now_mono - self._last_write_mono) >= 3600.0
+        )
+        if not should_write:
+            return
 
+        cop_params = self._cached_cop_params
         eta_cv = round(
-            float(cop_params.get("eta_carnot_cv", DAY1_COP_PARAMS.eta_carnot_cv)),
+            float(
+                cop_params.get("eta_carnot_cv", DAY1_COP_PARAMS.eta_carnot_cv)
+            ),
             4,
         )
         beta_def = round(
@@ -650,14 +726,16 @@ class BetonBatterijCopFitSensor(
             1,
         )
 
-        self._attr_native_value = round(live_cop, 2)
+        self._last_published_cop = live_cop
+        self._last_write_mono = now_mono
+        self._attr_native_value = live_cop
         self._attr_extra_state_attributes = {
             "eta_carnot_cv": eta_cv,
             "beta_defrost": beta_def,
             "eta_carnot_dhw": eta_dhw,
             "delta_p_wp_bias_w": p_bias,
-            "live_expected_cop": round(live_cop, 2),
-            "cop_diagnostics": cop_diag,
+            "live_expected_cop": live_cop,
+            "cop_diagnostics": self._cached_cop_diag,
         }
         self.async_write_ha_state()
 

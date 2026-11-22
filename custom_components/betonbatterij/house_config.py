@@ -67,9 +67,9 @@ DAY1_PRIORS_KT: ZoneParameters = ZoneParameters(
     c_air_wh_k=220.0,
     c_floor_wh_k=2400.0,
     r_fh_k_kw=5.00,
-    h_loss_w_k=45.0,
+    h_loss_w_k=25.0,
     h_up_w_k=0.0,
-    h_down_w_k=75.0,
+    h_down_w_k=40.0,
     alpha_sol=0.80,
     a_sol_m2=0.40,
     tau_d_h=1.8,
@@ -103,7 +103,7 @@ PARAM_BOUNDS_KT: dict[str, ParameterBounds] = {
         lower=3.50, upper=6.50, prior_mean=5.00, prior_std=0.80
     ),
     "h_loss_w_k": ParameterBounds(
-        lower=25.0, upper=80.0, prior_mean=45.0, prior_std=14.0
+        lower=12.0, upper=65.0, prior_mean=25.0, prior_std=10.0
     ),
     "a_sol_m2": ParameterBounds(
         lower=0.10, upper=2.00, prior_mean=0.40, prior_std=0.40
@@ -112,7 +112,7 @@ PARAM_BOUNDS_KT: dict[str, ParameterBounds] = {
         lower=2.00, upper=5.50, prior_mean=3.60, prior_std=0.70
     ),
     "h_down_w_k": ParameterBounds(
-        lower=50.0, upper=100.0, prior_mean=75.0, prior_std=20.0
+        lower=20.0, upper=75.0, prior_mean=40.0, prior_std=12.0
     ),
 }
 

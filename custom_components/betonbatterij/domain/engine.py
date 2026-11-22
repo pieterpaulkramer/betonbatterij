@@ -121,6 +121,119 @@ def _discretize_2x2(
     return phi_2x2, gamma_fh, gamma_ac
 
 
+def _clone_memory(
+    mem: contracts.ParameterPosteriorMemory | None,
+) -> contracts.ParameterPosteriorMemory | None:
+    """Returns a deep-copied `ParameterPosteriorMemory` or `None`."""
+    if mem is None:
+        return None
+    return contracts.ParameterPosteriorMemory(
+        mean=dict(mem.mean),
+        precision=dict(mem.precision),
+    )
+
+
+def _evaluate_both_zones_14d(
+    columns: Mapping[str, Sequence[float | int]],
+    params_wk: contracts.ZoneParameters,
+    params_kt: contracts.ZoneParameters,
+    flow_rates_l_min: Mapping[str, float],
+    k_hx_by_group: Mapping[str, float],
+    lat_deg: float,
+    lon_deg: float,
+    *,
+    precomputed_hist_eval: evaluation.PreprocessedHistory | None = None,
+    precomputed_hist_prior: evaluation.PreprocessedHistory | None = None,
+) -> tuple[contracts.ZoneEvaluationReport, contracts.ZoneEvaluationReport]:
+    """Computes 14d `ZoneEvaluationReport`s for `wk` and `kt` purely."""
+    ts_all = columns.get("ts_utc", ())
+    n_total = len(ts_all)
+    hist_eval_shared: evaluation.PreprocessedHistory | None = None
+    hist_prior_shared: evaluation.PreprocessedHistory | None = None
+    if n_total >= evaluation.SPINUP_48H_STEPS:
+        start_slice = max(0, n_total - evaluation.MAX_EVAL_SLICE_STEPS)
+        n_eval = n_total - start_slice
+        sub_cols: Mapping[str, Sequence[float | int]] | None = None
+        khx_eval = dict(house_config.DAY1_K_HX_BY_GROUP_W_K)
+        for g_name, val in k_hx_by_group.items():
+            khx_eval["kantoor" if g_name == "kt" else g_name] = float(val)
+        khx_eval["wk"] = params_wk.k_hx_w_k
+        khx_eval["kantoor"] = params_kt.k_hx_w_k
+
+        if (
+            precomputed_hist_eval is not None
+            and precomputed_hist_eval.n_rows == n_eval
+            and abs(precomputed_hist_eval.hyd_k_hx_wk - khx_eval["wk"]) <= 1e-9
+            and abs(precomputed_hist_eval.hyd_k_hx_kt - khx_eval["kantoor"])
+            <= 1e-9
+        ):
+            hist_eval_shared = precomputed_hist_eval
+        elif (
+            precomputed_hist_eval is not None
+            and precomputed_hist_eval.n_rows == n_eval
+        ):
+            sub_cols = evaluation.slice_columns(columns, start_slice, n_total)
+            hist_eval_shared = evaluation.recompute_history_for_khx(
+                precomputed_hist_eval,
+                sub_cols,
+                flow_rates_l_min=flow_rates_l_min,
+                k_hx_by_group=khx_eval,
+            )
+        else:
+            sub_cols = evaluation.slice_columns(columns, start_slice, n_total)
+            hist_eval_shared = evaluation.preprocess_history_columns(
+                sub_cols,
+                flow_rates_l_min=flow_rates_l_min,
+                k_hx_by_group=khx_eval,
+                eta_ac_ref=params_kt.eta_ac,
+                lat_deg=lat_deg,
+                lon_deg=lon_deg,
+            )
+
+        if (
+            precomputed_hist_prior is not None
+            and precomputed_hist_prior.n_rows == n_eval
+        ):
+            hist_prior_shared = precomputed_hist_prior
+        else:
+            if sub_cols is None:
+                sub_cols = evaluation.slice_columns(
+                    columns, start_slice, n_total
+                )
+            hist_prior_shared = evaluation.recompute_history_for_khx(
+                hist_eval_shared,
+                sub_cols,
+                flow_rates_l_min=flow_rates_l_min,
+                k_hx_by_group=house_config.DAY1_K_HX_BY_GROUP_W_K,
+            )
+
+    eval_wk = evaluation.evaluate_14d_hindcast(
+        columns,
+        "wk",
+        params_wk,
+        house_config.DAY1_PRIORS_WK,
+        flow_rates_l_min=flow_rates_l_min,
+        k_hx_by_group=k_hx_by_group,
+        lat_deg=lat_deg,
+        lon_deg=lon_deg,
+        precomputed_hist_eval=hist_eval_shared,
+        precomputed_hist_prior=hist_prior_shared,
+    )
+    eval_kt = evaluation.evaluate_14d_hindcast(
+        columns,
+        "kt",
+        params_kt,
+        house_config.DAY1_PRIORS_KT,
+        flow_rates_l_min=flow_rates_l_min,
+        k_hx_by_group=k_hx_by_group,
+        lat_deg=lat_deg,
+        lon_deg=lon_deg,
+        precomputed_hist_eval=hist_eval_shared,
+        precomputed_hist_prior=hist_prior_shared,
+    )
+    return eval_wk, eval_kt
+
+
 def _fit_cop_with_mode(
     columns: Mapping[str, Sequence[float | int]],
     current_cop: contracts.CopParameters,
@@ -128,6 +241,7 @@ def _fit_cop_with_mode(
     mode: Literal["manual", "auto_weekly"],
     lat_deg: float = house_config.LATITUDE_DEG,
     lon_deg: float = house_config.LONGITUDE_DEG,
+    eval_columns: Mapping[str, Sequence[float | int]] | None = None,
 ) -> tuple[
     contracts.CopParameters,
     contracts.ParameterPosteriorMemory,
@@ -140,6 +254,7 @@ def _fit_cop_with_mode(
         memory=memory_cop,
         lat_deg=lat_deg,
         lon_deg=lon_deg,
+        eval_columns=eval_columns,
     )
     diag = dict(diag_raw)
 
@@ -339,9 +454,17 @@ class DigitalTwinEngine:
         self._last_corr_kt: dict[str, dict[str, float]] = {}
         self._last_collinear_wk: list[str] = []
         self._last_collinear_kt: list[str] = []
+        self._last_bound_warnings_wk: list[str] = []
+        self._last_bound_warnings_kt: list[str] = []
 
+        self._param_epoch: int = 0
         self._snapshot_wk: contracts.ZoneSnapshot | None = None
         self._snapshot_kt: contracts.ZoneSnapshot | None = None
+
+    @property
+    def param_epoch(self) -> int:
+        """Monotonic counter incremented on every parameter mutation."""
+        return self._param_epoch
 
     def _build_snapshot(
         self,
@@ -901,6 +1024,8 @@ class DigitalTwinEngine:
             "memory_cop": calibration.posterior_memory_to_dict(
                 self.memory_cop
             ),
+            "bound_warnings_wk": list(self._last_bound_warnings_wk),
+            "bound_warnings_kt": list(self._last_bound_warnings_kt),
         }
 
     def _apply_snapshot_dict(self, snap: Mapping[str, Any]) -> None:
@@ -931,67 +1056,172 @@ class DigitalTwinEngine:
         self.memory_cop = calibration.posterior_memory_from_dict(
             snap.get("memory_cop")
         )
+        if isinstance(snap.get("bound_warnings_wk"), Sequence):
+            self._last_bound_warnings_wk = [
+                str(x) for x in snap["bound_warnings_wk"]
+            ]
+        else:
+            self._last_bound_warnings_wk = []
+        if isinstance(snap.get("bound_warnings_kt"), Sequence):
+            self._last_bound_warnings_kt = [
+                str(x) for x in snap["bound_warnings_kt"]
+            ]
+        else:
+            self._last_bound_warnings_kt = []
 
         self.estimator_wk.params = self._params_wk
         self.estimator_kt.params = self._params_kt
         self.hydraulics.update_k_hx(self._k_hx_by_group_w_k)
 
-    def run_calibration(
+    def capture_calibration_context(self) -> dict[str, Any]:
+        """Captures an isolated `< 1 ms` calibration context under lock."""
+        return {
+            "param_epoch": int(self._param_epoch),
+            "params_wk": self._params_wk,
+            "params_kt": self._params_kt,
+            "flow_rates_l_min": dict(self._flow_rates_l_min),
+            "k_hx_by_group_w_k": dict(self._k_hx_by_group_w_k),
+            "cop_params": self.cop_params,
+            "memory_wk": _clone_memory(self.memory_wk),
+            "memory_kt": _clone_memory(self.memory_kt),
+            "memory_cop": _clone_memory(self.memory_cop),
+            "episode_bank": self.episode_bank.clone(),
+            "bound_warnings_wk": list(self._last_bound_warnings_wk),
+            "bound_warnings_kt": list(self._last_bound_warnings_kt),
+            "snapshot_depth": len(self.snapshot_stack),
+            "latitude_deg": float(self.latitude_deg),
+            "longitude_deg": float(self.longitude_deg),
+            "last_ts_utc": int(self._last_ts_utc),
+        }
+
+    def compute_calibration_plan(
         self,
         columns: Mapping[str, Sequence[float | int]],
+        context: Mapping[str, Any],
         mode: Literal["manual", "auto_weekly"] = "manual",
     ) -> dict[str, Any]:
-        """Runs batch calibration (`episode_bank` + `k_hx` + zones + COP + 48h).
+        """Computes a lock-free calibration plan without reading/mutating `self`.
 
         Args:
-            columns: Full RingBuffer telemetry column dictionary.
+            columns: Snapshot of full RingBuffer telemetry columns.
+            context: Decoupled dictionary captured by
+                `capture_calibration_context()`.
             mode: `"manual"` or `"auto_weekly"`.
 
         Returns:
-            Summary dictionary with `accepted_any`, `accepted_wk`,
-            `accepted_kt`, `outcome_wk`, `outcome_kt`, `cop_params`, and
-            `snapshot_depth`.
+            Pure calibration plan dictionary ready for `apply_calibration_plan`.
         """
+        param_epoch = int(context["param_epoch"])
+        params_wk: contracts.ZoneParameters = context["params_wk"]
+        params_kt: contracts.ZoneParameters = context["params_kt"]
+        flow_rates: dict[str, float] = dict(context["flow_rates_l_min"])
+        k_hx_by_group: dict[str, float] = dict(context["k_hx_by_group_w_k"])
+        cop_params: contracts.CopParameters = context["cop_params"]
+        mem_wk_in = _clone_memory(context.get("memory_wk"))
+        mem_kt_in = _clone_memory(context.get("memory_kt"))
+        mem_cop_in = _clone_memory(context.get("memory_cop"))
+        snapshot_depth = int(context.get("snapshot_depth", 0))
+        lat_deg = float(context.get("latitude_deg", house_config.LATITUDE_DEG))
+        lon_deg = float(
+            context.get("longitude_deg", house_config.LONGITUDE_DEG)
+        )
+        last_ts_utc = int(context.get("last_ts_utc", 0))
+
         ts_seq = columns.get("ts_utc", ())
         n_total = len(ts_seq)
-        ts_now = int(ts_seq[-1]) if n_total > 0 else self._last_ts_utc
+        if n_total == 0:
+            return {
+                "empty": True,
+                "param_epoch": param_epoch,
+                "accepted_any": False,
+                "accepted_wk": False,
+                "accepted_kt": False,
+                "reason": "Empty telemetry history.",
+                "cop_params": cop_params,
+                "snapshot_depth": snapshot_depth,
+            }
+
+        ts_now = int(ts_seq[-1])
 
         if mode == "auto_weekly":
-            gate_ok, gate_reason = (
-                calibration.check_seasonal_calibration_gate(
-                    columns,
-                    lat_deg=self.latitude_deg,
-                    lon_deg=self.longitude_deg,
-                )
+            gate_ok, gate_reason = calibration.check_seasonal_calibration_gate(
+                columns,
+                lat_deg=lat_deg,
+                lon_deg=lon_deg,
             )
             if not gate_ok:
+                eval_wk_blk, eval_kt_blk = _evaluate_both_zones_14d(
+                    columns,
+                    params_wk,
+                    params_kt,
+                    flow_rates,
+                    k_hx_by_group,
+                    lat_deg,
+                    lon_deg,
+                )
                 return {
+                    "param_epoch": param_epoch,
+                    "blocked_by_seasonal_gate": True,
                     "accepted_any": False,
                     "accepted_wk": False,
                     "accepted_kt": False,
-                    "blocked_by_seasonal_gate": True,
                     "reason": gate_reason,
-                    "snapshot_depth": len(self.snapshot_stack),
+                    "eval_wk": eval_wk_blk,
+                    "eval_kt": eval_kt_blk,
+                    "snapshot_depth": snapshot_depth,
                 }
 
-        pre_snap = self._capture_snapshot(
-            reason=f"{mode}_calibration", ts_utc=ts_now
+        pre_snap = {
+            "ts_utc": ts_now if n_total > 0 else last_ts_utc,
+            "reason": f"{mode}_calibration",
+            "params_wk": _zone_params_to_dict(params_wk),
+            "params_kt": _zone_params_to_dict(params_kt),
+            "k_hx_by_group_w_k": dict(k_hx_by_group),
+            "cop_params": _cop_params_to_dict(cop_params),
+            "memory_wk": calibration.posterior_memory_to_dict(mem_wk_in),
+            "memory_kt": calibration.posterior_memory_to_dict(mem_kt_in),
+            "memory_cop": calibration.posterior_memory_to_dict(mem_cop_in),
+            "bound_warnings_wk": list(context.get("bound_warnings_wk", ())),
+            "bound_warnings_kt": list(context.get("bound_warnings_kt", ())),
+        }
+
+        bank_ctx = context.get("episode_bank")
+        if isinstance(bank_ctx, calibration.SeasonalEpisodeBank):
+            local_bank = bank_ctx.clone()
+        elif isinstance(context.get("episode_bank_dict"), Mapping):
+            local_bank = calibration.SeasonalEpisodeBank.from_dict(
+                context["episode_bank_dict"]
+            )
+        else:
+            local_bank = calibration.SeasonalEpisodeBank()
+
+        # Shared raw-aware chronological Train / Holdout split (F1)
+        is_lts_all, _ = evaluation.detect_lts_and_missing_prim_rows(columns)
+        train_end = evaluation.compute_train_holdout_split(
+            columns, is_lts_row=is_lts_all
         )
 
         # Curate EpisodeBank strictly from training split (no holdout leakage)
-        if n_total >= 4 * const.STEPS_PER_DAY:
-            train_end = (
-                n_total - evaluation.EVAL_14D_STEPS
-                if n_total >= 28 * const.STEPS_PER_DAY
-                else max(2 * const.STEPS_PER_DAY, int(0.70 * n_total))
+        hist_train_init: evaluation.PreprocessedHistory | None = None
+        if n_total >= 4 * const.STEPS_PER_DAY and train_end < n_total:
+            train_slice: Mapping[str, Sequence[float | int]] = (
+                evaluation.slice_columns(columns, 0, train_end)
             )
-            train_slice = evaluation.slice_columns(columns, 0, train_end)
-            self.episode_bank.update_from_columns(
+            hist_train_init = evaluation.preprocess_history_columns(
                 train_slice,
-                flow_rates_l_min=self._flow_rates_l_min,
-                k_hx_by_group=self._k_hx_by_group_w_k,
-                lat_deg=self.latitude_deg,
-                lon_deg=self.longitude_deg,
+                flow_rates_l_min=flow_rates,
+                k_hx_by_group=k_hx_by_group,
+                eta_ac_ref=params_kt.eta_ac,
+                lat_deg=lat_deg,
+                lon_deg=lon_deg,
+            )
+            local_bank.update_from_columns(
+                train_slice,
+                flow_rates_l_min=flow_rates,
+                k_hx_by_group=k_hx_by_group,
+                lat_deg=lat_deg,
+                lon_deg=lon_deg,
+                precomputed_hist=hist_train_init,
             )
         else:
             train_slice = dict(columns)
@@ -999,99 +1229,189 @@ class DigitalTwinEngine:
         # 1. Calibrate steady-state K_hx on training split
         raw_khx = calibration.calibrate_k_hx_robust(
             train_slice,
-            self._flow_rates_l_min,
-            self._k_hx_by_group_w_k,
-            lat_deg=self.latitude_deg,
-            lon_deg=self.longitude_deg,
+            flow_rates,
+            k_hx_by_group,
+            lat_deg=lat_deg,
+            lon_deg=lon_deg,
+            precomputed_hist=hist_train_init,
         )
         if mode == "auto_weekly":
             cand_khx = {
                 g: 0.80
-                * self._k_hx_by_group_w_k.get(
-                    g, house_config.DAY1_K_HX_BY_GROUP_W_K[g]
-                )
-                + 0.20
-                * raw_khx.get(g, house_config.DAY1_K_HX_BY_GROUP_W_K[g])
+                * k_hx_by_group.get(g, house_config.DAY1_K_HX_BY_GROUP_W_K[g])
+                + 0.20 * raw_khx.get(g, house_config.DAY1_K_HX_BY_GROUP_W_K[g])
                 for g in const.ALL_HYDRAULIC_GROUPS
             }
         else:
             cand_khx = dict(raw_khx)
 
+        # Share precomputed train/holdout history across `wk` and `kt`
+        hist_train_cand: evaluation.PreprocessedHistory | None = None
+        hist_hold_cand: evaluation.PreprocessedHistory | None = None
+        hist_hold_prior: evaluation.PreprocessedHistory | None = None
+        if n_total >= 4 * const.STEPS_PER_DAY and train_end < n_total:
+            if (
+                hist_train_init is not None
+                and cand_khx == k_hx_by_group
+            ):
+                hist_train_cand = hist_train_init
+            elif hist_train_init is not None:
+                hist_train_cand = evaluation.recompute_history_for_khx(
+                    hist_train_init,
+                    train_slice,
+                    flow_rates_l_min=flow_rates,
+                    k_hx_by_group=cand_khx,
+                )
+            else:
+                hist_train_cand = evaluation.preprocess_history_columns(
+                    train_slice,
+                    flow_rates_l_min=flow_rates,
+                    k_hx_by_group=cand_khx,
+                    eta_ac_ref=params_kt.eta_ac,
+                    lat_deg=lat_deg,
+                    lon_deg=lon_deg,
+                )
+            holdout_slice_start = max(
+                0, train_end - evaluation.SPINUP_48H_STEPS
+            )
+            holdout_cols = evaluation.slice_columns(
+                columns, holdout_slice_start, n_total
+            )
+            hist_hold_cand = evaluation.preprocess_history_columns(
+                holdout_cols,
+                flow_rates_l_min=flow_rates,
+                k_hx_by_group=cand_khx,
+                eta_ac_ref=params_kt.eta_ac,
+                lat_deg=lat_deg,
+                lon_deg=lon_deg,
+            )
+            evaluation.get_zone_tape(hist_hold_cand, "wk")
+            evaluation.get_zone_tape(hist_hold_cand, "kt")
+            hist_hold_prior = evaluation.recompute_history_for_khx(
+                hist_hold_cand,
+                holdout_cols,
+                flow_rates_l_min=flow_rates,
+                k_hx_by_group=house_config.DAY1_K_HX_BY_GROUP_W_K,
+            )
+
         # 2. Calibrate `wk` and `kt` (Choice A2 + B2 + D2 + D3 + Holdout Gate)
         out_wk, mem_wk = calibration.calibrate_zone_a2(
             columns,
             "wk",
-            self._params_wk,
+            params_wk,
             mode=mode,
-            episode_bank=self.episode_bank,
-            memory=self.memory_wk,
-            flow_rates_l_min=self._flow_rates_l_min,
+            episode_bank=local_bank,
+            memory=mem_wk_in,
+            flow_rates_l_min=flow_rates,
             k_hx_by_group=cand_khx,
-            lat_deg=self.latitude_deg,
-            lon_deg=self.longitude_deg,
+            lat_deg=lat_deg,
+            lon_deg=lon_deg,
+            precomputed_train_hist=hist_train_cand,
+            precomputed_holdout_hist=hist_hold_cand,
+            precomputed_holdout_prior_hist=hist_hold_prior,
+            is_lts_row=is_lts_all,
         )
         out_kt, mem_kt = calibration.calibrate_zone_a2(
             columns,
             "kt",
-            self._params_kt,
+            params_kt,
             mode=mode,
-            episode_bank=self.episode_bank,
-            memory=self.memory_kt,
-            flow_rates_l_min=self._flow_rates_l_min,
+            episode_bank=local_bank,
+            memory=mem_kt_in,
+            flow_rates_l_min=flow_rates,
             k_hx_by_group=cand_khx,
-            lat_deg=self.latitude_deg,
-            lon_deg=self.longitude_deg,
+            lat_deg=lat_deg,
+            lon_deg=lon_deg,
+            precomputed_train_hist=hist_train_cand,
+            precomputed_holdout_hist=hist_hold_cand,
+            precomputed_holdout_prior_hist=hist_hold_prior,
+            is_lts_row=is_lts_all,
         )
 
-        # 3. Calibrate heat pump COP model
-        cop_cols = (
-            train_slice
-            if len(train_slice.get("ts_utc", ())) >= const.STEPS_PER_DAY
-            else columns
+        # 3. Calibrate heat pump COP model on `train_slice` once raw rows exist
+        n_non_lts_train = sum(
+            1 for idx in range(min(train_end, len(is_lts_all))) if not is_lts_all[idx]
         )
+        cop_cols = train_slice if n_non_lts_train > 0 else columns
         new_cop, mem_cop, cop_diag = _fit_cop_with_mode(
             cop_cols,
-            self.cop_params,
-            self.memory_cop,
+            cop_params,
+            mem_cop_in,
             mode,
-            lat_deg=self.latitude_deg,
-            lon_deg=self.longitude_deg,
+            lat_deg=lat_deg,
+            lon_deg=lon_deg,
+            eval_columns=columns,
         )
-        cop_changed = new_cop != self.cop_params
+        cop_changed = new_cop != cop_params
         accepted_any = out_wk.accepted or out_kt.accepted or cop_changed
 
-        if accepted_any:
-            self.snapshot_stack.append(pre_snap)
-            if out_wk.accepted:
-                self._params_wk = out_wk.params_applied
-                self.memory_wk = mem_wk
-                self._k_hx_by_group_w_k["wk"] = out_wk.params_applied.k_hx_w_k
-                self._k_hx_by_group_w_k["gang"] = cand_khx.get(
-                    "gang", self._k_hx_by_group_w_k["gang"]
-                )
-            if out_kt.accepted:
-                self._params_kt = out_kt.params_applied
-                self.memory_kt = mem_kt
-                self._k_hx_by_group_w_k["kantoor"] = (
-                    out_kt.params_applied.k_hx_w_k
-                )
-            if cop_changed:
-                self.cop_params = new_cop
-                self.memory_cop = mem_cop
-            self.cop_diagnostics = cop_diag
-            self.hydraulics.update_k_hx(self._k_hx_by_group_w_k)
-            self.replay_48h_from_columns(columns)
+        next_params_wk = out_wk.params_applied if out_wk.accepted else params_wk
+        next_params_kt = out_kt.params_applied if out_kt.accepted else params_kt
+        next_khx = dict(k_hx_by_group)
+        if out_wk.accepted:
+            next_khx["wk"] = next_params_wk.k_hx_w_k
+            next_khx["gang"] = cand_khx.get("gang", next_khx["gang"])
+        if out_kt.accepted:
+            next_khx["kantoor"] = next_params_kt.k_hx_w_k
+
+        can_reuse_14d = (
+            n_total >= evaluation.SPINUP_48H_STEPS
+            and (n_total - train_end) == evaluation.EVAL_14D_STEPS
+            and next_khx == cand_khx
+        )
+        reuse_wk = (
+            can_reuse_14d
+            and out_wk.accepted
+            and out_wk.params_applied == out_wk.params_map_raw
+        )
+        reuse_kt = (
+            can_reuse_14d
+            and out_kt.accepted
+            and out_kt.params_applied == out_kt.params_map_raw
+        )
+        if reuse_wk and reuse_kt:
+            eval_wk = out_wk.holdout_after
+            eval_kt = out_kt.holdout_after
+        elif reuse_wk:
+            eval_wk = out_wk.holdout_after
+            eval_kt = evaluation.evaluate_14d_hindcast(
+                columns,
+                "kt",
+                next_params_kt,
+                house_config.DAY1_PRIORS_KT,
+                flow_rates_l_min=flow_rates,
+                k_hx_by_group=next_khx,
+                lat_deg=lat_deg,
+                lon_deg=lon_deg,
+                precomputed_hist_eval=hist_hold_cand,
+                precomputed_hist_prior=hist_hold_prior,
+            )
+        elif reuse_kt:
+            eval_wk = evaluation.evaluate_14d_hindcast(
+                columns,
+                "wk",
+                next_params_wk,
+                house_config.DAY1_PRIORS_WK,
+                flow_rates_l_min=flow_rates,
+                k_hx_by_group=next_khx,
+                lat_deg=lat_deg,
+                lon_deg=lon_deg,
+                precomputed_hist_eval=hist_hold_cand,
+                precomputed_hist_prior=hist_hold_prior,
+            )
+            eval_kt = out_kt.holdout_after
         else:
-            self.cop_diagnostics = cop_diag
-
-        self._last_posterior_std_wk = dict(out_wk.posterior_std)
-        self._last_posterior_std_kt = dict(out_kt.posterior_std)
-        self._last_corr_wk = dict(out_wk.correlation_matrix)
-        self._last_corr_kt = dict(out_kt.correlation_matrix)
-        self._last_collinear_wk = list(out_wk.collinearity_warnings)
-        self._last_collinear_kt = list(out_kt.collinearity_warnings)
-
-        self.refresh_14d_evaluation(columns)
+            eval_wk, eval_kt = _evaluate_both_zones_14d(
+                columns,
+                next_params_wk,
+                next_params_kt,
+                flow_rates,
+                next_khx,
+                lat_deg,
+                lon_deg,
+                precomputed_hist_eval=hist_hold_cand,
+                precomputed_hist_prior=hist_hold_prior,
+            )
 
         hist_entry = {
             "ts_utc": ts_now,
@@ -1107,7 +1427,135 @@ class DigitalTwinEngine:
             "holdout_j_kt_after": out_kt.holdout_after.overall_6h.j_eval_c,
             "cop_updated": cop_changed,
         }
-        self.calibration_history.append(hist_entry)
+
+        return {
+            "empty": False,
+            "param_epoch": param_epoch,
+            "mode": mode,
+            "accepted_any": accepted_any,
+            "accepted_wk": out_wk.accepted,
+            "accepted_kt": out_kt.accepted,
+            "cop_changed": cop_changed,
+            "pre_snap": pre_snap,
+            "episode_bank": local_bank,
+            "outcome_wk": out_wk,
+            "outcome_kt": out_kt,
+            "memory_wk": mem_wk,
+            "memory_kt": mem_kt,
+            "new_cop": new_cop,
+            "memory_cop": mem_cop,
+            "cop_diagnostics": cop_diag,
+            "next_k_hx": next_khx,
+            "eval_wk": eval_wk,
+            "eval_kt": eval_kt,
+            "history_entry": hist_entry,
+        }
+
+    def apply_calibration_plan(
+        self,
+        plan: Mapping[str, Any],
+        recent_columns: Mapping[str, Sequence[float | int]] | None = None,
+    ) -> dict[str, Any]:
+        """Applies a computed calibration plan in `< 20 ms` under lock."""
+        if plan.get("empty"):
+            return {
+                "empty": True,
+                "accepted_any": False,
+                "accepted_wk": False,
+                "accepted_kt": False,
+                "reason": str(plan.get("reason", "Empty telemetry history.")),
+                "cop_params": self.cop_params,
+                "snapshot_depth": len(self.snapshot_stack),
+            }
+
+        if plan.get("param_epoch") != self._param_epoch:
+            return {
+                "accepted_any": False,
+                "accepted_wk": False,
+                "accepted_kt": False,
+                "aborted_stale_epoch": True,
+                "reason": (
+                    "Aborted: parameters changed concurrently during "
+                    "calibration."
+                ),
+                "snapshot_depth": len(self.snapshot_stack),
+            }
+
+        if plan.get("blocked_by_seasonal_gate"):
+            if plan.get("eval_wk") is not None:
+                self.eval_report_wk = plan["eval_wk"]
+            if plan.get("eval_kt") is not None:
+                self.eval_report_kt = plan["eval_kt"]
+            self._refresh_cached_snapshots()
+            return {
+                "accepted_any": False,
+                "accepted_wk": False,
+                "accepted_kt": False,
+                "blocked_by_seasonal_gate": True,
+                "reason": str(plan.get("reason", "")),
+                "snapshot_depth": len(self.snapshot_stack),
+            }
+
+        bank_obj = plan.get("episode_bank")
+        if isinstance(bank_obj, calibration.SeasonalEpisodeBank):
+            self.episode_bank = bank_obj
+        elif isinstance(plan.get("episode_bank_dict"), Mapping):
+            self.episode_bank = calibration.SeasonalEpisodeBank.from_dict(
+                plan["episode_bank_dict"]
+            )
+
+        out_wk: contracts.CalibrationZoneOutcome = plan["outcome_wk"]
+        out_kt: contracts.CalibrationZoneOutcome = plan["outcome_kt"]
+        accepted_any = bool(plan["accepted_any"])
+        cop_changed = bool(plan["cop_changed"])
+
+        self.cop_diagnostics = dict(plan["cop_diagnostics"])
+        self.eval_report_wk = plan["eval_wk"]
+        self.eval_report_kt = plan["eval_kt"]
+
+        if accepted_any:
+            self.snapshot_stack.append(dict(plan["pre_snap"]))
+            if out_wk.accepted:
+                self._params_wk = out_wk.params_applied
+                self.memory_wk = _clone_memory(plan["memory_wk"])
+                self._k_hx_by_group_w_k["wk"] = out_wk.params_applied.k_hx_w_k
+                self._k_hx_by_group_w_k["gang"] = float(
+                    plan["next_k_hx"]["gang"]
+                )
+            if out_kt.accepted:
+                self._params_kt = out_kt.params_applied
+                self.memory_kt = _clone_memory(plan["memory_kt"])
+                self._k_hx_by_group_w_k["kantoor"] = (
+                    out_kt.params_applied.k_hx_w_k
+                )
+            if cop_changed:
+                self.cop_params = plan["new_cop"]
+                self.memory_cop = _clone_memory(plan["memory_cop"])
+
+            self.estimator_wk.params = self._params_wk
+            self.estimator_kt.params = self._params_kt
+            self.hydraulics.update_k_hx(self._k_hx_by_group_w_k)
+            self._param_epoch += 1
+
+        self._last_posterior_std_wk = dict(out_wk.posterior_std)
+        self._last_posterior_std_kt = dict(out_kt.posterior_std)
+        self._last_corr_wk = dict(out_wk.correlation_matrix)
+        self._last_corr_kt = dict(out_kt.correlation_matrix)
+        self._last_collinear_wk = list(out_wk.collinearity_warnings)
+        self._last_collinear_kt = list(out_kt.collinearity_warnings)
+        self._last_bound_warnings_wk = list(out_wk.bound_warnings)
+        self._last_bound_warnings_kt = list(out_kt.bound_warnings)
+
+        if (
+            accepted_any
+            and recent_columns is not None
+            and len(recent_columns.get("ts_utc", ())) > 0
+        ):
+            self.replay_48h_from_columns(recent_columns)
+        else:
+            self._refresh_cached_snapshots()
+
+        self.calibration_history.append(dict(plan["history_entry"]))
         if len(self.calibration_history) > MAX_CALIBRATION_HISTORY:
             self.calibration_history = self.calibration_history[
                 -MAX_CALIBRATION_HISTORY:
@@ -1122,6 +1570,26 @@ class DigitalTwinEngine:
             "cop_params": self.cop_params,
             "snapshot_depth": len(self.snapshot_stack),
         }
+
+    def run_calibration(
+        self,
+        columns: Mapping[str, Sequence[float | int]],
+        mode: Literal["manual", "auto_weekly"] = "manual",
+    ) -> dict[str, Any]:
+        """Runs synchronous 3-phase batch calibration (`ctx -> plan -> apply`).
+
+        Args:
+            columns: Full RingBuffer telemetry column dictionary.
+            mode: `"manual"` or `"auto_weekly"`.
+
+        Returns:
+            Summary dictionary with `accepted_any`, `accepted_wk`,
+            `accepted_kt`, `outcome_wk`, `outcome_kt`, `cop_params`, and
+            `snapshot_depth`.
+        """
+        ctx = self.capture_calibration_context()
+        plan = self.compute_calibration_plan(columns, ctx, mode=mode)
+        return self.apply_calibration_plan(plan, columns)
 
     def rollback_parameters(
         self,
@@ -1140,6 +1608,7 @@ class DigitalTwinEngine:
 
         snap = self.snapshot_stack.pop()
         self._apply_snapshot_dict(snap)
+        self._param_epoch += 1
 
         if columns is not None and len(columns.get("ts_utc", ())) > 0:
             self.replay_48h_from_columns(columns)
@@ -1181,10 +1650,13 @@ class DigitalTwinEngine:
         self._last_corr_kt = {}
         self._last_collinear_wk = []
         self._last_collinear_kt = []
+        self._last_bound_warnings_wk = []
+        self._last_bound_warnings_kt = []
 
         self.estimator_wk.params = self._params_wk
         self.estimator_kt.params = self._params_kt
         self.hydraulics.update_k_hx(self._k_hx_by_group_w_k)
+        self._param_epoch += 1
 
         if columns is not None and len(columns.get("ts_utc", ())) > 0:
             self.replay_48h_from_columns(columns)
@@ -1200,6 +1672,47 @@ class DigitalTwinEngine:
             }
         )
 
+    def compute_14d_evaluation_reports(
+        self,
+        columns: Mapping[str, Sequence[float | int]],
+        context: Mapping[str, Any] | None = None,
+    ) -> tuple[contracts.ZoneEvaluationReport, contracts.ZoneEvaluationReport]:
+        """Computes 14d `ZoneEvaluationReport`s for `wk` & `kt` purely.
+
+        Args:
+            columns: RingBuffer telemetry column dictionary.
+            context: Optional decoupled snapshot dictionary from
+                `capture_calibration_context()`. When omitted, uses active
+                engine parameters and the full `k_hx_by_group_w_k` mapping.
+
+        Returns:
+            Tuple `(eval_report_wk, eval_report_kt)`.
+        """
+        if context is not None:
+            p_wk: contracts.ZoneParameters = context["params_wk"]
+            p_kt: contracts.ZoneParameters = context["params_kt"]
+            flows: Mapping[str, float] = context["flow_rates_l_min"]
+            k_hx_map: Mapping[str, float] = context["k_hx_by_group_w_k"]
+            lat = float(context.get("latitude_deg", self.latitude_deg))
+            lon = float(context.get("longitude_deg", self.longitude_deg))
+        else:
+            p_wk = self._params_wk
+            p_kt = self._params_kt
+            flows = self._flow_rates_l_min
+            k_hx_map = self._k_hx_by_group_w_k
+            lat = self.latitude_deg
+            lon = self.longitude_deg
+
+        return _evaluate_both_zones_14d(
+            columns,
+            p_wk,
+            p_kt,
+            flows,
+            k_hx_map,
+            lat,
+            lon,
+        )
+
     def refresh_14d_evaluation(
         self,
         columns: Mapping[str, Sequence[float | int]],
@@ -1212,25 +1725,8 @@ class DigitalTwinEngine:
         Returns:
             Dictionary `{"wk": ZoneEvaluationReport, "kt": ZoneEvaluationReport}`.
         """
-        self.eval_report_wk = evaluation.evaluate_14d_hindcast(
-            columns,
-            "wk",
-            self._params_wk,
-            house_config.DAY1_PRIORS_WK,
-            flow_rates_l_min=self._flow_rates_l_min,
-            k_hx_by_group=self._k_hx_by_group_w_k,
-            lat_deg=self.latitude_deg,
-            lon_deg=self.longitude_deg,
-        )
-        self.eval_report_kt = evaluation.evaluate_14d_hindcast(
-            columns,
-            "kt",
-            self._params_kt,
-            house_config.DAY1_PRIORS_KT,
-            flow_rates_l_min=self._flow_rates_l_min,
-            k_hx_by_group=self._k_hx_by_group_w_k,
-            lat_deg=self.latitude_deg,
-            lon_deg=self.longitude_deg,
+        self.eval_report_wk, self.eval_report_kt = (
+            self.compute_14d_evaluation_reports(columns)
         )
         self._refresh_cached_snapshots()
         return {
@@ -1276,6 +1772,7 @@ class DigitalTwinEngine:
                     "posterior_std": dict(self._last_posterior_std_wk),
                     "correlation_matrix": dict(self._last_corr_wk),
                     "collinearity_warnings": list(self._last_collinear_wk),
+                    "bound_warnings": list(self._last_bound_warnings_wk),
                     "parameters_previous_snapshot": (
                         prev_snap.get("params_wk") if prev_snap else None
                     ),
@@ -1291,6 +1788,7 @@ class DigitalTwinEngine:
                     "posterior_std": dict(self._last_posterior_std_kt),
                     "correlation_matrix": dict(self._last_corr_kt),
                     "collinearity_warnings": list(self._last_collinear_kt),
+                    "bound_warnings": list(self._last_bound_warnings_kt),
                     "parameters_previous_snapshot": (
                         prev_snap.get("params_kt") if prev_snap else None
                     ),
@@ -1334,11 +1832,13 @@ class DigitalTwinEngine:
                 "posterior_std": dict(self._last_posterior_std_wk),
                 "correlation_matrix": dict(self._last_corr_wk),
                 "collinearity_warnings": list(self._last_collinear_wk),
+                "bound_warnings": list(self._last_bound_warnings_wk),
             }
         return {
             "posterior_std": dict(self._last_posterior_std_kt),
             "correlation_matrix": dict(self._last_corr_kt),
             "collinearity_warnings": list(self._last_collinear_kt),
+            "bound_warnings": list(self._last_bound_warnings_kt),
         }
 
     def get_zone_snapshot(
@@ -1392,6 +1892,7 @@ class DigitalTwinEngine:
                 q_fh = (
                     max(0.0, float(actuator.u_eff))
                     * params.k_hx_w_k
+                    * self.hydraulics.gamma_cal
                     * max(
                         0.0, float(actuator.t_supply_sec_c) - st_in.t_floor_c
                     )
@@ -1731,6 +2232,17 @@ class DigitalTwinEngine:
             {str(k): float(v) for k, v in flow_rates_l_min.items()}
         )
         self.hydraulics.update_flow_rates(self._flow_rates_l_min)
+        self._k_hx_by_group_w_k = dict(self.hydraulics.k_hx_by_group_w_k)
+        self._params_wk = dataclasses.replace(
+            self._params_wk, k_hx_w_k=self._k_hx_by_group_w_k["wk"]
+        )
+        self._params_kt = dataclasses.replace(
+            self._params_kt, k_hx_w_k=self._k_hx_by_group_w_k["kantoor"]
+        )
+        self.estimator_wk.params = self._params_wk
+        self.estimator_kt.params = self._params_kt
+        self._param_epoch += 1
+        self._refresh_cached_snapshots()
 
     # ========================================================================
     # Persistence (`betonbatterij.state`)
@@ -1755,7 +2267,6 @@ class DigitalTwinEngine:
             "cop_params": _cop_params_to_dict(self.cop_params),
             "hindcast_wk": self.hindcast_wk.to_dict(),
             "hindcast_kt": self.hindcast_kt.to_dict(),
-            "episode_bank": self.episode_bank.to_dict(),
             "memory_wk": calibration.posterior_memory_to_dict(self.memory_wk),
             "memory_kt": calibration.posterior_memory_to_dict(self.memory_kt),
             "memory_cop": calibration.posterior_memory_to_dict(
@@ -1780,8 +2291,11 @@ class DigitalTwinEngine:
             "corr_kt": dict(self._last_corr_kt),
             "collinear_wk": list(self._last_collinear_wk),
             "collinear_kt": list(self._last_collinear_kt),
+            "bound_warnings_wk": list(self._last_bound_warnings_wk),
+            "bound_warnings_kt": list(self._last_bound_warnings_kt),
         }
         sanitized: dict[str, Any] = evaluation.sanitize_json_payload(raw_state)
+        sanitized["episode_bank"] = self.episode_bank.to_dict()
         return sanitized
 
     def load_state_dict(self, data: Mapping[str, Any]) -> None:
@@ -1934,5 +2448,14 @@ class DigitalTwinEngine:
             self._last_collinear_kt = [
                 str(x) for x in data["collinear_kt"]
             ]
+        if isinstance(data.get("bound_warnings_wk"), Sequence):
+            self._last_bound_warnings_wk = [
+                str(x) for x in data["bound_warnings_wk"]
+            ]
+        if isinstance(data.get("bound_warnings_kt"), Sequence):
+            self._last_bound_warnings_kt = [
+                str(x) for x in data["bound_warnings_kt"]
+            ]
 
+        self._param_epoch += 1
         self._refresh_cached_snapshots()

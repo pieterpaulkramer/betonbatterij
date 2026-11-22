@@ -33,6 +33,7 @@ from custom_components.betonbatterij.domain import evaluation
 from custom_components.betonbatterij.domain import hydraulics
 from custom_components.betonbatterij.domain import solar_weather
 from custom_components.betonbatterij.domain import zoh_kalman
+from custom_components.betonbatterij.ha_bridge import storage_ring
 
 
 def _generate_synthetic_columns(
@@ -824,3 +825,177 @@ def test_digital_twin_engine_layer2_api_methods() -> None:
         snap_wk.state.t_floor_c,
         abs_tol=1e-9,
     )
+
+
+def test_ringbuffer_float32_roundtrip_legacy_lts_detection_and_flat_bridging() -> None:
+    """Verifies float32-safe legacy v0.1.0 LTS detection & multi-hour flat bridge."""
+    rb = storage_ring.ColumnarRingBuffer(chunk_rows=128, num_chunks=2)
+    t0 = int(
+        datetime.datetime(
+            2026, 1, 14, 0, 0, 0, tzinfo=datetime.timezone.utc
+        ).timestamp()
+    )
+
+    # 4 legacy LTS hours (0..48): hour 0 linear with ~1200 W P1, hours 1 & 2
+    # flat sandwiched, hour 3 linear; followed by 24 rows of real 5m Recorder.
+    n_lts = 49
+    n_rec = 24
+    n_tot = n_lts + n_rec
+
+    def _interp_4h(
+        v0: float, v1: float, v2: float, v3: float, v4: float
+    ) -> list[float]:
+        out = [0.0] * n_lts
+        knots = (v0, v1, v2, v3, v4)
+        for h in range(4):
+            a, b = knots[h], knots[h + 1]
+            for j in range(13):
+                out[h * 12 + j] = a + (b - a) * (j / 12.0)
+        return out
+
+    t_dak_lts = _interp_4h(2.1, 2.7, 2.7, 2.7, 3.3)
+    t_hm_lts = _interp_4h(2.3, 2.9, 2.9, 2.9, 3.5)
+    t_wk_lts = _interp_4h(19.7, 19.4, 19.4, 19.4, 19.1)
+    t_kt_lts = _interp_4h(18.9, 18.6, 18.6, 18.6, 18.4)
+    p1_lts = _interp_4h(950.0, 1450.0, 1450.0, 1450.0, 1080.0)
+
+    upstairs_zero = {
+        c: 0.0
+        for c in (
+            "u_eff_slaapkamer",
+            "u_eff_badkamer",
+            "u_eff_werkkamer_1e",
+            "u_eff_kamer_1e_midden",
+            "u_eff_kamer_1e_zuid",
+            "u_eff_badkamer_boven",
+            "u_eff_logeerkamer",
+        )
+    }
+
+    for k in range(n_tot):
+        row: dict[str, float | int] = {
+            "ts_utc": t0 + k * const.DT_STEP_S,
+            "flags": const.FLAG_VALID_WK | const.FLAG_VALID_KT,
+            "p_prim_th_w": 2400.0 if k >= 12 else 0.0,
+            "t_wp_out_c": 29.0,
+            "t_wp_in_c": 26.0,
+            **upstairs_zero,
+        }
+        if k < n_lts:
+            row["t_out_weather_c"] = math.nan
+            row["t_out_dak_c"] = t_dak_lts[k]
+            row["t_out_hm_c"] = t_hm_lts[k]
+            row["t_air_wk_c"] = t_wk_lts[k]
+            row["t_air_kantoor_c"] = t_kt_lts[k]
+            row["p_p1_net_w"] = p1_lts[k]
+        else:
+            # Real 5-min Recorder measurements with nonlinear fluctuations
+            dt_i = k - n_lts
+            row["t_out_weather_c"] = 3.4 + 0.12 * math.sin(0.9 * dt_i)
+            row["t_out_dak_c"] = 3.3 + 0.15 * math.cos(0.7 * dt_i)
+            row["t_out_hm_c"] = 3.5 + 0.10 * math.sin(0.5 * dt_i)
+            row["t_air_wk_c"] = 19.1 + 0.08 * math.sin(0.6 * dt_i)
+            row["t_air_kantoor_c"] = 18.4 + 0.06 * math.cos(0.8 * dt_i)
+            row["p_p1_net_w"] = 1150.0 + 180.0 * math.sin(1.1 * dt_i)
+        rb.append_row(row)
+
+    cols_f32 = rb.get_columns()
+    is_lts, miss_prim = evaluation.detect_lts_and_missing_prim_rows(cols_f32)
+    assert all(is_lts[:n_lts])
+    assert all(miss_prim[:n_lts])
+    assert not any(is_lts[n_lts:])
+    assert not any(miss_prim[n_lts:])
+
+
+def test_compute_train_holdout_split_80d_lts_plus_10d_raw() -> None:
+    """Verifies F1 raw-aware split on 80d LTS + 10d raw (and Cases A & C)."""
+    n_lts = 80 * const.STEPS_PER_DAY
+    n_raw = 10 * const.STEPS_PER_DAY
+    n_tot = n_lts + n_raw
+    t0 = 1_760_000_000
+    cols: dict[str, list[float | int]] = {
+        "ts_utc": [t0 + k * const.DT_STEP_S for k in range(n_tot)],
+        "flags": [const.FLAG_LTS_BACKFILL] * n_lts + [0] * n_raw,
+    }
+    train_end = evaluation.compute_train_holdout_split(cols)
+    # 65% of 10d raw (= 6.5d = 1872 rows) in train, 35% (= 3.5d = 1008) holdout
+    assert train_end == n_tot - int(round(0.35 * n_raw))
+    assert train_end == n_lts + (n_raw - 1008)
+    assert sum(1 for f in cols["flags"][:train_end] if f == 0) == 1872
+    assert all(f == 0 for f in cols["flags"][train_end:])
+
+    # Case A: >= 28d raw -> standard 14-day holdout
+    n_35d = 35 * const.STEPS_PER_DAY
+    cols_a = {
+        "ts_utc": [t0 + k * const.DT_STEP_S for k in range(n_35d)],
+        "flags": [0] * n_35d,
+    }
+    assert (
+        evaluation.compute_train_holdout_split(cols_a)
+        == n_35d - evaluation.EVAL_14D_STEPS
+    )
+
+    # Case C: < 4d raw (7d LTS + 3d raw = 10d) -> 70/30 fallback
+    n_7d = 7 * const.STEPS_PER_DAY
+    n_3d = 3 * const.STEPS_PER_DAY
+    cols_c = {
+        "ts_utc": [t0 + k * const.DT_STEP_S for k in range(n_7d + n_3d)],
+        "flags": [const.FLAG_LTS_BACKFILL] * n_7d + [0] * n_3d,
+    }
+    assert evaluation.compute_train_holdout_split(cols_c) == int(
+        0.70 * (n_7d + n_3d)
+    )
+
+
+def test_simulate_step_gamma_cal_f5a_without_scaling_solver_gamma_fh() -> None:
+    """Verifies F5a (`gamma_cal` in `simulate_step`) & untouched `gamma_fh`."""
+    eng = engine.DigitalTwinEngine()
+    st0 = contracts.ThermalState(t_air_c=19.5, t_floor_c=21.0, d_est_w=0.0)
+    ex = contracts.ExogenousStepInput(t_out_c=3.0)
+
+    eng.hydraulics.gamma_cal = 1.0
+    lin_1 = eng.export_solver_model("wk", dt_s=1800.0)
+    res_sup_1 = eng.simulate_step(
+        "wk",
+        st0,
+        ex,
+        contracts.ActuatorStepInput(t_supply_sec_c=31.0, u_eff=1.0),
+    )
+    res_qfh_1 = eng.simulate_step(
+        "wk", st0, ex, contracts.ActuatorStepInput(q_fh_w=1500.0)
+    )
+
+    eng.hydraulics.gamma_cal = 1.20
+    lin_12 = eng.export_solver_model("wk", dt_s=1800.0)
+    res_sup_12 = eng.simulate_step(
+        "wk",
+        st0,
+        ex,
+        contracts.ActuatorStepInput(t_supply_sec_c=31.0, u_eff=1.0),
+    )
+    res_qfh_12 = eng.simulate_step(
+        "wk", st0, ex, contracts.ActuatorStepInput(q_fh_w=1500.0)
+    )
+
+    # F5a scales t_supply_sec_c power by gamma_cal; explicit q_fh_w unchanged
+    assert math.isclose(
+        res_sup_12.q_fh_applied_w,
+        1.20 * res_sup_1.q_fh_applied_w,
+        rel_tol=1e-9,
+    )
+    assert res_qfh_12.q_fh_applied_w == res_qfh_1.q_fh_applied_w == 1500.0
+    # NOT F5b: linearized solver gamma_fh [K/W] must remain identical
+    assert lin_12.gamma_fh == lin_1.gamma_fh
+    assert lin_12.phi_2x2 == lin_1.phi_2x2
+
+    # Public pure wrapper compute_14d_evaluation_reports
+    cols = _generate_synthetic_columns(
+        n_days=4,
+        params_wk=house_config.DAY1_PRIORS_WK,
+        params_kt=house_config.DAY1_PRIORS_KT,
+    )
+    ctx = eng.capture_calibration_context()
+    rep_wk, rep_kt = eng.compute_14d_evaluation_reports(cols, ctx)
+    assert rep_wk.zone == "wk" and rep_kt.zone == "kt"
+    assert rep_wk.overall_6h.n_windows > 0
+    assert eng.eval_report_wk is None  # Pure: does not mutate engine state
