@@ -15,9 +15,8 @@ import decimal
 
 import pytest
 
-from custom_components.betonbatterij import house_config
 from custom_components.betonbatterij.domain import contracts
-from custom_components.betonbatterij.domain import solar_weather
+from custom_components.betonbatterij.domain import priors as domain_priors
 from custom_components.betonbatterij.domain import zoh_kalman
 
 
@@ -186,7 +185,7 @@ class TestZohDiscretizationAndPhysics:
         self,
         dt_s: float,
     ) -> None:
-        priors = house_config.DAY1_PRIORS_WK
+        priors = domain_priors.DAY1_PRIORS_WK
         ad, bd, qd = zoh_kalman.discretize_zoh_3x3(
             priors,
             dt_s=dt_s,
@@ -216,7 +215,7 @@ class TestZohDiscretizationAndPhysics:
 
     def test_semigroup_consistency_36_steps_vs_3_hours(self) -> None:
         """36 steps of 300 s match 1 step of 10,800 s for state and `Q_d`."""
-        priors = house_config.DAY1_PRIORS_WK
+        priors = domain_priors.DAY1_PRIORS_WK
         exog = contracts.ExogenousStepInput(
             t_out_c=3.0,
             v_wind_ms=2.0,
@@ -269,7 +268,7 @@ class TestZohDiscretizationAndPhysics:
     def test_exact_energy_conservation_for_adiabatic_envelope(self) -> None:
         """With `H_loss = H_up = H_down = 0`, enthalpy equals integrated power."""
         adiabatic = dataclasses.replace(
-            house_config.DAY1_PRIORS_WK,
+            domain_priors.DAY1_PRIORS_WK,
             h_loss_w_k=0.0,
             h_up_w_k=0.0,
             h_down_w_k=0.0,
@@ -334,7 +333,7 @@ class TestResolutionTobitAndKalmanGuards:
     def test_tobit_deadband_on_01c_sensor_and_001c_humidity_heartbeat(
         self,
     ) -> None:
-        priors = house_config.DAY1_PRIORS_WK
+        priors = domain_priors.DAY1_PRIORS_WK
         exog = contracts.ExogenousStepInput(
             t_out_c=2.0, t_up_c=18.0, t_down_c=10.5, q_int_known_w=50.0
         )
@@ -410,7 +409,7 @@ class TestResolutionTobitAndKalmanGuards:
 
     def test_cooking_spike_900w_isolated_from_concrete_slab(self) -> None:
         """A `+900 W` evening cooking spike routes to `d_est`, not `T_floor`."""
-        priors = house_config.DAY1_PRIORS_WK
+        priors = domain_priors.DAY1_PRIORS_WK
         exog = contracts.ExogenousStepInput(
             t_out_c=4.0, t_up_c=18.0, t_down_c=10.5, q_int_known_w=50.0
         )
@@ -467,7 +466,7 @@ class TestResolutionTobitAndKalmanGuards:
         self,
     ) -> None:
         """Open window holds `K_floor == 0` (`0.0000 °C` pull) for 35 min."""
-        priors = house_config.DAY1_PRIORS_WK
+        priors = domain_priors.DAY1_PRIORS_WK
         exog = contracts.ExogenousStepInput(
             t_out_c=3.0, t_up_c=18.0, t_down_c=10.5, q_int_known_w=50.0
         )
@@ -548,7 +547,7 @@ class TestResolutionTobitAndKalmanGuards:
     def test_nocturnal_anchoring_48h_replay_surface_and_gap_bridge(
         self,
     ) -> None:
-        priors = house_config.DAY1_PRIORS_WK
+        priors = domain_priors.DAY1_PRIORS_WK
         exog = contracts.ExogenousStepInput(
             t_out_c=2.0, t_up_c=17.5, t_down_c=10.5, q_int_known_w=50.0
         )
@@ -573,11 +572,11 @@ class TestResolutionTobitAndKalmanGuards:
         assert abs(est_night.state.t_floor_c - t_cur.t_floor_c) < 0.05
 
         p11_no_surf = est_night.cov_p[1][1]
-        t_surf_true = solar_weather.estimate_surface_temp(
+        t_surf_true = zoh_kalman.estimate_surface_temp(
             t_cur.t_air_c,
             t_cur.t_floor_c,
             priors.r_fh_k_kw,
-            house_config.AREA_WK_M2,
+            domain_priors.AREA_WK_M2,
         )
         est_night.step(
             ts_night + 67 * 300,
@@ -643,9 +642,9 @@ class TestResolutionTobitAndKalmanGuards:
     def test_qd_basis_cached_linearity_equivalence_and_zero_qfh_misses(
         self,
     ) -> None:
-        """`_discretize_qd_basis_cached` matches Van Loan (<1e-12) & caches."""
+        """`discretize_qd_basis_cached` matches Van Loan (<1e-12) & caches."""
         params = dataclasses.replace(
-            house_config.DAY1_PRIORS_WK,
+            domain_priors.DAY1_PRIORS_WK,
             c_wind=0.08,
             h_loss_w_k=53.5,
             r_fh_k_kw=2.12,
@@ -657,7 +656,7 @@ class TestResolutionTobitAndKalmanGuards:
             (900.0, 5.2, 75.0, 1.0, 1825.0, 0.0),
         ]:
             v_exc = max(0.0, v_wind - 3.0) if params.c_wind != 0.0 else 0.0
-            g0, g1, g2 = zoh_kalman._discretize_qd_basis_cached(
+            g0, g1, g2 = zoh_kalman.discretize_qd_basis_cached(
                 params, dt_s, v_exc
             )
             for gm in (g0, g1, g2):
@@ -705,7 +704,7 @@ class TestResolutionTobitAndKalmanGuards:
                     for j in range(3):
                         assert abs(qd_fn[i][j] - qd_dec[i][j]) < 1e-12
 
-        zoh_kalman._discretize_qd_basis_cached.cache_clear()
+        zoh_kalman.discretize_qd_basis_cached.cache_clear()
         for step_idx in range(50):
             zoh_kalman.discretize_zoh_3x3(
                 params,
@@ -715,6 +714,6 @@ class TestResolutionTobitAndKalmanGuards:
                 u_pump=1.0,
                 q_fh_w=200.0 + 41.3 * step_idx,
             )
-        info = zoh_kalman._discretize_qd_basis_cached.cache_info()
+        info = zoh_kalman.discretize_qd_basis_cached.cache_info()
         assert info.misses == 1
         assert info.hits == 49

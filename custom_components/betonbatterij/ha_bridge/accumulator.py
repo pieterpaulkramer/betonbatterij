@@ -1,8 +1,8 @@
-"""Event-driven sub-5-minute time-weighted accumulator (Component 5 §2).
+"""Event-driven sub-5-minute time-weighted accumulator.
 
 Core classes (`StepSignalAccumulator`, `WaxValveTracker`,
-`HydraulicPowerAccumulator`, `ClockJumpGuard`, `WindowAccumulatorCore`) have
-zero top-level `homeassistant.*` imports so `pytest` runs 100% offline.
+`HydraulicPowerAccumulator`, `WindowAccumulatorCore`) have zero top-level
+`homeassistant.*` imports so `pytest` runs 100% offline.
 """
 
 from __future__ import annotations
@@ -20,7 +20,6 @@ from ..const import (
     AC_MODE_HEAT,
     AC_MODE_OFF,
     AC_MODE_OTHER,
-    DT_STEP_S,
     FLAG_AANWEZIG,
     FLAG_AC_COOL_KT,
     FLAG_DEFROST_AC,
@@ -35,15 +34,18 @@ from ..const import (
     FLAG_VALID_WK,
     FLAG_Z1_OFF_HARVEST,
 )
-from ..house_config import (
-    HOUSE_ENTITIES,
-    ROOM_SENSORS,
+from ..domain.priors import (
     WATER_POWER_FACTOR_W_PER_LMIN_K,
     WAX_VALVE_CLOSE_TIME_S,
     WAX_VALVE_OPEN_TIME_S,
+)
+from ..house_config import (
+    HOUSE_ENTITIES,
+    ROOM_SENSORS,
     HouseEntityConfig,
     RoomSensorConfig,
 )
+from .row_utils import make_empty_raw_row
 
 if TYPE_CHECKING:
     from homeassistant.core import Event, HomeAssistant, State
@@ -53,7 +55,20 @@ _INVALID_HA_STATES: frozenset[str] = frozenset(
 )
 
 ZHA_STALE_THRESHOLD_S: float = 7200.0
-MIN_PLAUSIBLE_UTC_EPOCH: int = 1_704_067_200
+
+__all__ = [
+    "HAWindowAccumulator",
+    "HydraulicPowerAccumulator",
+    "HydraulicWindowSummary",
+    "StepSignalAccumulator",
+    "WaxValveTracker",
+    "WindowAccumulatorCore",
+    "WindowCloseResult",
+    "ZHA_STALE_THRESHOLD_S",
+    "convert_power_to_w",
+    "convert_wind_speed_to_ms",
+    "encode_ac_mode",
+]
 
 
 def _parse_float(raw: Any) -> float | None:
@@ -601,72 +616,6 @@ class HydraulicPowerAccumulator:
         )
 
 
-class ClockJumpGuard:
-    """Guard against pre-NTP epochs and NTP wall-clock jumps on RTC-less RPi 4."""
-
-    __slots__ = (
-        "last_accepted_utc",
-        "last_mono",
-        "min_valid_utc",
-        "ntp_synced",
-        "rejected_ticks",
-    )
-
-    def __init__(
-        self,
-        saved_wall_utc: int = 0,
-        t_mono_start: float | None = None,
-        min_epoch_utc: int = MIN_PLAUSIBLE_UTC_EPOCH,
-    ) -> None:
-        """Initialize the wall-clock jump guard."""
-        self.last_accepted_utc: int = max(0, int(saved_wall_utc))
-        self.min_valid_utc: int = max(int(min_epoch_utc), self.last_accepted_utc)
-        self.last_mono: float | None = (
-            float(t_mono_start) if t_mono_start is not None else None
-        )
-        self.ntp_synced: bool = False
-        self.rejected_ticks: int = 0
-
-    def reset_monotonic(self, t_mono: float) -> None:
-        """Anchor the monotonic clock reference."""
-        self.last_mono = float(t_mono)
-
-    def record_bridged_utc(self, bridged_utc: int, t_mono: float) -> None:
-        """Advance accepted UTC floor after restart-gap bridging or backfill."""
-        if bridged_utc > self.last_accepted_utc and bridged_utc >= self.min_valid_utc:
-            self.last_accepted_utc = int(bridged_utc)
-            self.min_valid_utc = max(self.min_valid_utc, self.last_accepted_utc)
-            self.ntp_synced = True
-        self.last_mono = float(t_mono)
-
-    def check_and_advance(
-        self, wall_utc: float | int, t_mono: float
-    ) -> tuple[bool, int, float]:
-        """Validate `wall_utc` and compute elapsed step duration from `t_mono`.
-
-        Args:
-            wall_utc: Candidate UTC epoch timestamp at tick boundary.
-            t_mono: Current `time.monotonic()` reading.
-
-        Returns:
-            A tuple `(accepted, ts_utc, dt_mono_s)`.
-        """
-        if self.last_mono is None:
-            dt_mono = float(DT_STEP_S)
-        else:
-            dt_mono = max(0.0, float(t_mono) - self.last_mono)
-        self.last_mono = float(t_mono)
-
-        ts_int = int(round(float(wall_utc)))
-        if ts_int < self.min_valid_utc or ts_int <= self.last_accepted_utc:
-            self.rejected_ticks += 1
-            return False, ts_int, dt_mono
-
-        self.ntp_synced = True
-        self.last_accepted_utc = ts_int
-        return True, ts_int, dt_mono
-
-
 @dataclass(slots=True)
 class _RoomTracker:
     """Internal per-room ZHA temperature and staleness tracker."""
@@ -801,6 +750,52 @@ class WindowAccumulatorCore:
                     cfg.swap_timestamp_utc,
                 )
 
+        self._binary_signal_by_entity: dict[str, str] = {
+            entities.pump_secondary_switch: "u_pump_sec",
+            entities.presence_boolean: "presence",
+            entities.wp_defrosting: "defrost_wp",
+            entities.wp_internal_heater: "internal_heater",
+            entities.ac_kantoor_defrosting: "defrost_ac",
+            entities.ac_kantoor_occupancy: "pir_occ_kt",
+        }
+        self._float_signal_by_entity: dict[str, str] = {
+            entities.wp_compressor_freq: "f_comp_hz",
+            entities.dhw_top_temp: "t_dhw_top_c",
+            entities.dhw_bot_temp: "t_dhw_bot_c",
+            entities.outdoor_temp_dak: "t_out_dak_c",
+            entities.outdoor_humidity_dak: "rh_dak_pct",
+            entities.wp_outside_temp: "t_out_hm_c",
+            entities.epex_price_eur_kwh: "epex_eur_kwh",
+        }
+        if entities.bg_manifold_supply_temp:
+            self._float_signal_by_entity[entities.bg_manifold_supply_temp] = (
+                "t_bg_sup_c"
+            )
+        if entities.floor_surface_sensor_wk:
+            self._float_signal_by_entity[entities.floor_surface_sensor_wk] = (
+                "t_floor_surf_meas_wk_c"
+            )
+
+        self._power_signal_by_entity: dict[str, tuple[str, str]] = {
+            entities.wp_power_consumption: ("p_wp_raw_el_w", "W"),
+            entities.p1_power_consumed_kw: ("p1_consumed_w", "kW"),
+            entities.p1_power_produced_kw: ("p1_produced_w", "kW"),
+            entities.pv_power_w: ("p_pv_w", "W"),
+            entities.pv_forecast_now_w: ("p_pv_forecast_w", "W"),
+            entities.ac_kantoor_power_w: ("p_el_ac_kt_w", "W"),
+            entities.growlights_kantoor_power_w: ("p_growlights_kt_w", "W"),
+        }
+        if entities.desk_kantoor_power_w:
+            self._power_signal_by_entity[entities.desk_kantoor_power_w] = (
+                "p_desk_kt_w",
+                "W",
+            )
+
+        self._screen_signal_by_entity: dict[str, str] = {
+            entities.screen_small_cover: "screen_small_pos",
+            entities.screen_large_cover: "screen_large_pos",
+        }
+
     def watched_entity_ids(self) -> list[str]:
         """Return deduplicated list of all Home Assistant entity IDs tracked."""
         e = self.entities
@@ -887,49 +882,17 @@ class WindowAccumulatorCore:
     ) -> None:
         """Process a single entity state change at monotonic timestamp `t_mono`."""
         attrs = attributes or {}
-        e = self.entities
         norm_state = (state_str or "").strip().lower()
         is_avail = norm_state not in _INVALID_HA_STATES
 
-        if entity_id in self._temp_room_by_entity:
-            room_key = self._temp_room_by_entity[entity_id]
-            cfg = self.room_sensors[room_key]
-            if (
-                cfg.swap_timestamp_utc is not None
-                and event_wall_utc is not None
-                and event_wall_utc < cfg.swap_timestamp_utc
-            ):
-                return
-            self._update_room_temp(
-                room_key,
-                state_str,
-                last_changed_utc,
-                last_reported_utc,
-                is_initial_seed=is_initial_seed,
-            )
-            return
-
-        if entity_id in self._preswap_room_by_entity:
-            room_key, swap_ts = self._preswap_room_by_entity[entity_id]
-            if event_wall_utc is not None and event_wall_utc < swap_ts:
-                self._update_room_temp(
-                    room_key,
-                    state_str,
-                    last_changed_utc,
-                    last_reported_utc,
-                    is_initial_seed=is_initial_seed,
-                )
-            return
-
-        if entity_id in self._hum_room_by_entity:
-            room_key = self._hum_room_by_entity[entity_id]
-            self._update_room_humidity(
-                room_key,
-                state_str,
-                last_changed_utc,
-                last_reported_utc,
-                is_initial_seed=is_initial_seed,
-            )
+        if self._ingest_room_signal(
+            entity_id,
+            state_str,
+            last_changed_utc,
+            last_reported_utc,
+            is_initial_seed=is_initial_seed,
+            event_wall_utc=event_wall_utc,
+        ):
             return
 
         if entity_id in self._valve_by_entity:
@@ -942,169 +905,55 @@ class WindowAccumulatorCore:
                 )
             return
 
-        if entity_id == e.pump_secondary_switch:
-            self._signals["u_pump_sec"].update(
-                1.0 if norm_state == "on" else 0.0, t_mono, is_valid=is_avail
-            )
-            return
-        if entity_id == e.presence_boolean:
-            self._signals["presence"].update(
-                1.0 if norm_state == "on" else 0.0, t_mono, is_valid=is_avail
-            )
-            return
-        if entity_id == e.wp_defrosting:
-            self._signals["defrost_wp"].update(
-                1.0 if norm_state == "on" else 0.0, t_mono, is_valid=is_avail
-            )
-            return
-        if entity_id == e.wp_internal_heater:
-            self._signals["internal_heater"].update(
-                1.0 if norm_state == "on" else 0.0, t_mono, is_valid=is_avail
-            )
-            return
-        if entity_id == e.ac_kantoor_defrosting:
-            self._signals["defrost_ac"].update(
-                1.0 if norm_state == "on" else 0.0, t_mono, is_valid=is_avail
-            )
-            return
-        if entity_id == e.ac_kantoor_occupancy:
-            self._signals["pir_occ_kt"].update(
+        if entity_id in self._binary_signal_by_entity:
+            sig_key = self._binary_signal_by_entity[entity_id]
+            self._signals[sig_key].update(
                 1.0 if norm_state == "on" else 0.0, t_mono, is_valid=is_avail
             )
             return
 
-        if entity_id == e.wp_pump_flow:
+        if entity_id in self._float_signal_by_entity:
+            sig_key = self._float_signal_by_entity[entity_id]
             val = _parse_float(state_str)
-            self._signals["v_prim_l_min"].update(val, t_mono, is_valid=val is not None)
-            self.hydraulics.update_flow(val, t_mono, is_valid=val is not None)
+            self._signals[sig_key].update(
+                val, t_mono, is_valid=val is not None
+            )
             return
-        if entity_id == e.wp_outlet_temp:
-            val = _parse_float(state_str)
-            self._signals["t_wp_out_c"].update(val, t_mono, is_valid=val is not None)
-            self.hydraulics.update_outlet_temp(val, t_mono, is_valid=val is not None)
-            return
-        if entity_id == e.wp_inlet_temp:
-            val = _parse_float(state_str)
-            self._signals["t_wp_in_c"].update(val, t_mono, is_valid=val is not None)
-            self.hydraulics.update_inlet_temp(val, t_mono, is_valid=val is not None)
-            return
-        if entity_id == e.wp_threeway_valve:
-            self.hydraulics.update_threeway_valve(state_str, t_mono)
-            return
-        if entity_id == e.wp_compressor_freq:
-            val = _parse_float(state_str)
-            self._signals["f_comp_hz"].update(val, t_mono, is_valid=val is not None)
-            return
-        if entity_id == e.wp_power_consumption:
+
+        if entity_id in self._power_signal_by_entity:
+            sig_key, default_unit = self._power_signal_by_entity[entity_id]
             val = _parse_float(state_str)
             unit = attrs.get("unit_of_measurement")
-            val_w = convert_power_to_w(val, unit, "W") if val is not None else None
-            self._signals["p_wp_raw_el_w"].update(
-                val_w, t_mono, is_valid=val_w is not None
-            )
-            return
-
-        if entity_id == e.buf_top_temp:
-            val = _parse_float(state_str)
-            self.hydraulics.update_buffer_top(val, is_valid=val is not None)
-            return
-        if entity_id == e.buf_bot_temp:
-            val = _parse_float(state_str)
-            self.hydraulics.update_buffer_bot(val, is_valid=val is not None)
-            return
-        if entity_id == e.dhw_top_temp:
-            val = _parse_float(state_str)
-            self._signals["t_dhw_top_c"].update(val, t_mono, is_valid=val is not None)
-            return
-        if entity_id == e.dhw_bot_temp:
-            val = _parse_float(state_str)
-            self._signals["t_dhw_bot_c"].update(val, t_mono, is_valid=val is not None)
-            return
-
-        if entity_id == e.p1_power_consumed_kw:
-            val = _parse_float(state_str)
-            unit = attrs.get("unit_of_measurement")
-            val_w = convert_power_to_w(val, unit, "kW") if val is not None else None
-            self._signals["p1_consumed_w"].update(
-                val_w, t_mono, is_valid=val_w is not None
-            )
-            return
-        if entity_id == e.p1_power_produced_kw:
-            val = _parse_float(state_str)
-            unit = attrs.get("unit_of_measurement")
-            val_w = convert_power_to_w(val, unit, "kW") if val is not None else None
-            self._signals["p1_produced_w"].update(
-                val_w, t_mono, is_valid=val_w is not None
-            )
-            return
-
-        if entity_id == e.outdoor_temp_dak:
-            val = _parse_float(state_str)
-            self._signals["t_out_dak_c"].update(val, t_mono, is_valid=val is not None)
-            return
-        if entity_id == e.outdoor_humidity_dak:
-            val = _parse_float(state_str)
-            self._signals["rh_dak_pct"].update(val, t_mono, is_valid=val is not None)
-            return
-        if entity_id == e.wp_outside_temp:
-            val = _parse_float(state_str)
-            self._signals["t_out_hm_c"].update(val, t_mono, is_valid=val is not None)
-            return
-        if entity_id == e.weather_entity:
-            w_temp = _parse_float(attrs.get("temperature"))
-            w_hum = _parse_float(attrs.get("humidity"))
-            w_wind_raw = _parse_float(attrs.get("wind_speed"))
-            w_wind_unit = attrs.get("wind_speed_unit")
-            w_wind_ms = (
-                convert_wind_speed_to_ms(w_wind_raw, w_wind_unit, "km/h")
-                if w_wind_raw is not None
+            val_w = (
+                convert_power_to_w(val, unit, default_unit)
+                if val is not None
                 else None
             )
-            self._signals["t_out_weather_c"].update(
-                w_temp, t_mono, is_valid=is_avail and w_temp is not None
-            )
-            self._signals["rh_weather_pct"].update(
-                w_hum, t_mono, is_valid=is_avail and w_hum is not None
-            )
-            self._signals["v_wind_ms"].update(
-                w_wind_ms, t_mono, is_valid=is_avail and w_wind_ms is not None
-            )
-            return
-        if entity_id == e.pv_power_w:
-            val = _parse_float(state_str)
-            unit = attrs.get("unit_of_measurement")
-            val_w = convert_power_to_w(val, unit, "W") if val is not None else None
-            self._signals["p_pv_w"].update(val_w, t_mono, is_valid=val_w is not None)
-            return
-        if entity_id == e.pv_forecast_now_w:
-            val = _parse_float(state_str)
-            unit = attrs.get("unit_of_measurement")
-            val_w = convert_power_to_w(val, unit, "W") if val is not None else None
-            self._signals["p_pv_forecast_w"].update(
+            self._signals[sig_key].update(
                 val_w, t_mono, is_valid=val_w is not None
             )
             return
-        if entity_id == e.epex_price_eur_kwh:
-            val = _parse_float(state_str)
-            self._signals["epex_eur_kwh"].update(val, t_mono, is_valid=val is not None)
-            return
-        if entity_id in (e.screen_small_cover, e.screen_large_cover):
-            sig_key = (
-                "screen_small_pos"
-                if entity_id == e.screen_small_cover
-                else "screen_large_pos"
+
+        if entity_id in self._screen_signal_by_entity:
+            self._ingest_screen(
+                self._screen_signal_by_entity[entity_id],
+                norm_state,
+                attrs,
+                t_mono,
+                is_avail=is_avail,
             )
-            pos = _parse_float(attrs.get("current_position"))
-            if pos is None and is_avail:
-                if norm_state == "open":
-                    pos = 100.0
-                elif norm_state == "closed":
-                    pos = 0.0
-            if pos is not None:
-                pos = min(100.0, max(0.0, pos))
-            self._signals[sig_key].update(pos, t_mono, is_valid=pos is not None)
             return
 
+        if self._ingest_hydraulic_signal(entity_id, state_str, t_mono):
+            return
+
+        e = self.entities
+        if entity_id == e.weather_entity:
+            self._ingest_weather(attrs, t_mono, is_avail=is_avail)
+            return
+        if entity_id == e.ac_kantoor_climate:
+            self._ingest_ac_mode(state_str, t_mono)
+            return
         if entity_id == e.wp_z1_climate and is_avail:
             self._wp_z1_state = norm_state
             return
@@ -1114,63 +963,216 @@ class WindowAccumulatorCore:
         if entity_id == e.wp_operating_mode and is_avail:
             self._wp_op_mode_state = (state_str or "").strip()
             return
-        if entity_id == e.ac_kantoor_climate:
-            code = encode_ac_mode(state_str)
-            self._ac_mode_latest = code
-            self._signals["ac_mode_heat"].update(
-                1.0 if code == AC_MODE_HEAT else 0.0, t_mono, is_valid=True
-            )
-            self._signals["ac_mode_cool"].update(
-                1.0 if code == AC_MODE_COOL else 0.0, t_mono, is_valid=True
-            )
-            self._signals["ac_mode_dry"].update(
-                1.0 if code == AC_MODE_DRY else 0.0, t_mono, is_valid=True
-            )
-            self._signals["ac_mode_other"].update(
-                1.0 if code == AC_MODE_OTHER else 0.0, t_mono, is_valid=True
-            )
-            return
-        if entity_id == e.ac_kantoor_power_w:
-            val = _parse_float(state_str)
-            unit = attrs.get("unit_of_measurement")
-            val_w = convert_power_to_w(val, unit, "W") if val is not None else None
-            self._signals["p_el_ac_kt_w"].update(
-                val_w, t_mono, is_valid=val_w is not None
-            )
-            return
-        if entity_id == e.growlights_kantoor_power_w:
-            val = _parse_float(state_str)
-            unit = attrs.get("unit_of_measurement")
-            val_w = convert_power_to_w(val, unit, "W") if val is not None else None
-            self._signals["p_growlights_kt_w"].update(
-                val_w, t_mono, is_valid=val_w is not None
-            )
-            return
-
-        if e.desk_kantoor_power_w and entity_id == e.desk_kantoor_power_w:
-            val = _parse_float(state_str)
-            unit = attrs.get("unit_of_measurement")
-            val_w = convert_power_to_w(val, unit, "W") if val is not None else None
-            self._signals["p_desk_kt_w"].update(
-                val_w, t_mono, is_valid=val_w is not None
-            )
-            return
-        if e.bg_manifold_supply_temp and entity_id == e.bg_manifold_supply_temp:
-            val = _parse_float(state_str)
-            self._signals["t_bg_sup_c"].update(val, t_mono, is_valid=val is not None)
-            return
-        if e.bg_manifold_return_temp and entity_id == e.bg_manifold_return_temp:
+        if (
+            e.bg_manifold_return_temp
+            and entity_id == e.bg_manifold_return_temp
+        ):
             val = _parse_float(state_str)
             adj = (
-                val + e.bg_manifold_return_offset_c if val is not None else None
+                val + e.bg_manifold_return_offset_c
+                if val is not None
+                else None
             )
-            self._signals["t_bg_ret_c"].update(adj, t_mono, is_valid=adj is not None)
-            return
-        if e.floor_surface_sensor_wk and entity_id == e.floor_surface_sensor_wk:
+            self._signals["t_bg_ret_c"].update(
+                adj, t_mono, is_valid=adj is not None
+            )
+
+    def _ingest_room_signal(
+        self,
+        entity_id: str,
+        state_str: str | None,
+        last_changed_utc: float | None,
+        last_reported_utc: float | None,
+        *,
+        is_initial_seed: bool,
+        event_wall_utc: float | None,
+    ) -> bool:
+        """Handle ZHA room temperature, pre-swap, and humidity entities."""
+        if entity_id in self._temp_room_by_entity:
+            room_key = self._temp_room_by_entity[entity_id]
+            cfg = self.room_sensors[room_key]
+            if (
+                cfg.swap_timestamp_utc is not None
+                and event_wall_utc is not None
+                and event_wall_utc < cfg.swap_timestamp_utc
+            ):
+                return True
+            self._update_room_temp(
+                room_key,
+                state_str,
+                last_changed_utc,
+                last_reported_utc,
+                is_initial_seed=is_initial_seed,
+            )
+            return True
+
+        if entity_id in self._preswap_room_by_entity:
+            room_key, swap_ts = self._preswap_room_by_entity[entity_id]
+            if event_wall_utc is not None and event_wall_utc < swap_ts:
+                self._update_room_temp(
+                    room_key,
+                    state_str,
+                    last_changed_utc,
+                    last_reported_utc,
+                    is_initial_seed=is_initial_seed,
+                )
+            return True
+
+        if entity_id in self._hum_room_by_entity:
+            room_key = self._hum_room_by_entity[entity_id]
+            self._update_room_humidity(
+                room_key,
+                state_str,
+                last_changed_utc,
+                last_reported_utc,
+                is_initial_seed=is_initial_seed,
+            )
+            return True
+
+        return False
+
+    def _ingest_hydraulic_signal(
+        self, entity_id: str, state_str: str | None, t_mono: float
+    ) -> bool:
+        """Handle coupled primary heat-pump hydraulic and buffer entities."""
+        e = self.entities
+        if entity_id == e.wp_pump_flow:
             val = _parse_float(state_str)
-            self._signals["t_floor_surf_meas_wk_c"].update(
+            self._signals["v_prim_l_min"].update(
                 val, t_mono, is_valid=val is not None
             )
+            self.hydraulics.update_flow(val, t_mono, is_valid=val is not None)
+            return True
+        if entity_id == e.wp_outlet_temp:
+            val = _parse_float(state_str)
+            self._signals["t_wp_out_c"].update(
+                val, t_mono, is_valid=val is not None
+            )
+            self.hydraulics.update_outlet_temp(
+                val, t_mono, is_valid=val is not None
+            )
+            return True
+        if entity_id == e.wp_inlet_temp:
+            val = _parse_float(state_str)
+            self._signals["t_wp_in_c"].update(
+                val, t_mono, is_valid=val is not None
+            )
+            self.hydraulics.update_inlet_temp(
+                val, t_mono, is_valid=val is not None
+            )
+            return True
+        if entity_id == e.wp_threeway_valve:
+            self.hydraulics.update_threeway_valve(state_str, t_mono)
+            return True
+        if entity_id == e.buf_top_temp:
+            val = _parse_float(state_str)
+            self.hydraulics.update_buffer_top(val, is_valid=val is not None)
+            return True
+        if entity_id == e.buf_bot_temp:
+            val = _parse_float(state_str)
+            self.hydraulics.update_buffer_bot(val, is_valid=val is not None)
+            return True
+        return False
+
+    def _ingest_weather(
+        self,
+        attrs: Mapping[str, Any],
+        t_mono: float,
+        *,
+        is_avail: bool,
+    ) -> None:
+        """Extract temperature, humidity, and SI wind speed from `weather.*`."""
+        w_temp = _parse_float(attrs.get("temperature"))
+        w_hum = _parse_float(attrs.get("humidity"))
+        w_wind_raw = _parse_float(attrs.get("wind_speed"))
+        w_wind_unit = attrs.get("wind_speed_unit")
+        w_wind_ms = (
+            convert_wind_speed_to_ms(w_wind_raw, w_wind_unit, "km/h")
+            if w_wind_raw is not None
+            else None
+        )
+        self._signals["t_out_weather_c"].update(
+            w_temp, t_mono, is_valid=is_avail and w_temp is not None
+        )
+        self._signals["rh_weather_pct"].update(
+            w_hum, t_mono, is_valid=is_avail and w_hum is not None
+        )
+        self._signals["v_wind_ms"].update(
+            w_wind_ms, t_mono, is_valid=is_avail and w_wind_ms is not None
+        )
+
+    def _ingest_screen(
+        self,
+        sig_key: str,
+        norm_state: str,
+        attrs: Mapping[str, Any],
+        t_mono: float,
+        *,
+        is_avail: bool,
+    ) -> None:
+        """Ingest exterior screen cover opening percentage (`0..100`)."""
+        pos = _parse_float(attrs.get("current_position"))
+        if pos is None and is_avail:
+            if norm_state == "open":
+                pos = 100.0
+            elif norm_state == "closed":
+                pos = 0.0
+        if pos is not None:
+            pos = min(100.0, max(0.0, pos))
+        self._signals[sig_key].update(pos, t_mono, is_valid=pos is not None)
+
+    def _ingest_ac_mode(
+        self, state_str: str | None, t_mono: float
+    ) -> None:
+        """Ingest attic split-AC climate mode into per-mode duty integrators."""
+        code = encode_ac_mode(state_str)
+        self._ac_mode_latest = code
+        self._signals["ac_mode_heat"].update(
+            1.0 if code == AC_MODE_HEAT else 0.0, t_mono, is_valid=True
+        )
+        self._signals["ac_mode_cool"].update(
+            1.0 if code == AC_MODE_COOL else 0.0, t_mono, is_valid=True
+        )
+        self._signals["ac_mode_dry"].update(
+            1.0 if code == AC_MODE_DRY else 0.0, t_mono, is_valid=True
+        )
+        self._signals["ac_mode_other"].update(
+            1.0 if code == AC_MODE_OTHER else 0.0, t_mono, is_valid=True
+        )
+
+    @staticmethod
+    def _record_room_timestamps(
+        rt: _RoomTracker,
+        prev_changed_ts: float | None,
+        last_changed_utc: float | None,
+        last_reported_utc: float | None,
+        *,
+        is_initial_seed: bool,
+        fallback_changed: bool,
+    ) -> tuple[bool, float | None]:
+        """Update `last_heard_utc` and compute change-in-window + timestamp."""
+        changed = False
+        next_changed_ts = prev_changed_ts
+        if last_changed_utc is not None:
+            if not is_initial_seed and (
+                prev_changed_ts is None
+                or last_changed_utc > prev_changed_ts + 1e-6
+            ):
+                changed = True
+            next_changed_ts = max(
+                prev_changed_ts or 0.0, float(last_changed_utc)
+            )
+        elif not is_initial_seed and fallback_changed:
+            changed = True
+
+        heard_candidates = [
+            ts
+            for ts in (rt.last_heard_utc, last_changed_utc, last_reported_utc)
+            if ts is not None
+        ]
+        if heard_candidates:
+            rt.last_heard_utc = max(heard_candidates)
+        return changed, next_changed_ts
 
     def _update_room_temp(
         self,
@@ -1188,34 +1190,19 @@ class WindowAccumulatorCore:
             return
 
         prev_val = rt.temp_c
-        prev_changed_ts = rt.last_temp_changed_utc
         rt.temp_c = val
         rt.temp_valid = True
-
-        if last_changed_utc is not None:
-            if (
-                not is_initial_seed
-                and prev_changed_ts is not None
-                and last_changed_utc > prev_changed_ts + 1e-6
-            ):
-                rt.temp_changed_in_window = True
-            elif not is_initial_seed and prev_changed_ts is None:
-                rt.temp_changed_in_window = True
-            rt.last_temp_changed_utc = max(
-                prev_changed_ts or 0.0, float(last_changed_utc)
-            )
-        elif not is_initial_seed and (
-            prev_val is None or abs(val - prev_val) > 1e-6
-        ):
+        changed, next_ts = self._record_room_timestamps(
+            rt,
+            rt.last_temp_changed_utc,
+            last_changed_utc,
+            last_reported_utc,
+            is_initial_seed=is_initial_seed,
+            fallback_changed=prev_val is None or abs(val - prev_val) > 1e-6,
+        )
+        if changed:
             rt.temp_changed_in_window = True
-
-        heard_candidates = [
-            ts
-            for ts in (rt.last_heard_utc, last_changed_utc, last_reported_utc)
-            if ts is not None
-        ]
-        if heard_candidates:
-            rt.last_heard_utc = max(heard_candidates)
+        rt.last_temp_changed_utc = next_ts
 
     def _update_room_humidity(
         self,
@@ -1231,29 +1218,17 @@ class WindowAccumulatorCore:
         if val is None:
             return
 
-        prev_hum_ts = rt.last_hum_changed_utc
-        if last_changed_utc is not None:
-            if (
-                not is_initial_seed
-                and prev_hum_ts is not None
-                and last_changed_utc > prev_hum_ts + 1e-6
-            ):
-                rt.hum_changed_in_window = True
-            elif not is_initial_seed and prev_hum_ts is None:
-                rt.hum_changed_in_window = True
-            rt.last_hum_changed_utc = max(
-                prev_hum_ts or 0.0, float(last_changed_utc)
-            )
-        elif not is_initial_seed:
+        changed, next_ts = self._record_room_timestamps(
+            rt,
+            rt.last_hum_changed_utc,
+            last_changed_utc,
+            last_reported_utc,
+            is_initial_seed=is_initial_seed,
+            fallback_changed=True,
+        )
+        if changed:
             rt.hum_changed_in_window = True
-
-        heard_candidates = [
-            ts
-            for ts in (rt.last_heard_utc, last_changed_utc, last_reported_utc)
-            if ts is not None
-        ]
-        if heard_candidates:
-            rt.last_heard_utc = max(heard_candidates)
+        rt.last_hum_changed_utc = next_ts
 
     def _is_room_stale(self, room_key: str, ts_utc: int) -> bool:
         rt = self._rooms[room_key]
@@ -1265,24 +1240,26 @@ class WindowAccumulatorCore:
                 return True
         return False
 
-    def close_window(
-        self,
-        ts_utc: int,
-        t_mono: float,
-        window_dt: float | None = None,
-    ) -> WindowCloseResult:
-        """Close the sub-5m window at `(ts_utc, t_mono)` and assemble `raw_row`."""
-        dt_s = (
-            float(window_dt)
-            if window_dt is not None and window_dt > 0.0
-            else max(1e-3, t_mono - self.window_start_t)
-        )
-        self.window_start_t = t_mono
+    @staticmethod
+    def _signal_val_or(
+        closed: Mapping[str, tuple[float | None, float]],
+        key: str,
+        default: float,
+        min_cov: float = 0.0,
+    ) -> float:
+        mean_v, cov = closed[key]
+        if mean_v is not None and (cov >= min_cov or min_cov == 0.0):
+            return mean_v
+        return default
 
+    def _close_valves(self, t_mono: float, dt_s: float) -> dict[str, float]:
+        """Close all wax-valve trackers and compute effective group openings."""
         u_bg = self._valves["bg"].close_window(t_mono, dt_s)
         u_slk_main = self._valves["slaapkamer_main"].close_window(t_mono, dt_s)
         u_slk_voor = self._valves["slaapkamer_voor"].close_window(t_mono, dt_s)
-        u_slk_achter = self._valves["slaapkamer_achter"].close_window(t_mono, dt_s)
+        u_slk_achter = self._valves["slaapkamer_achter"].close_window(
+            t_mono, dt_s
+        )
         if self._valves["slaapkamer_main"].has_state:
             u_slaapkamer = u_slk_main
         elif (
@@ -1297,41 +1274,34 @@ class WindowAccumulatorCore:
         else:
             u_slaapkamer = 0.0
 
-        u_badkamer = self._valves["badkamer"].close_window(t_mono, dt_s)
-        u_werkkamer_1e = self._valves["werkkamer_1e"].close_window(
-            t_mono, dt_s
-        )
-        u_kamer_1e_midden = self._valves["kamer_1e_midden"].close_window(
-            t_mono, dt_s
-        )
-        u_kamer_1e_zuid = self._valves["kamer_1e_zuid"].close_window(
-            t_mono, dt_s
-        )
-        u_kantoor = self._valves["kantoor"].close_window(t_mono, dt_s)
-        u_badkamer_boven = self._valves["badkamer_boven"].close_window(t_mono, dt_s)
-        u_logeerkamer = self._valves["logeerkamer"].close_window(t_mono, dt_s)
-
-        hyd = self.hydraulics.close_window(t_mono, dt_s)
-
-        closed: dict[str, tuple[float | None, float]] = {
-            key: acc.close_window(t_mono, dt_s)
-            for key, acc in self._signals.items()
+        return {
+            "u_eff_bg": u_bg,
+            "u_eff_slaapkamer": u_slaapkamer,
+            "u_eff_badkamer": self._valves["badkamer"].close_window(
+                t_mono, dt_s
+            ),
+            "u_eff_werkkamer_1e": self._valves["werkkamer_1e"].close_window(
+                t_mono, dt_s
+            ),
+            "u_eff_kamer_1e_midden": self._valves[
+                "kamer_1e_midden"
+            ].close_window(t_mono, dt_s),
+            "u_eff_kamer_1e_zuid": self._valves["kamer_1e_zuid"].close_window(
+                t_mono, dt_s
+            ),
+            "u_eff_kantoor": self._valves["kantoor"].close_window(t_mono, dt_s),
+            "u_eff_badkamer_boven": self._valves[
+                "badkamer_boven"
+            ].close_window(t_mono, dt_s),
+            "u_eff_logeerkamer": self._valves["logeerkamer"].close_window(
+                t_mono, dt_s
+            ),
         }
 
-        def _val_or(key: str, default: float, min_cov: float = 0.0) -> float:
-            mean_v, cov = closed[key]
-            if mean_v is not None and cov >= min_cov:
-                return mean_v
-            if mean_v is not None and min_cov == 0.0:
-                return mean_v
-            return default
-
-        u_pump_sec = min(1.0, max(0.0, _val_or("u_pump_sec", 0.0)))
-        presence_duty = _val_or("presence", 1.0)
-        defrost_wp_duty = _val_or("defrost_wp", 0.0)
-        internal_heater_duty = _val_or("internal_heater", 0.0)
-        defrost_ac_duty = _val_or("defrost_ac", 0.0)
-
+    def _resolve_outdoor_and_weather(
+        self, closed: Mapping[str, tuple[float | None, float]]
+    ) -> tuple[float, float, float, bool, float, float]:
+        """Resolve outdoor temperature trio, humidity, and wind speed."""
         t_dak_mean, t_dak_cov = closed["t_out_dak_c"]
         t_wea_mean, t_wea_cov = closed["t_out_weather_c"]
         t_hm_mean, t_hm_cov = closed["t_out_hm_c"]
@@ -1339,7 +1309,9 @@ class WindowAccumulatorCore:
         has_fallback_out = (t_wea_mean is not None and t_wea_cov >= 0.50) or (
             t_hm_mean is not None and t_hm_cov >= 0.50
         )
-        if t_dak_mean is not None and (t_dak_cov >= 0.50 or not has_fallback_out):
+        if t_dak_mean is not None and (
+            t_dak_cov >= 0.50 or not has_fallback_out
+        ):
             t_out_dak_c = t_dak_mean
         else:
             t_out_dak_c = float("nan")
@@ -1352,7 +1324,8 @@ class WindowAccumulatorCore:
         )
         t_out_hm_c = t_hm_mean if t_hm_mean is not None else float("nan")
         any_outdoor_valid = any(
-            math.isfinite(x) for x in (t_out_dak_c, t_out_weather_c, t_out_hm_c)
+            math.isfinite(x)
+            for x in (t_out_dak_c, t_out_weather_c, t_out_hm_c)
         )
 
         rh_wea, rh_wea_cov = closed["rh_weather_pct"]
@@ -1366,88 +1339,85 @@ class WindowAccumulatorCore:
         else:
             rh_out_pct = 80.0
 
-        v_wind_ms = max(0.0, _val_or("v_wind_ms", 3.0, min_cov=0.50))
+        v_wind_ms = max(
+            0.0, self._signal_val_or(closed, "v_wind_ms", 3.0, min_cov=0.50)
+        )
+        return (
+            t_out_dak_c,
+            t_out_weather_c,
+            t_out_hm_c,
+            any_outdoor_valid,
+            rh_out_pct,
+            v_wind_ms,
+        )
 
-        p_pv_forecast_w = max(0.0, _val_or("p_pv_forecast_w", 0.0))
+    def _resolve_pv_and_epex(
+        self, closed: Mapping[str, tuple[float | None, float]]
+    ) -> tuple[float, float, float, bool]:
+        """Resolve raw PV telemetry, Forecast.Solar estimate, and EPEX price.
+
+        Preserves raw `p_pv_w` (`NaN` when unavailable) and sets
+        `pv_fallback_used` only for genuine PV sensor staleness/unavailability;
+        curtailment detection belongs exclusively to `domain/solar_weather.py`.
+        """
+        p_pv_forecast_w = max(
+            0.0, self._signal_val_or(closed, "p_pv_forecast_w", 0.0)
+        )
         p_pv_mean, p_pv_cov = closed["p_pv_w"]
-        epex_eur_kwh = _val_or("epex_eur_kwh", float("nan"))
-        pv_fallback_used = False
-        if p_pv_mean is not None and p_pv_cov >= 0.50:
-            p_pv_w = max(0.0, p_pv_mean)
-            if (
-                math.isfinite(epex_eur_kwh)
-                and epex_eur_kwh < 0.0
-                and p_pv_forecast_w > 50.0
-                and p_pv_w < 0.30 * p_pv_forecast_w
-            ):
-                pv_fallback_used = True
-        elif p_pv_forecast_w > 0.0 and p_pv_mean is None:
-            p_pv_w = p_pv_forecast_w
-            pv_fallback_used = True
-        else:
-            p_pv_w = max(0.0, p_pv_mean or 0.0)
+        epex_eur_kwh = self._signal_val_or(closed, "epex_eur_kwh", float("nan"))
 
-        p1_cons_mean, _ = closed["p1_consumed_w"]
-        p1_prod_mean, _ = closed["p1_produced_w"]
-        if p1_cons_mean is not None or p1_prod_mean is not None:
-            p_p1_net_w = (p1_cons_mean or 0.0) - (p1_prod_mean or 0.0)
-        else:
-            p_p1_net_w = float("nan")
+        if p_pv_mean is None:
+            return (
+                float("nan"),
+                p_pv_forecast_w,
+                epex_eur_kwh,
+                p_pv_forecast_w > 0.0,
+            )
 
-        dhw_top_acc = self._signals["t_dhw_top_c"]
-        t_dhw_top_c = (
-            dhw_top_acc.value
-            if dhw_top_acc.is_valid
-            else _val_or("t_dhw_top_c", float("nan"))
-        )
-        dhw_bot_acc = self._signals["t_dhw_bot_c"]
-        t_dhw_bot_c = (
-            dhw_bot_acc.value
-            if dhw_bot_acc.is_valid
-            else _val_or("t_dhw_bot_c", float("nan"))
-        )
+        p_pv_w = max(0.0, p_pv_mean)
+        pv_stale = p_pv_cov < 0.50 and p_pv_forecast_w > 0.0
+        return p_pv_w, p_pv_forecast_w, epex_eur_kwh, pv_stale
 
-        p_el_ac_kt_w = max(0.0, _val_or("p_el_ac_kt_w", 0.0))
-        ac_heat_duty = _val_or("ac_mode_heat", 0.0)
-        ac_cool_duty = _val_or("ac_mode_cool", 0.0)
-        ac_dry_duty = _val_or("ac_mode_dry", 0.0)
-        ac_other_duty = _val_or("ac_mode_other", 0.0)
-        if ac_heat_duty > 0.0 and ac_heat_duty >= max(ac_cool_duty, ac_dry_duty):
-            ac_mode_code = AC_MODE_HEAT
-        elif ac_cool_duty > 0.0 and ac_cool_duty >= ac_dry_duty:
-            ac_mode_code = AC_MODE_COOL
-        elif ac_dry_duty > 0.0:
-            ac_mode_code = AC_MODE_DRY
-        elif ac_other_duty >= 0.5:
-            ac_mode_code = AC_MODE_OTHER
-        else:
-            ac_mode_code = self._ac_mode_latest
+    def _resolve_ac_mode(
+        self, closed: Mapping[str, tuple[float | None, float]]
+    ) -> float:
+        """Select dominant attic split-AC mode code for the closed window."""
+        ac_heat_duty = self._signal_val_or(closed, "ac_mode_heat", 0.0)
+        ac_cool_duty = self._signal_val_or(closed, "ac_mode_cool", 0.0)
+        ac_dry_duty = self._signal_val_or(closed, "ac_mode_dry", 0.0)
+        ac_other_duty = self._signal_val_or(closed, "ac_mode_other", 0.0)
+        if ac_heat_duty > 0.0 and ac_heat_duty >= max(
+            ac_cool_duty, ac_dry_duty
+        ):
+            return AC_MODE_HEAT
+        if ac_cool_duty > 0.0 and ac_cool_duty >= ac_dry_duty:
+            return AC_MODE_COOL
+        if ac_dry_duty > 0.0:
+            return AC_MODE_DRY
+        if ac_other_duty >= 0.5:
+            return AC_MODE_OTHER
+        return self._ac_mode_latest
 
-        stale_wk = self._is_room_stale("wk", ts_utc)
-        stale_kt = self._is_room_stale("kantoor", ts_utc)
-
-        rt_wk = self._rooms["wk"]
-        rt_kt = self._rooms["kantoor"]
-        temp_changed_wk = rt_wk.temp_changed_in_window
-        hum_changed_wk = rt_wk.hum_changed_in_window
-        temp_changed_kt = rt_kt.temp_changed_in_window
-        hum_changed_kt = rt_kt.hum_changed_in_window
-
-        for rt in self._rooms.values():
-            rt.temp_changed_in_window = False
-            rt.hum_changed_in_window = False
-
-        def _room_temp(key: str) -> float:
-            tracker = self._rooms.get(key)
-            if tracker is None or not tracker.temp_valid or tracker.temp_c is None:
-                return float("nan")
-            return tracker.temp_c
-
-        t_air_wk_c = _room_temp("wk")
-        t_air_kt_c = _room_temp("kantoor")
-        f_comp_hz = max(0.0, _val_or("f_comp_hz", 0.0))
-
-        flags: int = 0
+    def _compute_flags(
+        self,
+        *,
+        t_air_wk_c: float,
+        t_air_kt_c: float,
+        stale_wk: bool,
+        stale_kt: bool,
+        any_outdoor_valid: bool,
+        presence_duty: float,
+        ac_mode_code: float,
+        dhw_duty: float,
+        u_pump_sec: float,
+        f_comp_hz: float,
+        pv_fallback_used: bool,
+        defrost_wp_duty: float,
+        defrost_ac_duty: float,
+        internal_heater_duty: float,
+    ) -> int:
+        """Compute the uint32 RingBuffer status bitmask for the closed window."""
+        flags = 0
         if math.isfinite(t_air_wk_c) and not stale_wk and any_outdoor_valid:
             flags |= FLAG_VALID_WK
         if math.isfinite(t_air_kt_c) and not stale_kt and any_outdoor_valid:
@@ -1468,7 +1438,7 @@ class WindowAccumulatorCore:
             flags |= FLAG_FLOOR_COOL
         if ac_mode_code in (AC_MODE_COOL, AC_MODE_DRY):
             flags |= FLAG_AC_COOL_KT
-        if hyd.dhw_duty >= 0.5:
+        if dhw_duty >= 0.5:
             flags |= FLAG_DHW_TANK
         if u_pump_sec > 0.01:
             flags |= FLAG_PUMP_SEC_ON
@@ -1486,6 +1456,56 @@ class WindowAccumulatorCore:
             flags |= FLAG_DEFROST_AC
         if internal_heater_duty > 0.0:
             flags |= FLAG_INTERNAL_HEATER
+        return flags
+
+    def _room_temp(self, key: str) -> float:
+        tracker = self._rooms.get(key)
+        if tracker is None or not tracker.temp_valid or tracker.temp_c is None:
+            return float("nan")
+        return tracker.temp_c
+
+    def _assemble_raw_row(
+        self,
+        *,
+        ts_utc: int,
+        flags: int,
+        valves: Mapping[str, float],
+        hyd: HydraulicWindowSummary,
+        closed: Mapping[str, tuple[float | None, float]],
+        u_pump_sec: float,
+        t_air_wk_c: float,
+        t_air_kt_c: float,
+        f_comp_hz: float,
+        t_out_dak_c: float,
+        t_out_weather_c: float,
+        t_out_hm_c: float,
+        rh_out_pct: float,
+        v_wind_ms: float,
+        p_pv_w: float,
+        p_pv_forecast_w: float,
+        epex_eur_kwh: float,
+        ac_mode_code: float,
+    ) -> dict[str, float | int]:
+        """Populate a canonical 60-column RingBuffer row dictionary."""
+        p1_cons_mean, _ = closed["p1_consumed_w"]
+        p1_prod_mean, _ = closed["p1_produced_w"]
+        if p1_cons_mean is not None or p1_prod_mean is not None:
+            p_p1_net_w = (p1_cons_mean or 0.0) - (p1_prod_mean or 0.0)
+        else:
+            p_p1_net_w = float("nan")
+
+        dhw_top_acc = self._signals["t_dhw_top_c"]
+        t_dhw_top_c = (
+            dhw_top_acc.value
+            if dhw_top_acc.is_valid
+            else self._signal_val_or(closed, "t_dhw_top_c", float("nan"))
+        )
+        dhw_bot_acc = self._signals["t_dhw_bot_c"]
+        t_dhw_bot_c = (
+            dhw_bot_acc.value
+            if dhw_bot_acc.is_valid
+            else self._signal_val_or(closed, "t_dhw_bot_c", float("nan"))
+        )
 
         # Preserve total primary DHW thermal power whenever FLAG_DHW_TANK is set
         # (hydraulics.py zeroes buffer injection when FLAG_DHW_TANK is set).
@@ -1497,70 +1517,179 @@ class WindowAccumulatorCore:
             max(0.0, p_desk_mean) if p_desk_mean is not None else float("nan")
         )
 
-        raw_row: dict[str, float | int] = {
-            "ts_utc": int(ts_utc),
-            "flags": int(flags),
-            "u_eff_bg": u_bg,
-            "u_eff_slaapkamer": u_slaapkamer,
-            "u_eff_badkamer": u_badkamer,
-            "u_eff_werkkamer_1e": u_werkkamer_1e,
-            "u_eff_kamer_1e_midden": u_kamer_1e_midden,
-            "u_eff_kamer_1e_zuid": u_kamer_1e_zuid,
-            "u_eff_kantoor": u_kantoor,
-            "u_eff_badkamer_boven": u_badkamer_boven,
-            "u_eff_logeerkamer": u_logeerkamer,
-            "u_pump_sec": u_pump_sec,
-            "t_air_wk_c": t_air_wk_c,
-            "t_air_slaapkamer_c": _room_temp("slaapkamer"),
-            "t_air_badkamer_c": _room_temp("badkamer"),
-            "t_air_werkkamer_1e_c": _room_temp("werkkamer_1e"),
-            "t_air_kamer_1e_midden_c": _room_temp("kamer_1e_midden"),
-            "t_air_kamer_1e_zuid_c": _room_temp("kamer_1e_zuid"),
-            "t_air_kantoor_c": t_air_kt_c,
-            "t_air_badkamer_boven_c": _room_temp("badkamer_boven"),
-            "t_air_logeerkamer_c": _room_temp("logeerkamer"),
-            "v_prim_l_min": max(0.0, _val_or("v_prim_l_min", 0.0)),
-            "t_wp_out_c": _val_or("t_wp_out_c", float("nan")),
-            "t_wp_in_c": _val_or("t_wp_in_c", float("nan")),
-            "p_prim_th_w": p_prim_col_w,
-            "f_comp_hz": f_comp_hz,
-            "p_wp_raw_el_w": max(0.0, _val_or("p_wp_raw_el_w", 0.0)),
-            "t_buf_top_start_c": hyd.t_buf_top_start_c,
-            "t_buf_top_end_c": hyd.t_buf_top_end_c,
-            "t_buf_bot_start_c": hyd.t_buf_bot_start_c,
-            "t_buf_bot_end_c": hyd.t_buf_bot_end_c,
-            "t_dhw_top_c": t_dhw_top_c,
-            "t_dhw_bot_c": t_dhw_bot_c,
-            "p_p1_net_w": p_p1_net_w,
-            "t_out_dak_c": t_out_dak_c,
-            "t_out_weather_c": t_out_weather_c,
-            "t_out_hm_c": t_out_hm_c,
-            "rh_out_pct": rh_out_pct,
-            "v_wind_ms": v_wind_ms,
-            "p_pv_w": p_pv_w,
-            "p_pv_forecast_w": p_pv_forecast_w,
-            "epex_eur_kwh": epex_eur_kwh,
-            "screen_small_pos": _val_or("screen_small_pos", 100.0),
-            "screen_large_pos": _val_or("screen_large_pos", 100.0),
-            "p_el_ac_kt_w": p_el_ac_kt_w,
-            "ac_mode_code": ac_mode_code,
-            "p_desk_kt_w": p_desk_kt_w,
-            "pir_occ_kt": min(1.0, max(0.0, _val_or("pir_occ_kt", 0.0))),
-            "p_growlights_kt_w": max(0.0, _val_or("p_growlights_kt_w", 0.0)),
-            "t_bg_sup_c": _val_or("t_bg_sup_c", float("nan")),
-            "t_bg_ret_c": _val_or("t_bg_ret_c", float("nan")),
-            "t_floor_surf_meas_wk_c": _val_or(
-                "t_floor_surf_meas_wk_c", float("nan")
-            ),
-            "t_floor_wk_c": float("nan"),
-            "d_est_wk_w": float("nan"),
-            "q_fh_wk_w": float("nan"),
-            "t_hind6h_wk_c": float("nan"),
-            "t_floor_kt_c": float("nan"),
-            "d_est_kt_w": float("nan"),
-            "q_fh_kt_w": float("nan"),
-            "t_hind6h_kt_c": float("nan"),
+        row = make_empty_raw_row(int(ts_utc), int(flags))
+        row.update(valves)
+        row.update(
+            {
+                "u_pump_sec": u_pump_sec,
+                "t_air_wk_c": t_air_wk_c,
+                "t_air_slaapkamer_c": self._room_temp("slaapkamer"),
+                "t_air_badkamer_c": self._room_temp("badkamer"),
+                "t_air_werkkamer_1e_c": self._room_temp("werkkamer_1e"),
+                "t_air_kamer_1e_midden_c": self._room_temp("kamer_1e_midden"),
+                "t_air_kamer_1e_zuid_c": self._room_temp("kamer_1e_zuid"),
+                "t_air_kantoor_c": t_air_kt_c,
+                "t_air_badkamer_boven_c": self._room_temp("badkamer_boven"),
+                "t_air_logeerkamer_c": self._room_temp("logeerkamer"),
+                "v_prim_l_min": max(
+                    0.0, self._signal_val_or(closed, "v_prim_l_min", 0.0)
+                ),
+                "t_wp_out_c": self._signal_val_or(
+                    closed, "t_wp_out_c", float("nan")
+                ),
+                "t_wp_in_c": self._signal_val_or(
+                    closed, "t_wp_in_c", float("nan")
+                ),
+                "p_prim_th_w": p_prim_col_w,
+                "f_comp_hz": f_comp_hz,
+                "p_wp_raw_el_w": max(
+                    0.0, self._signal_val_or(closed, "p_wp_raw_el_w", 0.0)
+                ),
+                "t_buf_top_start_c": hyd.t_buf_top_start_c,
+                "t_buf_top_end_c": hyd.t_buf_top_end_c,
+                "t_buf_bot_start_c": hyd.t_buf_bot_start_c,
+                "t_buf_bot_end_c": hyd.t_buf_bot_end_c,
+                "t_dhw_top_c": t_dhw_top_c,
+                "t_dhw_bot_c": t_dhw_bot_c,
+                "p_p1_net_w": p_p1_net_w,
+                "t_out_dak_c": t_out_dak_c,
+                "t_out_weather_c": t_out_weather_c,
+                "t_out_hm_c": t_out_hm_c,
+                "rh_out_pct": rh_out_pct,
+                "v_wind_ms": v_wind_ms,
+                "p_pv_w": p_pv_w,
+                "p_pv_forecast_w": p_pv_forecast_w,
+                "epex_eur_kwh": epex_eur_kwh,
+                "screen_small_pos": self._signal_val_or(
+                    closed, "screen_small_pos", 100.0
+                ),
+                "screen_large_pos": self._signal_val_or(
+                    closed, "screen_large_pos", 100.0
+                ),
+                "p_el_ac_kt_w": max(
+                    0.0, self._signal_val_or(closed, "p_el_ac_kt_w", 0.0)
+                ),
+                "ac_mode_code": ac_mode_code,
+                "p_desk_kt_w": p_desk_kt_w,
+                "pir_occ_kt": min(
+                    1.0,
+                    max(0.0, self._signal_val_or(closed, "pir_occ_kt", 0.0)),
+                ),
+                "p_growlights_kt_w": max(
+                    0.0, self._signal_val_or(closed, "p_growlights_kt_w", 0.0)
+                ),
+                "t_bg_sup_c": self._signal_val_or(
+                    closed, "t_bg_sup_c", float("nan")
+                ),
+                "t_bg_ret_c": self._signal_val_or(
+                    closed, "t_bg_ret_c", float("nan")
+                ),
+                "t_floor_surf_meas_wk_c": self._signal_val_or(
+                    closed, "t_floor_surf_meas_wk_c", float("nan")
+                ),
+            }
+        )
+        return row
+
+    def close_window(
+        self,
+        ts_utc: int,
+        t_mono: float,
+        window_dt: float | None = None,
+    ) -> WindowCloseResult:
+        """Close the sub-5m window at `(ts_utc, t_mono)` and assemble `raw_row`."""
+        dt_s = (
+            float(window_dt)
+            if window_dt is not None and window_dt > 0.0
+            else max(1e-3, t_mono - self.window_start_t)
+        )
+        self.window_start_t = t_mono
+
+        valves = self._close_valves(t_mono, dt_s)
+        hyd = self.hydraulics.close_window(t_mono, dt_s)
+        closed: dict[str, tuple[float | None, float]] = {
+            key: acc.close_window(t_mono, dt_s)
+            for key, acc in self._signals.items()
         }
+
+        u_pump_sec = min(
+            1.0, max(0.0, self._signal_val_or(closed, "u_pump_sec", 0.0))
+        )
+        presence_duty = self._signal_val_or(closed, "presence", 1.0)
+        defrost_wp_duty = self._signal_val_or(closed, "defrost_wp", 0.0)
+        internal_heater_duty = self._signal_val_or(
+            closed, "internal_heater", 0.0
+        )
+        defrost_ac_duty = self._signal_val_or(closed, "defrost_ac", 0.0)
+
+        (
+            t_out_dak_c,
+            t_out_weather_c,
+            t_out_hm_c,
+            any_outdoor_valid,
+            rh_out_pct,
+            v_wind_ms,
+        ) = self._resolve_outdoor_and_weather(closed)
+        p_pv_w, p_pv_forecast_w, epex_eur_kwh, pv_fallback_used = (
+            self._resolve_pv_and_epex(closed)
+        )
+        ac_mode_code = self._resolve_ac_mode(closed)
+
+        stale_wk = self._is_room_stale("wk", ts_utc)
+        stale_kt = self._is_room_stale("kantoor", ts_utc)
+
+        rt_wk = self._rooms["wk"]
+        rt_kt = self._rooms["kantoor"]
+        temp_changed_wk = rt_wk.temp_changed_in_window
+        hum_changed_wk = rt_wk.hum_changed_in_window
+        temp_changed_kt = rt_kt.temp_changed_in_window
+        hum_changed_kt = rt_kt.hum_changed_in_window
+
+        for rt in self._rooms.values():
+            rt.temp_changed_in_window = False
+            rt.hum_changed_in_window = False
+
+        t_air_wk_c = self._room_temp("wk")
+        t_air_kt_c = self._room_temp("kantoor")
+        f_comp_hz = max(0.0, self._signal_val_or(closed, "f_comp_hz", 0.0))
+
+        flags = self._compute_flags(
+            t_air_wk_c=t_air_wk_c,
+            t_air_kt_c=t_air_kt_c,
+            stale_wk=stale_wk,
+            stale_kt=stale_kt,
+            any_outdoor_valid=any_outdoor_valid,
+            presence_duty=presence_duty,
+            ac_mode_code=ac_mode_code,
+            dhw_duty=hyd.dhw_duty,
+            u_pump_sec=u_pump_sec,
+            f_comp_hz=f_comp_hz,
+            pv_fallback_used=pv_fallback_used,
+            defrost_wp_duty=defrost_wp_duty,
+            defrost_ac_duty=defrost_ac_duty,
+            internal_heater_duty=internal_heater_duty,
+        )
+
+        raw_row = self._assemble_raw_row(
+            ts_utc=ts_utc,
+            flags=flags,
+            valves=valves,
+            hyd=hyd,
+            closed=closed,
+            u_pump_sec=u_pump_sec,
+            t_air_wk_c=t_air_wk_c,
+            t_air_kt_c=t_air_kt_c,
+            f_comp_hz=f_comp_hz,
+            t_out_dak_c=t_out_dak_c,
+            t_out_weather_c=t_out_weather_c,
+            t_out_hm_c=t_out_hm_c,
+            rh_out_pct=rh_out_pct,
+            v_wind_ms=v_wind_ms,
+            p_pv_w=p_pv_w,
+            p_pv_forecast_w=p_pv_forecast_w,
+            epex_eur_kwh=epex_eur_kwh,
+            ac_mode_code=ac_mode_code,
+        )
 
         return WindowCloseResult(
             raw_row=raw_row,
@@ -1618,8 +1747,7 @@ class HAWindowAccumulator:
 
     def start(self) -> None:
         """Seed current Home Assistant states and subscribe to state events."""
-        from homeassistant.core import callback
-        from homeassistant.helpers.event import async_track_state_change_event
+        from ._ha_compat import async_track_state_change_event, callback
 
         t_now = time.monotonic()
         self.core = WindowAccumulatorCore(
@@ -1670,8 +1798,13 @@ class HAWindowAccumulator:
         )
 
     def close_window(
-        self, ts_utc: int, t_mono: float | None = None
+        self,
+        ts_utc: int,
+        t_mono: float | None = None,
+        window_dt: float | None = None,
     ) -> WindowCloseResult:
         """Close the active 5-minute window and return `WindowCloseResult`."""
         mono = time.monotonic() if t_mono is None else float(t_mono)
-        return self.core.close_window(ts_utc=ts_utc, t_mono=mono)
+        return self.core.close_window(
+            ts_utc=ts_utc, t_mono=mono, window_dt=window_dt
+        )

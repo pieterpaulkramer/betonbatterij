@@ -1,18 +1,26 @@
 """Self-learning parameter calibration, Box-Huber-LM solver, and seasonal memory.
 
-Implements Component 3 (`03-parameter-identificatie-en-kalibratie.md`):
-- Choice A2: Joint Multi-Horizon Trajectory MAP with self-consistent KF warmup.
-- Choice B2: Pure-Python Box-Projected Huber Levenberg-Marquardt
-  (`solve_b2_box_huber_lm`).
-- Choice D2: 52-week precision aging + Fisher information gate
-  (`update_posterior_memory`).
-- Choice D3: Stratified 365-day `SeasonalEpisodeBank` (top-8 episodes/regime
-  with 24h spin-up).
-- Robust `K_hx` calibration on steady 18..25 Hz runs and Out-of-Sample 14-day
-  Holdout Gate.
+Owns pure-Python parameter identification for `wk` and `kt`:
+- Box-projected Huber Levenberg-Marquardt MAP solver (`solve_b2_box_huber_lm`)
+  with Fisher covariance, correlation matrix, and collinearity diagnostics,
+- 52-week Bayesian precision-weighted seasonal memory (`compute_aged_prior`,
+  `update_posterior_memory`) with Fisher information gating,
+- Stratified 365-day `SeasonalEpisodeBank` retaining top-K clean excitation
+  episodes per regime with 24-hour Kalman spin-up,
+- Robust steady-state floor pipe conductance calibration
+  (`calibrate_k_hx_robust`) and autonomous seasonal/cooling gate
+  (`check_seasonal_calibration_gate`), and
+- Joint multi-horizon trajectory MAP calibration with out-of-sample holdout
+  acceptance gating (`calibrate_zone_a2`).
 
-100% pure Python stdlib — zero `homeassistant.*`, `numpy`, or `scipy` imports.
+Does not own RingBuffer ETL (`preprocessing.py`), unrolled Kalman tapes
+(`kalman_tape.py`), COP curve fitting (`cop_model.py`), or Home Assistant
+locking/persistence (`engine.py`, `ha_bridge/`).
+
+Units: temperatures in °C, thermal capacities in Wh/K, resistances in K/kW,
+conductances in W/K, apertures in m², powers in W, time in s.
 """
+
 from __future__ import annotations
 
 from collections.abc import Callable, Mapping, Sequence
@@ -21,13 +29,15 @@ import math
 from typing import Any, Literal
 
 from custom_components.betonbatterij import const
-from custom_components.betonbatterij import house_config
 from custom_components.betonbatterij.domain import contracts
 from custom_components.betonbatterij.domain import evaluation
+from custom_components.betonbatterij.domain import kalman_tape
+from custom_components.betonbatterij.domain import preprocessing
+from custom_components.betonbatterij.domain import priors
 from custom_components.betonbatterij.domain import solar_weather
 
 # Seasonal memory & calibration constants
-MEMORY_WEEKLY_GAMMA: float = 2.0 ** (-1.0 / 52.0)  # 52-week half-life (~0.9868)
+MEMORY_WEEKLY_GAMMA: float = preprocessing.MEMORY_WEEKLY_GAMMA
 FISHER_GATE_REL_THRESHOLD: float = 0.05  # Min Fisher info vs Day-1 precision
 EPISODE_SPINUP_STEPS: int = 288  # 24h Kalman spin-up per stored episode
 EPISODE_WINDOW_STEPS: int = 72  # 6h rollout window per stored episode
@@ -38,7 +48,7 @@ RESIDUAL_SIGMA_C: float = 0.08  # Trajectory measurement noise scale [K]
 
 
 # ============================================================================
-# 1. Pure-Python Linear Algebra & Choice B2 Box-Huber-LM Solver
+# 1. Pure-Python Linear Algebra & Box-Projected Huber-LM Solver
 # ============================================================================
 @dataclasses.dataclass(frozen=True, slots=True)
 class SolverResult:
@@ -225,7 +235,7 @@ def solve_b2_box_huber_lm(
     max_iter: int = 18,
     tol: float = 1e-4,
 ) -> SolverResult:
-    """Solves Box-Projected Huber Levenberg-Marquardt MAP optimization (Choice B2).
+    """Solves Box-Projected Huber Levenberg-Marquardt MAP optimization.
 
     Args:
         residual_fn: Callable mapping parameter vector `theta` to standardized
@@ -446,7 +456,7 @@ def solve_b2_box_huber_lm(
 
 
 # ============================================================================
-# 2. Choice D2: Precision-Weighted Posterior Memory & Fisher Information Gate
+# 2. Precision-Weighted Posterior Memory & Fisher Information Gate
 # ============================================================================
 def compute_aged_prior(
     old_memory: contracts.ParameterPosteriorMemory | None,
@@ -463,29 +473,9 @@ def compute_aged_prior(
     Returns:
         Tuple `(prior_mean, prior_precision)` keyed by parameter name.
     """
-    prior_mean: dict[str, float] = {}
-    prior_prec: dict[str, float] = {}
-
-    for name, b in bounds.items():
-        tau_0 = 1.0 / max(1e-12, b.prior_std * b.prior_std)
-        mu_0 = b.prior_mean
-        if (
-            old_memory is None
-            or name not in old_memory.mean
-            or name not in old_memory.precision
-        ):
-            prior_mean[name] = mu_0
-            prior_prec[name] = tau_0
-        else:
-            tau_mem = max(tau_0 * 0.1, float(old_memory.precision[name]))
-            mu_mem = float(old_memory.mean[name])
-            tau_w = (1.0 - gamma) * tau_0 + gamma * tau_mem
-            mu_w = (
-                (1.0 - gamma) * tau_0 * mu_0 + gamma * tau_mem * mu_mem
-            ) / tau_w
-            prior_mean[name] = min(b.upper, max(b.lower, mu_w))
-            prior_prec[name] = tau_w
-
+    prior_mean, prior_prec, _ = preprocessing.age_precision_memory(
+        old_memory, bounds, gamma
+    )
     return prior_mean, prior_prec
 
 
@@ -499,7 +489,7 @@ def update_posterior_memory(
     dict[str, float],
     contracts.ParameterPosteriorMemory,
 ]:
-    """Updates Choice D2 seasonal memory with 52w aging and Fisher info gate.
+    """Updates seasonal memory with 52-week aging and Fisher information gate.
 
     Unobserved seasonal parameters (`fisher_diag[j] < 0.05 * tau_day1`, e.g.,
     `a_sol_m2` during dark winter weeks) retain their learned
@@ -549,7 +539,7 @@ def update_posterior_memory(
 
 
 # ============================================================================
-# 3. Clean Regime Window Extraction & Choice D3 `SeasonalEpisodeBank`
+# 3. Clean Regime Window Extraction & 365-Day `SeasonalEpisodeBank`
 # ============================================================================
 @dataclasses.dataclass(slots=True)
 class TrainingWindow:
@@ -595,7 +585,7 @@ class StoredEpisode:
 
 
 def _build_step_hard_mask(
-    hist: evaluation.PreprocessedHistory,
+    hist: preprocessing.PreprocessedHistory,
     zone: contracts.ZoneId,
 ) -> list[bool]:
     """Returns per-step exclusion mask (`True` = dropout/cooling/defrost)."""
@@ -646,17 +636,8 @@ def _build_step_hard_mask(
     return masked
 
 
-def _is_wk_evening_cooking_slot(ts_utc: int, flags_val: int) -> bool:
-    """Excludes `17:30–20:30` cooking slot in `wk` only when `aanwezig == on`."""
-    if not (flags_val & const.FLAG_AANWEZIG):
-        return False
-    hr, mn = solar_weather.local_hour_minute(ts_utc)
-    mins = hr * 60 + mn
-    return 1050 <= mins <= 1230
-
-
 def extract_clean_regime_windows(
-    hist: evaluation.PreprocessedHistory,
+    hist: preprocessing.PreprocessedHistory,
     zone: contracts.ZoneId,
     d_init: Sequence[float],
     min_k0: int = 144,
@@ -720,7 +701,7 @@ def extract_clean_regime_windows(
         ts_m = ts_arr[m]
         hr_key = ts_m // 3600
         if hr_key != last_hr_key:
-            cached_hr_base, _ = solar_weather.local_hour_minute(hr_key * 3600)
+            cached_hr_base, _ = preprocessing.local_hour_minute(hr_key * 3600)
             last_hr_key = hr_key
         hr_m = cached_hr_base
         mn_m = (ts_m % 3600) // 60
@@ -965,10 +946,9 @@ def extract_clean_regime_windows(
 class SeasonalEpisodeBank:
     """Stratified 365-day reservoir of top-8 cleanest episodes per regime.
 
-    Implements Choice D3 (`03-parameter-identificatie-en-kalibratie.md` §4.2)
-    so seasonal excitation windows (sunny autumn afternoons, deep frost nights,
-    split-AC boosts) remain available across the full annual cycle even after
-    aging out of the 90-day live RingBuffer.
+    Retains high-excitation seasonal windows (sunny afternoons, cold winter
+    nights, active floor heating runs, and split-AC boosts) across the full
+    annual cycle even after aging out of the 90-day live RingBuffer.
     """
 
     def __init__(self, max_per_regime: int = EPISODE_MAX_PER_REGIME) -> None:
@@ -1007,7 +987,7 @@ class SeasonalEpisodeBank:
         """Filters out active-heating episodes contaminated by LTS/missing prim."""
         if ep.clean_verified or ep.regime not in ("heat", "ac", "airco_heat"):
             return True
-        is_lts, missing_prim = evaluation.detect_lts_and_missing_prim_rows(
+        is_lts, missing_prim = preprocessing.detect_lts_and_missing_prim_rows(
             ep.columns
         )
         if any(is_lts):
@@ -1043,10 +1023,10 @@ class SeasonalEpisodeBank:
         columns: Mapping[str, Sequence[float | int]],
         flow_rates_l_min: Mapping[str, float] | None = None,
         k_hx_by_group: Mapping[str, float] | None = None,
-        lat_deg: float = house_config.LATITUDE_DEG,
-        lon_deg: float = house_config.LONGITUDE_DEG,
+        lat_deg: float = priors.LATITUDE_DEG,
+        lon_deg: float = priors.LONGITUDE_DEG,
         *,
-        precomputed_hist: evaluation.PreprocessedHistory | None = None,
+        precomputed_hist: preprocessing.PreprocessedHistory | None = None,
     ) -> int:
         """Scans `columns` and retains top-K cleanest episodes over 365 days.
 
@@ -1072,7 +1052,7 @@ class SeasonalEpisodeBank:
         if precomputed_hist is not None and precomputed_hist.n_rows == n:
             hist = precomputed_hist
         else:
-            hist = evaluation.preprocess_history_columns(
+            hist = preprocessing.preprocess_history_columns(
                 columns,
                 flow_rates_l_min=flow_rates_l_min,
                 k_hx_by_group=k_hx_by_group,
@@ -1089,11 +1069,11 @@ class SeasonalEpisodeBank:
         for zone in ("wk", "kt"):
             z_id: contracts.ZoneId = "wk" if zone == "wk" else "kt"
             day1 = (
-                house_config.DAY1_PRIORS_WK
+                priors.DAY1_PRIORS_WK
                 if z_id == "wk"
-                else house_config.DAY1_PRIORS_KT
+                else priors.DAY1_PRIORS_KT
             )
-            states_0 = evaluation.reconstruct_states_tuples(hist, z_id, day1)
+            states_0 = kalman_tape.reconstruct_states_tuples(hist, z_id, day1)
             d_init = [st[2] for st in states_0]
 
             wins = extract_clean_regime_windows(
@@ -1148,7 +1128,7 @@ class SeasonalEpisodeBank:
                         and any(hist.missing_prim_th[s_idx:e_idx])
                     ):
                         continue
-                ep_cols = evaluation.slice_columns(columns, s_idx, e_idx)
+                ep_cols = preprocessing.slice_columns(columns, s_idx, e_idx)
                 ep = StoredEpisode(
                     zone=z_id,
                     regime=w.regime,
@@ -1382,7 +1362,7 @@ def _finite_col_val(
 
 
 def _extract_group_valves(
-    hist: evaluation.PreprocessedHistory,
+    hist: preprocessing.PreprocessedHistory,
     columns: Mapping[str, Sequence[float | int]],
     idx: int,
 ) -> dict[str, float]:
@@ -1448,10 +1428,10 @@ def calibrate_k_hx_robust(
     columns: Mapping[str, Sequence[float | int]],
     flow_rates_l_min: Mapping[str, float],
     current_k_hx: Mapping[str, float],
-    lat_deg: float = house_config.LATITUDE_DEG,
-    lon_deg: float = house_config.LONGITUDE_DEG,
+    lat_deg: float = priors.LATITUDE_DEG,
+    lon_deg: float = priors.LONGITUDE_DEG,
     *,
-    precomputed_hist: evaluation.PreprocessedHistory | None = None,
+    precomputed_hist: preprocessing.PreprocessedHistory | None = None,
 ) -> dict[str, float]:
     """Calibrates `K_hx` [W/K] on steady `18..25 Hz` runs (`>= 40 min`, `dT >= 2 K`).
 
@@ -1466,9 +1446,9 @@ def calibrate_k_hx_robust(
     Returns:
         Updated dictionary mapping all 10 hydraulic groups to `K_hx` [W/K].
     """
-    out_khx: dict[str, float] = dict(house_config.DAY1_K_HX_BY_GROUP_W_K)
+    out_khx: dict[str, float] = dict(priors.DAY1_K_HX_BY_GROUP_W_K)
     for g, v in current_k_hx.items():
-        out_khx["kantoor" if g == "kt" else g] = float(v)
+        out_khx[preprocessing.zone_to_hydraulic_group(g)] = float(v)
 
     ts_seq = columns.get("ts_utc", ())
     n = len(ts_seq)
@@ -1486,7 +1466,7 @@ def calibrate_k_hx_robust(
     ):
         hist = precomputed_hist
     else:
-        hist = evaluation.preprocess_history_columns(
+        hist = preprocessing.preprocess_history_columns(
             columns,
             flow_rates_l_min=flows,
             k_hx_by_group=out_khx,
@@ -1494,20 +1474,20 @@ def calibrate_k_hx_robust(
             lon_deg=lon_deg,
         )
 
-    st_wk = evaluation.reconstruct_states_tuples(
+    st_wk = kalman_tape.reconstruct_states_tuples(
         hist,
         "wk",
         dataclasses.replace(
-            house_config.DAY1_PRIORS_WK, k_hx_w_k=out_khx["wk"]
+            priors.DAY1_PRIORS_WK, k_hx_w_k=out_khx["wk"]
         ),
     )
     tf_wk = [s[1] for s in st_wk]
 
-    st_kt = evaluation.reconstruct_states_tuples(
+    st_kt = kalman_tape.reconstruct_states_tuples(
         hist,
         "kt",
         dataclasses.replace(
-            house_config.DAY1_PRIORS_KT, k_hx_w_k=out_khx["kantoor"]
+            priors.DAY1_PRIORS_KT, k_hx_w_k=out_khx["kantoor"]
         ),
     )
     tf_kt = [s[1] for s in st_kt]
@@ -1557,18 +1537,18 @@ def calibrate_k_hx_robust(
         bot_s_raw = _opt_col_temp(columns, "t_buf_bot_start_c", k)
         bot_e_raw = _opt_col_temp(columns, "t_buf_bot_end_c", k)
         bot_s = (
-            bot_s_raw + house_config.BUF_BOT_SENSOR_OFFSET_C
+            bot_s_raw + priors.BUF_BOT_SENSOR_OFFSET_C
             if bot_s_raw is not None
             else hist.t_buf_bot_cal_c[k]
         )
         bot_e = (
-            bot_e_raw + house_config.BUF_BOT_SENSOR_OFFSET_C
+            bot_e_raw + priors.BUF_BOT_SENSOR_OFFSET_C
             if bot_e_raw is not None
             else hist.t_buf_bot_cal_c[k]
         )
         t_mean_s = 0.5 * (top_s + bot_s)
         t_mean_e = 0.5 * (top_e + bot_e)
-        q_cal = hist.p_prim_th_w[k] - house_config.C_BUF_J_K * (
+        q_cal = hist.p_prim_th_w[k] - priors.C_BUF_J_K * (
             t_mean_e - t_mean_s
         ) / max(60.0, hist.dt_s[k])
         if not math.isfinite(q_cal) or q_cal <= 400.0:
@@ -1581,7 +1561,7 @@ def calibrate_k_hx_robust(
         return out_khx
 
     gang_to_wk_ratio = flows["gang"] / max(0.2, flows["wk"])
-    day1_wk = house_config.DAY1_K_HX_BY_GROUP_W_K["wk"]
+    day1_wk = priors.DAY1_K_HX_BY_GROUP_W_K["wk"]
 
     # Pass 1: Calibrate `wk` (+ `gang`) preferring BG-solo steady 20 Hz steps
     wk_solo_vals: list[float] = []
@@ -1636,10 +1616,10 @@ def calibrate_k_hx_robust(
                     wk_mix_wts.append(dt_wk * dt_wk)
 
     def _clamp_khx(group_name: str, raw_val: float) -> float:
-        day1_g = house_config.DAY1_K_HX_BY_GROUP_W_K[group_name]
+        day1_g = priors.DAY1_K_HX_BY_GROUP_W_K[group_name]
         cap_g = min(
             1.45 * day1_g,
-            0.75 * flows[group_name] * house_config.WATER_POWER_FACTOR_W_PER_LMIN_K,
+            0.75 * flows[group_name] * priors.WATER_POWER_FACTOR_W_PER_LMIN_K,
         )
         return max(1.0, min(cap_g, max(0.4 * day1_g, raw_val)))
 
@@ -1657,7 +1637,7 @@ def calibrate_k_hx_robust(
     # Pass 2: Calibrate `kantoor` (`kt`) using updated BG `K_hx`
     kt_vals: list[float] = []
     kt_wts: list[float] = []
-    day1_kt = house_config.DAY1_K_HX_BY_GROUP_W_K["kantoor"]
+    day1_kt = priors.DAY1_K_HX_BY_GROUP_W_K["kantoor"]
 
     for k in steady_indices:
         if hist.u_eff_kt[k] < 0.98:
@@ -1718,8 +1698,8 @@ def _opt_col_temp(
 
 def check_seasonal_calibration_gate(
     columns: Mapping[str, Sequence[float | int]],
-    lat_deg: float = house_config.LATITUDE_DEG,
-    lon_deg: float = house_config.LONGITUDE_DEG,
+    lat_deg: float = priors.LATITUDE_DEG,
+    lon_deg: float = priors.LONGITUDE_DEG,
 ) -> tuple[bool, str]:
     """Evaluates autonomous Layer-1 seasonal & cooling gate (`mean_7d < 14 °C`).
 
@@ -1810,18 +1790,18 @@ def check_seasonal_calibration_gate(
 
 
 # ============================================================================
-# 5. Choice A2 Joint Multi-Horizon Trajectory MAP Calibration + Holdout Gate
+# 5. Joint Multi-Horizon Trajectory MAP Calibration + Out-of-Sample Gate
 # ============================================================================
 def _active_bounds_for_zone(
     zone: contracts.ZoneId,
 ) -> dict[str, contracts.ParameterBounds]:
     """Returns active parameter box bounds and priors for `zone`."""
     raw = (
-        house_config.PARAM_BOUNDS_WK
+        priors.PARAM_BOUNDS_WK
         if zone == "wk"
-        else house_config.PARAM_BOUNDS_KT
+        else priors.PARAM_BOUNDS_KT
     )
-    if house_config.FIT_INTERFLOOR_CONDUCTANCE:
+    if priors.FIT_INTERFLOOR_CONDUCTANCE:
         return dict(raw)
     skip = "h_up_w_k" if zone == "wk" else "h_down_w_k"
     return {k: v for k, v in raw.items() if k != skip}
@@ -1845,10 +1825,25 @@ def _blend_zone_parameters(
     old_p: contracts.ZoneParameters,
     new_p: contracts.ZoneParameters,
     alpha_new: float,
+    *,
+    keep_new_khx: bool = False,
 ) -> contracts.ZoneParameters:
-    """Linearly blends `old_p` and `new_p` with weight `alpha_new`."""
+    """Linearly blends `old_p` and `new_p` with weight `alpha_new`.
+
+    Args:
+        old_p: Active `ZoneParameters` prior to calibration.
+        new_p: Newly estimated MAP `ZoneParameters`.
+        alpha_new: Weight on `new_p` in `[0.0, 1.0]`.
+        keep_new_khx: When True, preserves `new_p.k_hx_w_k` directly because
+            `k_hx_w_k` was already damped upstream.
+    """
     a = min(1.0, max(0.0, alpha_new))
     b = 1.0 - a
+    k_hx_blended = (
+        new_p.k_hx_w_k
+        if keep_new_khx
+        else (b * old_p.k_hx_w_k + a * new_p.k_hx_w_k)
+    )
     return contracts.ZoneParameters(
         c_air_wh_k=old_p.c_air_wh_k,
         c_floor_wh_k=b * old_p.c_floor_wh_k + a * new_p.c_floor_wh_k,
@@ -1859,7 +1854,7 @@ def _blend_zone_parameters(
         a_sol_m2=b * old_p.a_sol_m2 + a * new_p.a_sol_m2,
         tau_d_h=old_p.tau_d_h,
         eta_ac=b * old_p.eta_ac + a * new_p.eta_ac,
-        k_hx_w_k=b * old_p.k_hx_w_k + a * new_p.k_hx_w_k,
+        k_hx_w_k=k_hx_blended,
         h_up_w_k=b * old_p.h_up_w_k + a * new_p.h_up_w_k,
         c_wind=b * old_p.c_wind + a * new_p.c_wind,
     )
@@ -1883,15 +1878,18 @@ def calibrate_zone_a2(
     memory: contracts.ParameterPosteriorMemory | None = None,
     flow_rates_l_min: Mapping[str, float] | None = None,
     k_hx_by_group: Mapping[str, float] | None = None,
-    lat_deg: float = house_config.LATITUDE_DEG,
-    lon_deg: float = house_config.LONGITUDE_DEG,
+    lat_deg: float = priors.LATITUDE_DEG,
+    lon_deg: float = priors.LONGITUDE_DEG,
     *,
-    precomputed_train_hist: evaluation.PreprocessedHistory | None = None,
-    precomputed_holdout_hist: evaluation.PreprocessedHistory | None = None,
-    precomputed_holdout_prior_hist: evaluation.PreprocessedHistory | None = None,
+    precomputed_train_hist: preprocessing.PreprocessedHistory | None = None,
+    precomputed_holdout_hist: preprocessing.PreprocessedHistory | None = None,
+    precomputed_holdout_prior_hist: (
+        preprocessing.PreprocessedHistory | None
+    ) = None,
     is_lts_row: Sequence[bool] | None = None,
+    khx_already_damped: bool = False,
 ) -> tuple[contracts.CalibrationZoneOutcome, contracts.ParameterPosteriorMemory]:
-    """Runs Choice A2 Multi-Horizon Trajectory MAP + Out-of-Sample Holdout Gate.
+    """Runs Joint Multi-Horizon Trajectory MAP + Out-of-Sample Holdout Gate.
 
     Args:
         columns: Full RingBuffer telemetry columns (up to 90 days).
@@ -1899,10 +1897,18 @@ def calibrate_zone_a2(
         current_params: Active `ZoneParameters` prior to calibration.
         mode: `"manual"` (direct MAP on acceptance) or `"auto_weekly"`
             (`0.80 * old + 0.20 * map` damped update with seasonal gate).
-        episode_bank: Optional Choice D3 365-day `SeasonalEpisodeBank`.
-        memory: Optional Choice D2 `ParameterPosteriorMemory`.
+        episode_bank: Optional 365-day `SeasonalEpisodeBank`.
+        memory: Optional seasonal `ParameterPosteriorMemory`.
         flow_rates_l_min: Optional manifold rotameter flow rates [L/min].
         k_hx_by_group: Optional candidate `K_hx` [W/K] per hydraulic group.
+        lat_deg: Observer latitude in degrees North.
+        lon_deg: Observer longitude in degrees East.
+        precomputed_train_hist: Optional precomputed training history.
+        precomputed_holdout_hist: Optional precomputed holdout history.
+        precomputed_holdout_prior_hist: Optional precomputed Day-1 holdout hist.
+        is_lts_row: Optional precomputed LTS backfill mask.
+        khx_already_damped: True when `k_hx_by_group` was already damped by
+            `0.20` upstream (prevents double-damping in `auto_weekly` mode).
 
     Returns:
         Tuple `(outcome, updated_memory)`.
@@ -1911,9 +1917,9 @@ def calibrate_zone_a2(
     n_total = len(ts_all)
     ts_now = int(ts_all[-1]) if n_total > 0 else 0
     day1_prior = (
-        house_config.DAY1_PRIORS_WK
+        priors.DAY1_PRIORS_WK
         if zone == "wk"
-        else house_config.DAY1_PRIORS_KT
+        else priors.DAY1_PRIORS_KT
     )
     active_bounds = _active_bounds_for_zone(zone)
     param_names = list(active_bounds.keys())
@@ -2006,8 +2012,8 @@ def calibrate_zone_a2(
                 fallback_mem,
             )
 
-    # Shared raw-aware chronological Train / Holdout split (F1)
-    train_end = evaluation.compute_train_holdout_split(
+    # Shared raw-aware chronological Train / Holdout split
+    train_end = preprocessing.compute_train_holdout_split(
         columns, is_lts_row=is_lts_row
     )
     holdout_steps = n_total - train_end
@@ -2021,7 +2027,7 @@ def calibrate_zone_a2(
     def _get_holdout_cols() -> Mapping[str, Sequence[float | int]]:
         nonlocal holdout_cols_cache
         if holdout_cols_cache is None:
-            holdout_cols_cache = evaluation.slice_columns(
+            holdout_cols_cache = preprocessing.slice_columns(
                 columns, holdout_slice_start, n_total
             )
         return holdout_cols_cache
@@ -2042,8 +2048,8 @@ def calibrate_zone_a2(
     ):
         hist_train = precomputed_train_hist
     else:
-        train_cols = evaluation.slice_columns(columns, 0, train_end)
-        hist_train = evaluation.preprocess_history_columns(
+        train_cols = preprocessing.slice_columns(columns, 0, train_end)
+        hist_train = preprocessing.preprocess_history_columns(
             train_cols,
             flow_rates_l_min=flow_rates_l_min,
             k_hx_by_group=k_hx_by_group,
@@ -2051,7 +2057,7 @@ def calibrate_zone_a2(
             lat_deg=lat_deg,
             lon_deg=lon_deg,
         )
-    states_init = evaluation.reconstruct_states_tuples(
+    states_init = kalman_tape.reconstruct_states_tuples(
         hist_train, zone, current_params
     )
     d_init = [st[2] for st in states_init]
@@ -2061,11 +2067,11 @@ def calibrate_zone_a2(
         hist_train, zone, d_init, min_k0=min_spin_train, max_per_regime=20
     )
 
-    # External seasonal episodes from Choice D3 EpisodeBank (zero holdout leak)
+    # External seasonal episodes from EpisodeBank (zero holdout leak)
     ext_episodes: list[
         tuple[
             StoredEpisode,
-            evaluation.PrecomputedZoneTape,
+            kalman_tape.PrecomputedZoneTape,
         ]
     ] = []
     if episode_bank is not None:
@@ -2078,7 +2084,7 @@ def calibrate_zone_a2(
             )
             if overlaps_train:
                 continue
-            ep_hist = evaluation.preprocess_history_columns(
+            ep_hist = preprocessing.preprocess_history_columns(
                 ep.columns,
                 flow_rates_l_min=flow_rates_l_min,
                 k_hx_by_group=k_hx_by_group,
@@ -2088,7 +2094,7 @@ def calibrate_zone_a2(
             )
             if ep_hist.n_rows > ep.spinup_steps + 12:
                 ext_episodes.append(
-                    (ep, evaluation.get_zone_tape(ep_hist, zone))
+                    (ep, kalman_tape.get_zone_tape(ep_hist, zone))
                 )
 
     if not train_windows and not ext_episodes:
@@ -2155,7 +2161,7 @@ def calibrate_zone_a2(
 
     # Precompute 1D parameter-independent tapes & window specs once before LM
     train_tape = (
-        evaluation.get_zone_tape(hist_train, zone) if train_windows else None
+        kalman_tape.get_zone_tape(hist_train, zone) if train_windows else None
     )
     train_specs: list[tuple[int, int, Sequence[int], float]] = [
         (
@@ -2168,7 +2174,7 @@ def calibrate_zone_a2(
     ]
     ext_specs: list[
         tuple[
-            evaluation.PrecomputedZoneTape,
+            kalman_tape.PrecomputedZoneTape,
             list[tuple[int, int, Sequence[int], float]],
         ]
     ] = []
@@ -2207,13 +2213,13 @@ def calibrate_zone_a2(
         residuals: list[float] = []
         if train_tape is not None and train_specs:
             residuals.extend(
-                evaluation.evaluate_windows_on_tape(
+                kalman_tape.evaluate_windows_on_tape(
                     train_tape, cand_p, train_specs
                 )
             )
         for ep_tape, ep_spec in ext_specs:
             residuals.extend(
-                evaluation.evaluate_windows_on_tape(ep_tape, cand_p, ep_spec)
+                kalman_tape.evaluate_windows_on_tape(ep_tape, cand_p, ep_spec)
             )
         return residuals
 
@@ -2254,7 +2260,10 @@ def calibrate_zone_a2(
         params_candidate = params_map_raw
     else:
         params_candidate = _blend_zone_parameters(
-            current_params, params_map_raw, alpha_new=0.20
+            current_params,
+            params_map_raw,
+            alpha_new=0.20,
+            keep_new_khx=khx_already_damped,
         )
 
     # Out-of-sample evaluation on unseen holdout slice with shared ref d_act
@@ -2264,7 +2273,7 @@ def calibrate_zone_a2(
     ):
         hist_hold = precomputed_holdout_hist
     else:
-        hist_hold = evaluation.preprocess_history_columns(
+        hist_hold = preprocessing.preprocess_history_columns(
             _get_holdout_cols(),
             flow_rates_l_min=flow_rates_l_min,
             k_hx_by_group=k_hx_by_group,
@@ -2272,20 +2281,22 @@ def calibrate_zone_a2(
             lat_deg=lat_deg,
             lon_deg=lon_deg,
         )
-    states_hold_ref = evaluation.reconstruct_states_tuples(
+    states_hold_ref = kalman_tape.reconstruct_states_tuples(
         hist_hold, zone, params_map_raw
     )
     ref_d_hold = [s[2] for s in states_hold_ref]
 
-    k_hx_prior_hold = dict(house_config.DAY1_K_HX_BY_GROUP_W_K)
-    k_hx_prior_hold["wk" if zone == "wk" else "kantoor"] = day1_prior.k_hx_w_k
+    k_hx_prior_hold = dict(priors.DAY1_K_HX_BY_GROUP_W_K)
+    k_hx_prior_hold[preprocessing.zone_to_hydraulic_group(zone)] = (
+        day1_prior.k_hx_w_k
+    )
     if (
         precomputed_holdout_prior_hist is not None
         and precomputed_holdout_prior_hist.n_rows == n_hold
     ):
         hist_hold_prior = precomputed_holdout_prior_hist
     else:
-        hist_hold_prior = evaluation.recompute_history_for_khx(
+        hist_hold_prior = preprocessing.recompute_history_for_khx(
             hist_hold,
             _get_holdout_cols(),
             flow_rates_l_min=flow_rates_l_min,
@@ -2501,9 +2512,23 @@ def posterior_memory_from_dict(
     data: Mapping[str, Any] | None,
 ) -> contracts.ParameterPosteriorMemory | None:
     """Deserializes `ParameterPosteriorMemory` from a persisted dict."""
-    if not data or "mean" not in data or "precision" not in data:
+    if not isinstance(data, Mapping):
         return None
+    raw_mean = data.get("mean")
+    raw_prec = data.get("precision")
+    if not isinstance(raw_mean, Mapping) or not isinstance(raw_prec, Mapping):
+        return None
+    mean: dict[str, float] = {}
+    precision: dict[str, float] = {}
+    for k, mean_val in raw_mean.items():
+        key = str(k)
+        prec_val = raw_prec.get(key)
+        if preprocessing.is_finite_number(
+            mean_val
+        ) and preprocessing.is_finite_number(prec_val):
+            mean[key] = float(mean_val)
+            precision[key] = float(prec_val)
     return contracts.ParameterPosteriorMemory(
-        mean={str(k): float(v) for k, v in data["mean"].items()},
-        precision={str(k): float(v) for k, v in data["precision"].items()},
+        mean=mean,
+        precision=precision,
     )

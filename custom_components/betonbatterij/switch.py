@@ -1,4 +1,8 @@
-"""Switch platform for BetonBatterij (`switch.betonbatterij_auto_kalibratie`)."""
+"""Switch platform for BetonBatterij (`switch.betonbatterij_auto_kalibratie`).
+
+Exposes a single persistent configuration switch controlling whether the
+coordinator executes automatic weekly Sunday `03:15` MAP parameter calibration.
+"""
 
 from __future__ import annotations
 
@@ -31,7 +35,12 @@ PARALLEL_UPDATES = 0
 class BetonBatterijAutoKalibratieSwitch(
     CoordinatorEntity["BetonBatterijCoordinator"], RestoreEntity, SwitchEntity
 ):
-    """Toggle weekly Sunday `03:15` automatic MAP parameter calibration."""
+    """Configuration switch gating weekly Sunday `03:15` MAP calibration.
+
+    Restores its previous on/off preference via `RestoreEntity` when no value
+    has yet been persisted in the coordinator's `.storage` state document, and
+    delegates all mutations to `coordinator.async_set_auto_calibrate`.
+    """
 
     _attr_has_entity_name = True
     _attr_translation_key = "auto_kalibratie"

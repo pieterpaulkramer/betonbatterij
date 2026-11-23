@@ -1,14 +1,30 @@
-"""Immutable domain contracts for Layer 1 Digital Twin and Layer 2 API.
+"""Immutable domain contracts and Layer-2 protocol for BetonBatterij.
 
-Zero `homeassistant.*` imports are allowed inside `domain/`.
+This is a pure leaf module with zero internal package imports and zero
+`homeassistant.*`, `numpy`, or `scipy` dependencies. All state, parameter,
+forecast, and evaluation records are immutable (`frozen=True, slots=True`)
+dataclasses, and `ThermalTwinProtocol` defines the read-only Layer-2 boundary.
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
-from typing import Literal, TypeAlias
+from collections.abc import Mapping, Sequence
+from dataclasses import MISSING, dataclass, field, fields
+import math
+from typing import Any, Literal, Protocol, TypeAlias, runtime_checkable
 
 ZoneId: TypeAlias = Literal["wk", "kt"]
+
+
+def _parse_finite_float(raw: Any) -> float | None:
+    """Returns `float(raw)` if `raw` is a finite non-boolean number, else None."""
+    if raw is None or isinstance(raw, bool):
+        return None
+    try:
+        fval = float(raw)
+    except (TypeError, ValueError):
+        return None
+    return fval if math.isfinite(fval) else None
 
 
 @dataclass(frozen=True, slots=True)
@@ -75,10 +91,56 @@ class ZoneParameters:
     h_up_w_k: float = 0.0
     c_wind: float = 0.0
 
+    def to_dict(self) -> dict[str, float]:
+        """Serializes all scalar parameters to a plain `dict[str, float]`."""
+        return {f.name: float(getattr(self, f.name)) for f in fields(self)}
+
+    @classmethod
+    def from_dict(
+        cls,
+        raw: Mapping[str, Any] | None,
+        defaults: ZoneParameters | None = None,
+    ) -> ZoneParameters:
+        """Deserializes `ZoneParameters` with strict finite-float checks.
+
+        Args:
+            raw: Serialized parameter mapping (or `None`).
+            defaults: Optional fallback `ZoneParameters` supplying missing or
+                non-finite fields.
+
+        Returns:
+            Constructed immutable `ZoneParameters`.
+
+        Raises:
+            ValueError: If `defaults` is `None` and `raw` omits or provides a
+                non-finite value for any required field.
+        """
+        if not isinstance(raw, Mapping):
+            if defaults is not None:
+                return defaults
+            raise ValueError(
+                "Cannot deserialize ZoneParameters from non-mapping without "
+                "defaults"
+            )
+        kwargs: dict[str, float] = {}
+        for f in fields(cls):
+            parsed = _parse_finite_float(raw.get(f.name))
+            if parsed is not None:
+                kwargs[f.name] = parsed
+            elif defaults is not None:
+                kwargs[f.name] = float(getattr(defaults, f.name))
+            elif f.default is not MISSING:
+                kwargs[f.name] = float(f.default)
+            else:
+                raise ValueError(
+                    f"Missing or non-finite ZoneParameters field '{f.name}'"
+                )
+        return cls(**kwargs)
+
 
 @dataclass(frozen=True, slots=True)
 class CopParameters:
-    """Calibrated Panasonic 9 kW T-CAP COP curve parameters (Component 6).
+    """Calibrated Panasonic 9 kW T-CAP Carnot COP curve parameters.
 
     Attributes:
         eta_carnot_cv: Space-heating Carnot efficiency factor [-].
@@ -92,10 +154,57 @@ class CopParameters:
     eta_carnot_dhw: float = 0.34
     delta_p_wp_bias_w: float = 145.0
 
+    def to_dict(self) -> dict[str, float]:
+        """Serializes all COP parameters to a plain `dict[str, float]`."""
+        return {f.name: float(getattr(self, f.name)) for f in fields(self)}
+
+    @classmethod
+    def from_dict(
+        cls,
+        raw: Mapping[str, Any] | None,
+        defaults: CopParameters | None = None,
+    ) -> CopParameters:
+        """Deserializes `CopParameters` with finite-float checks and fallback.
+
+        Args:
+            raw: Serialized COP parameter mapping (or `None`).
+            defaults: Optional fallback `CopParameters` (defaults to `cls()`).
+
+        Returns:
+            Constructed immutable `CopParameters`.
+        """
+        base = defaults if defaults is not None else cls()
+        if not isinstance(raw, Mapping):
+            return base
+        kwargs: dict[str, float] = {}
+        for f in fields(cls):
+            parsed = _parse_finite_float(raw.get(f.name))
+            kwargs[f.name] = (
+                parsed if parsed is not None else float(getattr(base, f.name))
+            )
+        return cls(**kwargs)
+
 
 @dataclass(frozen=True, slots=True)
 class ZoneSnapshot:
-    """Real-time O(1) readout of a modeled zone for HA sensors and Layer 2."""
+    """Real-time O(1) readout of a modeled zone for HA sensors and Layer 2.
+
+    Attributes:
+        zone: Zone identifier (`"wk"` or `"kt"`).
+        ts_utc: UTC epoch timestamp of the latest processed step [s].
+        state: Latest posterior 3-state vector `[T_air, T_floor, d_est]`.
+        t_surface_est_c: Estimated PVC floor surface temperature [°C].
+        t_air_meas_c: Latest valid measured air temperature [°C], or `None`.
+        t_floor_std_c: Kalman posterior 1-sigma uncertainty on `T_floor` [°C].
+        q_fh_now_w: Latest estimated floor heating power [W].
+        t_hindcast_6h_c: Latest published 6-hour open-loop hindcast [°C].
+        sensor_stale: True when the room ZHA thermometer is stale.
+        open_window_active: True when the open-window Kalman guard is active.
+        stored_slab_energy_wh: Thermal energy stored in slab above `T_air` [Wh].
+        params: Active physical `ZoneParameters` for the zone.
+        rmse_6h_c: Latest 14-day overall 6h hindcast RMSE [°C], or `None`.
+        warmup_remaining_min: Remaining 6h hindcast FIFO warmup duration [min].
+    """
 
     zone: ZoneId
     ts_utc: int
@@ -110,6 +219,7 @@ class ZoneSnapshot:
     stored_slab_energy_wh: float
     params: ZoneParameters
     rmse_6h_c: float | None
+    warmup_remaining_min: int = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -208,7 +318,7 @@ class ZoneEvaluationReport:
 
 @dataclass(frozen=True, slots=True)
 class ParameterPosteriorMemory:
-    """Bayesian precision-weighted seasonal memory (Choice D2)."""
+    """Bayesian precision-weighted seasonal posterior parameter memory."""
 
     mean: dict[str, float]
     precision: dict[str, float]
@@ -233,3 +343,108 @@ class CalibrationZoneOutcome:
     holdout_before: ZoneEvaluationReport
     holdout_after: ZoneEvaluationReport
     bound_warnings: list[str] = field(default_factory=list)
+
+
+@runtime_checkable
+class ThermalTwinProtocol(Protocol):
+    """Read-only structural protocol defining the Layer-1 -> Layer-2 contract.
+
+    Layer-2 optimization and MPC consumers interact with `DigitalTwinEngine`
+    exclusively through these side-effect-free query, rollout, and solver
+    export methods.
+    """
+
+    @property
+    def cop_params(self) -> CopParameters:
+        """Active calibrated heat-pump `CopParameters`."""
+        ...
+
+    def get_zone_snapshot(self, zone: ZoneId) -> ZoneSnapshot:
+        """Returns the latest O(1) immutable `ZoneSnapshot` for `zone`."""
+        ...
+
+    def simulate_step(
+        self,
+        zone: ZoneId,
+        state: ThermalState | None,
+        exog: ExogenousStepInput,
+        actuator: ActuatorStepInput | None = None,
+        dt_s: float = 300.0,
+        step_index: int = 0,
+    ) -> SimulationStepResult:
+        """Executes one side-effect-free forward ZOH step from `state`."""
+        ...
+
+    def simulate_horizon(
+        self,
+        zone: ZoneId,
+        exog_forecast: Sequence[ExogenousStepInput],
+        actuators: (
+            Sequence[ActuatorStepInput] | ActuatorStepInput | None
+        ) = None,
+        initial_state: ThermalState | None = None,
+        dt_s: float = 300.0,
+    ) -> list[SimulationStepResult]:
+        """Runs a side-effect-free multi-step ZOH rollout over `exog_forecast`."""
+        ...
+
+    def estimate_coast_duration(
+        self,
+        zone: ZoneId,
+        floor_temp_min_air_c: float,
+        exog_forecast: Sequence[ExogenousStepInput],
+        initial_state: ThermalState | None = None,
+        dt_s: float = 300.0,
+    ) -> CoastEstimate:
+        """Estimates passive coasting duration and slab overshoot at `Q_fh=0`."""
+        ...
+
+    def estimate_preheat_lead_time(
+        self,
+        zone: ZoneId,
+        target_temp_c: float,
+        exog_forecast: Sequence[ExogenousStepInput],
+        t_supply_sec_c: float = 30.0,
+        q_fh_max_w: float | None = None,
+        p_el_ac_w: float = 0.0,
+        initial_state: ThermalState | None = None,
+        max_surface_temp_c: float = 27.5,
+        dt_s: float = 300.0,
+    ) -> PreheatEstimate:
+        """Estimates preheat lead time to reach `target_temp_c`."""
+        ...
+
+    def estimate_total_sink_capacity_w(
+        self,
+        t_supply_sec_c: float,
+        open_zones: Sequence[str] | Mapping[str, float],
+    ) -> float:
+        """Estimates total secondary floor heat uptake [W] across `open_zones`."""
+        ...
+
+    def predict_cop_cv(
+        self,
+        t_out_c: float,
+        t_sup_c: float,
+        rh_out_pct: float = 80.0,
+    ) -> float:
+        """Predicts calibrated space-heating COP for `(t_out_c, t_sup_c, rh)`."""
+        ...
+
+    def predict_cop_dhw(
+        self,
+        t_out_c: float,
+        t_dhw_start_c: float,
+        t_dhw_target_c: float,
+        rh_out_pct: float = 80.0,
+    ) -> float:
+        """Predicts calibrated 2-stage DHW COP across `[start_c -> target_c]`."""
+        ...
+
+    def export_solver_model(
+        self,
+        zone: ZoneId,
+        dt_s: float = 1800.0,
+    ) -> LinearizedDiscreteModel:
+        """Exports linearized 2x2 ZOH matrices for external MILP/MPC solvers."""
+        ...

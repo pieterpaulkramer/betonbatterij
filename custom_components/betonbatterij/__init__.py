@@ -10,6 +10,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, Any, TypeAlias
 
 from .const import DOMAIN, VERSION
+from .ha_bridge._ha_compat import callback
 
 if TYPE_CHECKING:
     from homeassistant.config_entries import ConfigEntry
@@ -67,12 +68,17 @@ def build_device_info(entry_id: str) -> DeviceInfo:
         }
 
 
+@callback
 def async_get_engine(hass: HomeAssistant) -> DigitalTwinEngine | None:
     """Return the active `DigitalTwinEngine` instance for Layer 2 consumers."""
     loaded = hass.config_entries.async_loaded_entries(DOMAIN)
     if not loaded:
         return None
-    coordinator: BetonBatterijCoordinator = loaded[0].runtime_data
+    coordinator: BetonBatterijCoordinator | None = getattr(
+        loaded[0], "runtime_data", None
+    )
+    if coordinator is None:
+        return None
     return coordinator.engine
 
 
@@ -80,10 +86,8 @@ async def async_setup_entry(
     hass: HomeAssistant, entry: BetonBatterijConfigEntry
 ) -> bool:
     """Set up BetonBatterij Layer 1 Digital Twin from a config entry."""
-    from .ha_bridge.coordinator import (
-        BetonBatterijCoordinator,
-        extract_flow_rates_from_entry,
-    )
+    from .ha_bridge.coordinator import BetonBatterijCoordinator
+    from .ha_bridge.row_utils import extract_flow_rates_from_entry
 
     coordinator = BetonBatterijCoordinator(hass, entry)
     await coordinator.async_config_entry_first_refresh()

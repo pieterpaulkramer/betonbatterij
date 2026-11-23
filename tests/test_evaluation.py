@@ -26,11 +26,14 @@ import pathlib
 from typing import Any
 
 from custom_components.betonbatterij import const
-from custom_components.betonbatterij import house_config
+from custom_components.betonbatterij.domain import calibration
 from custom_components.betonbatterij.domain import contracts
 from custom_components.betonbatterij.domain import engine
 from custom_components.betonbatterij.domain import evaluation
 from custom_components.betonbatterij.domain import hydraulics
+from custom_components.betonbatterij.domain import preprocessing
+from custom_components.betonbatterij.domain import priors
+from custom_components.betonbatterij.domain import reporting
 from custom_components.betonbatterij.domain import solar_weather
 from custom_components.betonbatterij.domain import zoh_kalman
 from custom_components.betonbatterij.ha_bridge import storage_ring
@@ -60,7 +63,7 @@ def _generate_synthetic_columns(
         cols[c] = [0.0] * n_steps
 
     flows = const.DEFAULT_FLOW_RATES_L_MIN
-    k_hx_map = dict(house_config.DAY1_K_HX_BY_GROUP_W_K)
+    k_hx_map = dict(priors.DAY1_K_HX_BY_GROUP_W_K)
     k_hx_map["wk"] = params_wk.k_hx_w_k
     k_hx_map["gang"] = params_wk.k_hx_w_k * (flows["gang"] / flows["wk"])
     k_hx_map["kantoor"] = params_kt.k_hx_w_k
@@ -77,7 +80,7 @@ def _generate_synthetic_columns(
     for k in range(n_steps):
         ts_k = start_ts_utc + k * const.DT_STEP_S
         day_idx = k // const.STEPS_PER_DAY
-        hr_loc, mn_loc = solar_weather.local_hour_minute(ts_k)
+        hr_loc, mn_loc = preprocessing.local_hour_minute(ts_k)
         mins_loc = hr_loc * 60 + mn_loc
 
         fl = const.FLAG_VALID_WK | const.FLAG_VALID_KT | const.FLAG_AANWEZIG
@@ -184,7 +187,7 @@ def _generate_synthetic_columns(
             * max(0.0, t_top - st_kt.t_floor_c)
         )
         p_prim = (q_exp_wk + q_exp_gang + q_exp_kt) if f_hz > 0.0 else 0.0
-        t_bot_raw = t_bot_cal - house_config.BUF_BOT_SENSOR_OFFSET_C
+        t_bot_raw = t_bot_cal - priors.BUF_BOT_SENSOR_OFFSET_C
 
         hyd_res = hyd.step(
             dt_s=float(const.DT_STEP_S),
@@ -231,8 +234,8 @@ def _generate_synthetic_columns(
             last_valid_cache=interfloor_cache,
             ts_utc=ts_k,
         )
-        t_dn_wk = house_config.T_GROUND_MEAN_C
-        q_int_wk = house_config.BASELOAD_WK_W + max(
+        t_dn_wk = priors.T_GROUND_MEAN_C
+        q_int_wk = priors.BASELOAD_WK_W + max(
             0.0, hyd_res.q_leak_1e_to_wk_w
         )
         q_int_kt, q_ac_base = solar_weather.compute_internal_and_ac_loads_kt(
@@ -247,7 +250,7 @@ def _generate_synthetic_columns(
             desk_state=desk_state,
             dt_s=float(const.DT_STEP_S),
         )
-        q_ac_kt = evaluation.compute_ac_heating_power_w(
+        q_ac_kt = solar_weather.compute_ac_heating_power_w(
             p_el_ac_w=p_ac,
             ac_mode_code=ac_mode,
             ac_defrost=False,
@@ -353,7 +356,7 @@ def _generate_synthetic_columns(
 
 def test_live_hindcast_tracker_warmup_and_bit_exact_rollout() -> None:
     """Verifies `LiveHindcastTracker` matches offline 72-step ZOH bit-for-bit."""
-    params = house_config.DAY1_PRIORS_WK
+    params = priors.DAY1_PRIORS_WK
     tracker = evaluation.LiveHindcastTracker(
         horizon_steps=evaluation.HORIZON_6H_STEPS
     )
@@ -422,7 +425,7 @@ def test_live_hindcast_tracker_warmup_and_bit_exact_rollout() -> None:
 
 def test_live_hindcast_tracker_bridge_gap_reseed_and_persistence() -> None:
     """Verifies `to_dict`/`from_dict`, `bridge_gap`, and `reseed_from_history`."""
-    params = house_config.DAY1_PRIORS_WK
+    params = priors.DAY1_PRIORS_WK
     tracker = evaluation.LiveHindcastTracker()
     ex = contracts.ExogenousStepInput(
         t_out_c=4.0,
@@ -484,7 +487,7 @@ def test_live_hindcast_tracker_bridge_gap_reseed_and_persistence() -> None:
 def test_fair_x_prior_reconstruction_zero_enthalpy_jump() -> None:
     """Verifies `evaluate_14d_hindcast` reconstructs `x_prior(k0)` cleanly."""
     true_wk = dataclasses.replace(
-        house_config.DAY1_PRIORS_WK,
+        priors.DAY1_PRIORS_WK,
         c_floor_wh_k=4600.0,
         r_fh_k_kw=2.15,
         h_loss_w_k=49.0,
@@ -492,11 +495,11 @@ def test_fair_x_prior_reconstruction_zero_enthalpy_jump() -> None:
         k_hx_w_k=218.0,
     )
     cols = _generate_synthetic_columns(
-        n_days=7, params_wk=true_wk, params_kt=house_config.DAY1_PRIORS_KT
+        n_days=7, params_wk=true_wk, params_kt=priors.DAY1_PRIORS_KT
     )
 
     rep_clean = evaluation.evaluate_14d_hindcast(
-        cols, "wk", true_wk, house_config.DAY1_PRIORS_WK
+        cols, "wk", true_wk, priors.DAY1_PRIORS_WK
     )
     assert rep_clean.overall_6h.n_windows > 20
     assert rep_clean.overall_6h.rmse_end_c is not None
@@ -513,7 +516,7 @@ def test_fair_x_prior_reconstruction_zero_enthalpy_jump() -> None:
         float(v) + 8.0 for v in cols["t_floor_wk_c"]
     ]
     rep_poisoned = evaluation.evaluate_14d_hindcast(
-        cols_poisoned, "wk", true_wk, house_config.DAY1_PRIORS_WK
+        cols_poisoned, "wk", true_wk, priors.DAY1_PRIORS_WK
     )
 
     assert math.isclose(
@@ -530,7 +533,7 @@ def test_fair_x_prior_reconstruction_zero_enthalpy_jump() -> None:
     # Short history < 48h gracefully returns empty metrics without error
     short_cols = {k: v[:400] for k, v in cols.items()}
     rep_short = evaluation.evaluate_14d_hindcast(
-        short_cols, "wk", true_wk, house_config.DAY1_PRIORS_WK
+        short_cols, "wk", true_wk, priors.DAY1_PRIORS_WK
     )
     assert rep_short.overall_6h.n_windows == 0
     assert rep_short.overall_6h.rmse_end_c is None
@@ -538,17 +541,17 @@ def test_fair_x_prior_reconstruction_zero_enthalpy_jump() -> None:
 
 def test_causal_mid_window_truncation_on_evening_cooking_spike() -> None:
     """Verifies afternoon heating windows truncate causally before cooking."""
-    true_wk = house_config.DAY1_PRIORS_WK
+    true_wk = priors.DAY1_PRIORS_WK
     cols_cook = _generate_synthetic_columns(
         n_days=6,
         params_wk=true_wk,
-        params_kt=house_config.DAY1_PRIORS_KT,
+        params_kt=priors.DAY1_PRIORS_KT,
         inject_evening_cooking_wk=True,
     )
     cols_clean_ref = _generate_synthetic_columns(
         n_days=6,
         params_wk=true_wk,
-        params_kt=house_config.DAY1_PRIORS_KT,
+        params_kt=priors.DAY1_PRIORS_KT,
         inject_evening_cooking_wk=False,
     )
 
@@ -569,25 +572,25 @@ def test_causal_mid_window_truncation_on_evening_cooking_spike() -> None:
         int(cols_win["flags"][900]) | const.FLAG_OPEN_WIN_WK
     )
     rep_win = evaluation.evaluate_14d_hindcast(
-        cols_win, "wk", true_wk, house_config.DAY1_PRIORS_WK
+        cols_win, "wk", true_wk, priors.DAY1_PRIORS_WK
     )
     assert rep_win.overall_6h.n_windows >= 10
 
 
 def test_airco_heating_1h_hindcast_sensitivity_and_flank_trigger() -> None:
     """Verifies `kt` 1h AC hindcast (`H=12`) captures `eta_ac` sensitivity."""
-    true_kt = dataclasses.replace(house_config.DAY1_PRIORS_KT, eta_ac=4.35)
-    wrong_kt = dataclasses.replace(house_config.DAY1_PRIORS_KT, eta_ac=2.40)
+    true_kt = dataclasses.replace(priors.DAY1_PRIORS_KT, eta_ac=4.35)
+    wrong_kt = dataclasses.replace(priors.DAY1_PRIORS_KT, eta_ac=2.40)
 
     cols = _generate_synthetic_columns(
         n_days=6,
-        params_wk=house_config.DAY1_PRIORS_WK,
+        params_wk=priors.DAY1_PRIORS_WK,
         params_kt=true_kt,
     )
 
     rep_true = evaluation.evaluate_14d_hindcast(cols, "kt", true_kt, wrong_kt)
     rep_wrong = evaluation.evaluate_14d_hindcast(
-        cols, "kt", wrong_kt, house_config.DAY1_PRIORS_KT
+        cols, "kt", wrong_kt, priors.DAY1_PRIORS_KT
     )
 
     ac_true = rep_true.by_regime["airco_heating_1h"]
@@ -608,8 +611,8 @@ def test_atomic_export_csv_31_columns_and_fit_report_json(
     """Verifies atomic export writes 31 CSV columns + `fit_report.json`."""
     cols = _generate_synthetic_columns(
         n_days=3,
-        params_wk=house_config.DAY1_PRIORS_WK,
-        params_kt=house_config.DAY1_PRIORS_KT,
+        params_wk=priors.DAY1_PRIORS_WK,
+        params_kt=priors.DAY1_PRIORS_KT,
     )
     eng = engine.DigitalTwinEngine()
     eng.replay_48h_from_columns(cols)
@@ -624,7 +627,7 @@ def test_atomic_export_csv_31_columns_and_fit_report_json(
         rows = list(csv.reader(f_csv))
 
     assert len(rows[0]) == 31
-    assert tuple(rows[0]) == evaluation.CSV_EXPORT_COLUMNS
+    assert tuple(rows[0]) == reporting.CSV_EXPORT_COLUMNS
     assert "t_surf_wk_c" in rows[0]
     assert "t_surf_kt_c" in rows[0]
     assert "p_wp_raw_el_w" in rows[0]
@@ -638,10 +641,30 @@ def test_atomic_export_csv_31_columns_and_fit_report_json(
     assert "wk" in report["zones"] and "kt" in report["zones"]
     assert report["zones"]["wk"]["evaluation_14d"] is not None
 
-    csv2, json2 = evaluation.export_csv_and_report(
+    csv2, json2 = reporting.export_csv_and_report(
         tmp_path / "sub", {k: v[:20] for k, v in cols.items()}, report
     )
     assert pathlib.Path(csv2).is_file() and pathlib.Path(json2).is_file()
+
+    # Verify calibrated `gang` K_hx in `fit_report["k_hx_by_group_w_k"]` is
+    # preserved during CSV export (higher gang K_hx raises `q_sec_tot_w`).
+    report_high_gang = dict(report)
+    report_high_gang["k_hx_by_group_w_k"] = {
+        **report["k_hx_by_group_w_k"],
+        "gang": 220.0,
+    }
+    csv3, _ = reporting.export_csv_and_report(
+        tmp_path / "sub_gang", cols, report_high_gang
+    )
+    with open(csv_path, encoding="utf-8", newline="") as f1, open(
+        csv3, encoding="utf-8", newline=""
+    ) as f3:
+        r1 = list(csv.reader(f1))
+        r3 = list(csv.reader(f3))
+    q_tot_idx = r1[0].index("q_sec_tot_w")
+    q_tot_base = sum(float(row[q_tot_idx]) for row in r1[1:])
+    q_tot_gang = sum(float(row[q_tot_idx]) for row in r3[1:])
+    assert q_tot_gang > q_tot_base
 
 
 def test_digital_twin_engine_layer2_api_methods() -> None:
@@ -774,7 +797,7 @@ def test_digital_twin_engine_layer2_api_methods() -> None:
     assert lin_wk.gamma_ac_el_ref == (0.0, 0.0)
     assert lin_kt.gamma_ac_el_ref[0] > 0.0
     assert 15.0 < lin_wk.effective_tau_coast_h < 80.0
-    assert lin_wk.steady_loss_total_w_k > house_config.DAY1_PRIORS_WK.h_loss_w_k
+    assert lin_wk.steady_loss_total_w_k > priors.DAY1_PRIORS_WK.h_loss_w_k
 
     ex_zero = contracts.ExogenousStepInput(
         t_out_c=0.0,
@@ -825,6 +848,35 @@ def test_digital_twin_engine_layer2_api_methods() -> None:
         snap_wk.state.t_floor_c,
         abs_tol=1e-9,
     )
+
+    # Hardening: `None` values from JSON NaN sanitization never raise TypeError.
+    sanitized_none = dict(saved)
+    sanitized_none["last_q_fh_wk_w"] = None
+    sanitized_none["last_q_fh_kt_w"] = None
+    sanitized_none["posterior_std_wk"] = {"h_loss_w_k": None, "r_fh_k_kw": 0.1}
+    sanitized_none["posterior_std_kt"] = {"h_loss_w_k": None}
+    sanitized_none["corr_wk"] = {"h_loss_w_k": {"h_loss_w_k": 1.0, "a": None}}
+    sanitized_none["corr_kt"] = {"h_loss_w_k": {"h_loss_w_k": None}}
+    sanitized_none["memory_wk"] = {
+        "mean": {"h_loss_w_k": 55.0, "a_sol_m2": None},
+        "precision": {"h_loss_w_k": 0.25, "a_sol_m2": 1.0},
+    }
+    sanitized_none["memory_kt"] = {
+        "mean": {"h_loss_w_k": 35.0},
+        "precision": {"h_loss_w_k": None},
+    }
+    eng3 = engine.DigitalTwinEngine()
+    eng3.load_state_dict(sanitized_none)
+    assert eng3.get_zone_snapshot("wk").q_fh_now_w == 0.0
+    assert eng3.get_zone_fit_diagnostics("wk")["posterior_std"] == {
+        "r_fh_k_kw": 0.1
+    }
+    assert eng3.memory_wk is not None and "h_loss_w_k" in eng3.memory_wk.mean
+    assert "a_sol_m2" not in eng3.memory_wk.mean
+    assert eng3.memory_kt is not None and eng3.memory_kt.mean == {}
+    assert calibration.posterior_memory_from_dict(
+        {"mean": {"x": 1.0}, "precision": {"x": None}}
+    ) == contracts.ParameterPosteriorMemory(mean={}, precision={})
 
 
 def test_ringbuffer_float32_roundtrip_legacy_lts_detection_and_flat_bridging() -> None:
@@ -900,7 +952,7 @@ def test_ringbuffer_float32_roundtrip_legacy_lts_detection_and_flat_bridging() -
         rb.append_row(row)
 
     cols_f32 = rb.get_columns()
-    is_lts, miss_prim = evaluation.detect_lts_and_missing_prim_rows(cols_f32)
+    is_lts, miss_prim = preprocessing.detect_lts_and_missing_prim_rows(cols_f32)
     assert all(is_lts[:n_lts])
     assert all(miss_prim[:n_lts])
     assert not any(is_lts[n_lts:])
@@ -917,7 +969,7 @@ def test_compute_train_holdout_split_80d_lts_plus_10d_raw() -> None:
         "ts_utc": [t0 + k * const.DT_STEP_S for k in range(n_tot)],
         "flags": [const.FLAG_LTS_BACKFILL] * n_lts + [0] * n_raw,
     }
-    train_end = evaluation.compute_train_holdout_split(cols)
+    train_end = preprocessing.compute_train_holdout_split(cols)
     # 65% of 10d raw (= 6.5d = 1872 rows) in train, 35% (= 3.5d = 1008) holdout
     assert train_end == n_tot - int(round(0.35 * n_raw))
     assert train_end == n_lts + (n_raw - 1008)
@@ -931,7 +983,7 @@ def test_compute_train_holdout_split_80d_lts_plus_10d_raw() -> None:
         "flags": [0] * n_35d,
     }
     assert (
-        evaluation.compute_train_holdout_split(cols_a)
+        preprocessing.compute_train_holdout_split(cols_a)
         == n_35d - evaluation.EVAL_14D_STEPS
     )
 
@@ -942,7 +994,7 @@ def test_compute_train_holdout_split_80d_lts_plus_10d_raw() -> None:
         "ts_utc": [t0 + k * const.DT_STEP_S for k in range(n_7d + n_3d)],
         "flags": [const.FLAG_LTS_BACKFILL] * n_7d + [0] * n_3d,
     }
-    assert evaluation.compute_train_holdout_split(cols_c) == int(
+    assert preprocessing.compute_train_holdout_split(cols_c) == int(
         0.70 * (n_7d + n_3d)
     )
 
@@ -991,8 +1043,8 @@ def test_simulate_step_gamma_cal_f5a_without_scaling_solver_gamma_fh() -> None:
     # Public pure wrapper compute_14d_evaluation_reports
     cols = _generate_synthetic_columns(
         n_days=4,
-        params_wk=house_config.DAY1_PRIORS_WK,
-        params_kt=house_config.DAY1_PRIORS_KT,
+        params_wk=priors.DAY1_PRIORS_WK,
+        params_kt=priors.DAY1_PRIORS_KT,
     )
     ctx = eng.capture_calibration_context()
     rep_wk, rep_kt = eng.compute_14d_evaluation_reports(cols, ctx)

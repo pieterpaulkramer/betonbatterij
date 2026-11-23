@@ -1,35 +1,23 @@
-"""Diagnostics support for BetonBatterij (Integration Quality Scale Gold)."""
+"""Diagnostics support for BetonBatterij (Integration Quality Scale Gold).
+
+Exports a JSON-sanitized, location-redacted snapshot of coordinator configuration,
+clock-guard health, columnar ringbuffer status, active thermal zone states, COP
+curve parameters, and 14-day hindcast evaluation metrics.
+"""
 
 from __future__ import annotations
 
-from collections.abc import Mapping
-from dataclasses import asdict, is_dataclass
-import math
 from typing import Any
 
 from homeassistant.components.diagnostics import async_redact_data
 from homeassistant.core import HomeAssistant
 
 from . import BetonBatterijConfigEntry
+from .ha_bridge.row_utils import sanitize_json_value
 
 TO_REDACT: frozenset[str] = frozenset(
     {"latitude", "longitude", "unique_id"}
 )
-
-
-def _serialize_diagnostic_obj(obj: Any) -> Any:
-    """Convert dataclasses and mappings into `orjson`-safe JSON structures."""
-    if obj is None or isinstance(obj, (bool, int, str)):
-        return obj
-    if isinstance(obj, float):
-        return obj if math.isfinite(obj) else None
-    if is_dataclass(obj) and not isinstance(obj, type):
-        return _serialize_diagnostic_obj(asdict(obj))
-    if isinstance(obj, Mapping):
-        return {str(k): _serialize_diagnostic_obj(v) for k, v in obj.items()}
-    if isinstance(obj, (list, tuple)):
-        return [_serialize_diagnostic_obj(item) for item in obj]
-    return obj
 
 
 async def async_get_config_entry_diagnostics(
@@ -60,14 +48,14 @@ async def async_get_config_entry_diagnostics(
             "corrupt_chunks_recovered": rb.corrupt_chunks_recovered,
         },
         "zones": {
-            "wk": _serialize_diagnostic_obj(engine.get_zone_snapshot("wk")),
-            "kt": _serialize_diagnostic_obj(engine.get_zone_snapshot("kt")),
+            "wk": sanitize_json_value(engine.get_zone_snapshot("wk")),
+            "kt": sanitize_json_value(engine.get_zone_snapshot("kt")),
         },
-        "cop_params": _serialize_diagnostic_obj(engine.cop_params),
-        "cop_diagnostics": _serialize_diagnostic_obj(engine.cop_diagnostics),
+        "cop_params": sanitize_json_value(engine.cop_params),
+        "cop_diagnostics": sanitize_json_value(engine.cop_diagnostics),
         "evaluation_14d": {
-            "wk": _serialize_diagnostic_obj(engine.eval_report_wk),
-            "kt": _serialize_diagnostic_obj(engine.eval_report_kt),
+            "wk": sanitize_json_value(engine.eval_report_wk),
+            "kt": sanitize_json_value(engine.eval_report_kt),
         },
         "calibration_history_count": len(engine.calibration_history),
     }

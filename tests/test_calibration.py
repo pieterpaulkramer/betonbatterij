@@ -31,12 +31,14 @@ import time
 from typing import Any
 
 from custom_components.betonbatterij import const
-from custom_components.betonbatterij import house_config
 from custom_components.betonbatterij.domain import calibration
 from custom_components.betonbatterij.domain import contracts
 from custom_components.betonbatterij.domain import engine
 from custom_components.betonbatterij.domain import evaluation
 from custom_components.betonbatterij.domain import hydraulics
+from custom_components.betonbatterij.domain import kalman_tape
+from custom_components.betonbatterij.domain import preprocessing
+from custom_components.betonbatterij.domain import priors
 from custom_components.betonbatterij.domain import solar_weather
 from custom_components.betonbatterij.domain import zoh_kalman
 
@@ -66,7 +68,7 @@ def _generate_calibration_dataset(
         cols[c] = [0.0] * n_steps
 
     flows = const.DEFAULT_FLOW_RATES_L_MIN
-    k_hx_map = dict(house_config.DAY1_K_HX_BY_GROUP_W_K)
+    k_hx_map = dict(priors.DAY1_K_HX_BY_GROUP_W_K)
     k_hx_map["wk"] = params_wk.k_hx_w_k
     k_hx_map["gang"] = params_wk.k_hx_w_k * (flows["gang"] / flows["wk"])
     k_hx_map["kantoor"] = params_kt.k_hx_w_k
@@ -83,7 +85,7 @@ def _generate_calibration_dataset(
     for k in range(n_steps):
         ts_k = start_ts_utc + k * const.DT_STEP_S
         day_idx = k // const.STEPS_PER_DAY
-        hr_loc, mn_loc = solar_weather.local_hour_minute(ts_k)
+        hr_loc, mn_loc = preprocessing.local_hour_minute(ts_k)
         mins_loc = hr_loc * 60 + mn_loc
 
         fl = const.FLAG_VALID_WK | const.FLAG_VALID_KT | const.FLAG_AANWEZIG
@@ -185,7 +187,7 @@ def _generate_calibration_dataset(
             * max(0.0, t_top - st_kt.t_floor_c)
         )
         p_prim = (q_exp_wk + q_exp_gang + q_exp_kt) if f_hz > 0.0 else 0.0
-        t_bot_raw = t_bot_cal - house_config.BUF_BOT_SENSOR_OFFSET_C
+        t_bot_raw = t_bot_cal - priors.BUF_BOT_SENSOR_OFFSET_C
 
         hyd_res = hyd.step(
             dt_s=float(const.DT_STEP_S),
@@ -232,8 +234,8 @@ def _generate_calibration_dataset(
             last_valid_cache=interfloor_cache,
             ts_utc=ts_k,
         )
-        t_dn_wk = house_config.T_GROUND_MEAN_C
-        q_int_wk = house_config.BASELOAD_WK_W + max(
+        t_dn_wk = priors.T_GROUND_MEAN_C
+        q_int_wk = priors.BASELOAD_WK_W + max(
             0.0, hyd_res.q_leak_1e_to_wk_w
         )
         q_int_kt, q_ac_base = solar_weather.compute_internal_and_ac_loads_kt(
@@ -248,7 +250,7 @@ def _generate_calibration_dataset(
             desk_state=desk_state,
             dt_s=float(const.DT_STEP_S),
         )
-        q_ac_kt = evaluation.compute_ac_heating_power_w(
+        q_ac_kt = solar_weather.compute_ac_heating_power_w(
             p_el_ac_w=p_ac,
             ac_mode_code=ac_mode,
             ac_defrost=False,
@@ -412,7 +414,7 @@ def test_solve_b2_box_huber_lm_convergence_bounds_outliers_and_collinearity() ->
 def test_synthetic_multiday_parameter_recovery_wk_and_kt_a2_b2() -> None:
     """Verifies Choice A2 + B2 + `calibrate_k_hx_robust` recover `wk` & `kt`."""
     true_wk = dataclasses.replace(
-        house_config.DAY1_PRIORS_WK,
+        priors.DAY1_PRIORS_WK,
         c_floor_wh_k=4750.0,
         r_fh_k_kw=2.18,
         h_loss_w_k=51.0,
@@ -420,7 +422,7 @@ def test_synthetic_multiday_parameter_recovery_wk_and_kt_a2_b2() -> None:
         k_hx_w_k=218.0,
     )
     true_kt = dataclasses.replace(
-        house_config.DAY1_PRIORS_KT,
+        priors.DAY1_PRIORS_KT,
         c_floor_wh_k=1950.0,
         r_fh_k_kw=4.25,
         h_loss_w_k=36.0,
@@ -436,7 +438,7 @@ def test_synthetic_multiday_parameter_recovery_wk_and_kt_a2_b2() -> None:
     khx_fit = calibration.calibrate_k_hx_robust(
         cols,
         const.DEFAULT_FLOW_RATES_L_MIN,
-        house_config.DAY1_K_HX_BY_GROUP_W_K,
+        priors.DAY1_K_HX_BY_GROUP_W_K,
     )
     assert abs(khx_fit["wk"] - 218.0) / 218.0 < 0.05
     assert abs(khx_fit["kantoor"] - 48.0) / 48.0 < 0.06
@@ -444,7 +446,7 @@ def test_synthetic_multiday_parameter_recovery_wk_and_kt_a2_b2() -> None:
     out_wk, mem_wk = calibration.calibrate_zone_a2(
         cols,
         "wk",
-        house_config.DAY1_PRIORS_WK,
+        priors.DAY1_PRIORS_WK,
         mode="manual",
         flow_rates_l_min=const.DEFAULT_FLOW_RATES_L_MIN,
         k_hx_by_group=khx_fit,
@@ -457,7 +459,7 @@ def test_synthetic_multiday_parameter_recovery_wk_and_kt_a2_b2() -> None:
         < out_wk.holdout_before.overall_6h.j_eval_c
     )
     assert abs(out_wk.params_applied.h_loss_w_k - true_wk.h_loss_w_k) < abs(
-        house_config.DAY1_PRIORS_WK.h_loss_w_k - true_wk.h_loss_w_k
+        priors.DAY1_PRIORS_WK.h_loss_w_k - true_wk.h_loss_w_k
     )
     assert abs(out_wk.params_applied.a_sol_m2 - true_wk.a_sol_m2) < 0.40
     assert "c_floor_wh_k" in mem_wk.mean
@@ -465,7 +467,7 @@ def test_synthetic_multiday_parameter_recovery_wk_and_kt_a2_b2() -> None:
     out_kt, _ = calibration.calibrate_zone_a2(
         cols,
         "kt",
-        house_config.DAY1_PRIORS_KT,
+        priors.DAY1_PRIORS_KT,
         mode="manual",
         flow_rates_l_min=const.DEFAULT_FLOW_RATES_L_MIN,
         k_hx_by_group=khx_fit,
@@ -479,20 +481,20 @@ def test_synthetic_multiday_parameter_recovery_wk_and_kt_a2_b2() -> None:
     )
     assert abs(out_kt.params_applied.eta_ac - true_kt.eta_ac) < 0.35
     assert abs(out_kt.params_applied.h_loss_w_k - true_kt.h_loss_w_k) < abs(
-        house_config.DAY1_PRIORS_KT.h_loss_w_k - true_kt.h_loss_w_k
+        priors.DAY1_PRIORS_KT.h_loss_w_k - true_kt.h_loss_w_k
     )
 
     out_auto, _ = calibration.calibrate_zone_a2(
         cols,
         "wk",
-        house_config.DAY1_PRIORS_WK,
+        priors.DAY1_PRIORS_WK,
         mode="auto_weekly",
         flow_rates_l_min=const.DEFAULT_FLOW_RATES_L_MIN,
         k_hx_by_group=khx_fit,
     )
     assert out_auto.accepted is True
     expected_h_loss = (
-        0.80 * house_config.DAY1_PRIORS_WK.h_loss_w_k
+        0.80 * priors.DAY1_PRIORS_WK.h_loss_w_k
         + 0.20 * out_auto.params_map_raw.h_loss_w_k
     )
     assert math.isclose(
@@ -504,16 +506,16 @@ def test_cooling_exclusion_with_2h_tail_and_seasonal_gate() -> None:
     """Verifies autonomous seasonal gate (`<14 °C`) & +2.0h cooling tail."""
     cols = _generate_calibration_dataset(
         n_days=8,
-        params_wk=house_config.DAY1_PRIORS_WK,
-        params_kt=house_config.DAY1_PRIORS_KT,
+        params_wk=priors.DAY1_PRIORS_WK,
+        params_kt=priors.DAY1_PRIORS_KT,
     )
     ok_winter, _ = calibration.check_seasonal_calibration_gate(cols)
     assert ok_winter is True
 
     warm_cols = _generate_calibration_dataset(
         n_days=8,
-        params_wk=house_config.DAY1_PRIORS_WK,
-        params_kt=house_config.DAY1_PRIORS_KT,
+        params_wk=priors.DAY1_PRIORS_WK,
+        params_kt=priors.DAY1_PRIORS_KT,
         base_t_out_c=16.5,
     )
     ok_warm, msg_warm = calibration.check_seasonal_calibration_gate(warm_cols)
@@ -521,7 +523,7 @@ def test_cooling_exclusion_with_2h_tail_and_seasonal_gate() -> None:
     assert "14.0" in msg_warm
 
     out_blocked, _ = calibration.calibrate_zone_a2(
-        warm_cols, "wk", house_config.DAY1_PRIORS_WK, mode="auto_weekly"
+        warm_cols, "wk", priors.DAY1_PRIORS_WK, mode="auto_weekly"
     )
     assert out_blocked.accepted is False
     assert "Seasonal gate" in out_blocked.reason
@@ -546,13 +548,13 @@ def test_cooling_exclusion_with_2h_tail_and_seasonal_gate() -> None:
             int(cols_mid_cool["flags"][idx]) | const.FLAG_FLOOR_COOL
         )
 
-    hist = evaluation.preprocess_history_columns(cols_mid_cool)
+    hist = preprocessing.preprocess_history_columns(cols_mid_cool)
     for idx in range(c_start, c_end + 24 + 1):
         assert hist.cooling_or_tail[idx] is True
     assert hist.cooling_or_tail[c_end + 25] is False
 
     states, _, _, _ = evaluation.reconstruct_kalman_states(
-        hist, "wk", house_config.DAY1_PRIORS_WK
+        hist, "wk", priors.DAY1_PRIORS_WK
     )
     wins = calibration.extract_clean_regime_windows(
         hist, "wk", [s.d_est_w for s in states], min_k0=144
@@ -566,7 +568,7 @@ def test_cooling_exclusion_with_2h_tail_and_seasonal_gate() -> None:
 def test_seasonal_precision_memory_d2_and_episode_bank_d3() -> None:
     """Verifies Choice D2 Fisher gate & Choice D3 EpisodeBank across seasons."""
     bounds = {
-        k: v for k, v in house_config.PARAM_BOUNDS_WK.items() if k != "h_up_w_k"
+        k: v for k, v in priors.PARAM_BOUNDS_WK.items() if k != "h_up_w_k"
     }
 
     _, _, mem_autumn = calibration.update_posterior_memory(
@@ -616,7 +618,7 @@ def test_seasonal_precision_memory_d2_and_episode_bank_d3() -> None:
     )
 
     true_wk = dataclasses.replace(
-        house_config.DAY1_PRIORS_WK, h_loss_w_k=52.0, a_sol_m2=4.50
+        priors.DAY1_PRIORS_WK, h_loss_w_k=52.0, a_sol_m2=4.50
     )
     autumn_ts = int(
         datetime.datetime(
@@ -626,7 +628,7 @@ def test_seasonal_precision_memory_d2_and_episode_bank_d3() -> None:
     autumn_cols = _generate_calibration_dataset(
         n_days=6,
         params_wk=true_wk,
-        params_kt=house_config.DAY1_PRIORS_KT,
+        params_kt=priors.DAY1_PRIORS_KT,
         solar_enabled=True,
         start_ts_utc=autumn_ts,
     )
@@ -652,7 +654,7 @@ def test_seasonal_precision_memory_d2_and_episode_bank_d3() -> None:
     dark_winter_cols = _generate_calibration_dataset(
         n_days=8,
         params_wk=true_wk,
-        params_kt=house_config.DAY1_PRIORS_KT,
+        params_kt=priors.DAY1_PRIORS_KT,
         solar_enabled=False,
         start_ts_utc=winter_ts,
     )
@@ -660,20 +662,20 @@ def test_seasonal_precision_memory_d2_and_episode_bank_d3() -> None:
     out_no_bank, _ = calibration.calibrate_zone_a2(
         dark_winter_cols,
         "wk",
-        house_config.DAY1_PRIORS_WK,
+        priors.DAY1_PRIORS_WK,
         mode="manual",
         episode_bank=None,
     )
     assert math.isclose(
         out_no_bank.params_map_raw.a_sol_m2,
-        house_config.DAY1_PRIORS_WK.a_sol_m2,
+        priors.DAY1_PRIORS_WK.a_sol_m2,
         abs_tol=0.05,
     )
 
     out_with_bank, _ = calibration.calibrate_zone_a2(
         dark_winter_cols,
         "wk",
-        house_config.DAY1_PRIORS_WK,
+        priors.DAY1_PRIORS_WK,
         mode="manual",
         episode_bank=bank_restored,
     )
@@ -682,15 +684,15 @@ def test_seasonal_precision_memory_d2_and_episode_bank_d3() -> None:
 
 def test_holdout_rejection_gate_when_candidate_degrades() -> None:
     """Verifies holdout gate rejects candidates when unseen `J_eval` degrades."""
-    true_wk = house_config.DAY1_PRIORS_WK
+    true_wk = priors.DAY1_PRIORS_WK
     cols = _generate_calibration_dataset(
-        n_days=9, params_wk=true_wk, params_kt=house_config.DAY1_PRIORS_KT
+        n_days=9, params_wk=true_wk, params_kt=priors.DAY1_PRIORS_KT
     )
 
-    train_end = evaluation.compute_train_holdout_split(cols)
+    train_end = preprocessing.compute_train_holdout_split(cols)
     corrupted = {k: list(v) for k, v in cols.items()}
     for k in range(train_end):
-        hr, mn = solar_weather.local_hour_minute(int(corrupted["ts_utc"][k]))
+        hr, mn = preprocessing.local_hour_minute(int(corrupted["ts_utc"][k]))
         mins = hr * 60 + mn
         if 30 <= mins <= 390:
             corrupted["t_air_wk_c"][k] = float(
@@ -710,7 +712,7 @@ def test_holdout_rejection_gate_when_candidate_degrades() -> None:
 def test_engine_snapshot_stack_8_deep_rollback_reset_and_48h_replay() -> None:
     """Verifies 8-deep snapshot stack, rollback, reset, & 48h state replay."""
     true_wk = dataclasses.replace(
-        house_config.DAY1_PRIORS_WK,
+        priors.DAY1_PRIORS_WK,
         c_floor_wh_k=4700.0,
         r_fh_k_kw=2.18,
         h_loss_w_k=51.5,
@@ -718,7 +720,7 @@ def test_engine_snapshot_stack_8_deep_rollback_reset_and_48h_replay() -> None:
         k_hx_w_k=220.0,
     )
     true_kt = dataclasses.replace(
-        house_config.DAY1_PRIORS_KT,
+        priors.DAY1_PRIORS_KT,
         c_floor_wh_k=2000.0,
         r_fh_k_kw=4.30,
         h_loss_w_k=36.5,
@@ -750,14 +752,14 @@ def test_engine_snapshot_stack_8_deep_rollback_reset_and_48h_replay() -> None:
     assert len(eng_reloaded.episode_bank.get_episodes("wk")) > 0
 
     learned_wk = eng.get_zone_snapshot("wk").params
-    assert learned_wk != house_config.DAY1_PRIORS_WK
+    assert learned_wk != priors.DAY1_PRIORS_WK
     floor_after_cal = eng.get_zone_snapshot("wk").state.t_floor_c
     assert abs(floor_after_cal - floor_before_cal) > 0.02
     assert len(eng.hindcast_wk.queue) == evaluation.HORIZON_6H_STEPS
 
     eng.reset_parameters(cols)
     assert len(eng.snapshot_stack) == 2
-    assert eng.get_zone_snapshot("wk").params == house_config.DAY1_PRIORS_WK
+    assert eng.get_zone_snapshot("wk").params == priors.DAY1_PRIORS_WK
     assert math.isclose(
         eng.get_zone_snapshot("wk").state.t_floor_c,
         floor_before_cal,
@@ -785,13 +787,13 @@ def test_engine_snapshot_stack_8_deep_rollback_reset_and_48h_replay() -> None:
 
 
 def _reference_window_residuals(
-    hist: evaluation.PreprocessedHistory,
+    hist: preprocessing.PreprocessedHistory,
     zone: contracts.ZoneId,
     params: contracts.ZoneParameters,
     window_specs: Sequence[tuple[int, int, Sequence[int], float]],
 ) -> list[float]:
     """Reference evaluator via `reconstruct_kalman_states` + `propagate_open_loop_step`."""
-    exogs = evaluation.build_zone_exog_list(hist, zone)
+    exogs = preprocessing.build_zone_exog_list(hist, zone)
     states, _, _, _ = evaluation.reconstruct_kalman_states(
         hist, zone, params, exogs
     )
@@ -807,10 +809,10 @@ def _reference_window_residuals(
         ptr = 0
         for s in range(1, len_w + 1):
             idx = k0_w + s
-            q_fh_s = evaluation.step_q_fh_for_params(
+            q_fh_s = preprocessing.step_q_fh_for_params(
                 hist, zone, idx, st.t_floor_c, params
             )
-            q_ac_s = evaluation.step_q_ac_for_params(hist, zone, idx, params)
+            q_ac_s = preprocessing.step_q_ac_for_params(hist, zone, idx, params)
             st = zoh_kalman.propagate_open_loop_step(
                 state=st,
                 params=params,
@@ -828,7 +830,7 @@ def _reference_window_residuals(
 def test_fast_tape_evaluator_matches_reference_kalman_and_zoh_rollout() -> None:
     """Proves fast-tape residuals match reference Kalman + ZOH within `< 1e-11 °C`."""
     cand_wk = dataclasses.replace(
-        house_config.DAY1_PRIORS_WK,
+        priors.DAY1_PRIORS_WK,
         c_floor_wh_k=4820.0,
         r_fh_k_kw=2.21,
         h_loss_w_k=54.3,
@@ -837,7 +839,7 @@ def test_fast_tape_evaluator_matches_reference_kalman_and_zoh_rollout() -> None:
         c_wind=0.07,
     )
     cand_kt = dataclasses.replace(
-        house_config.DAY1_PRIORS_KT,
+        priors.DAY1_PRIORS_KT,
         c_floor_wh_k=1980.0,
         r_fh_k_kw=4.35,
         h_loss_w_k=35.2,
@@ -868,10 +870,10 @@ def test_fast_tape_evaluator_matches_reference_kalman_and_zoh_rollout() -> None:
             cols["u_eff_bg"][k] = 1.0
     cols["t_air_wk_c"][700] = float(cols["t_air_wk_c"][699]) - 0.85
 
-    hist = evaluation.preprocess_history_columns(cols)
+    hist = preprocessing.preprocess_history_columns(cols)
     for zone, cand_p in (("wk", cand_wk), ("kt", cand_kt)):
         z_id: contracts.ZoneId = "wk" if zone == "wk" else "kt"
-        st_init = evaluation.reconstruct_states_tuples(hist, z_id, cand_p)
+        st_init = kalman_tape.reconstruct_states_tuples(hist, z_id, cand_p)
         wins = calibration.extract_clean_regime_windows(
             hist, z_id, [s[2] for s in st_init], min_k0=144
         )
@@ -885,8 +887,8 @@ def test_fast_tape_evaluator_matches_reference_kalman_and_zoh_rollout() -> None:
             )
             for w in wins
         ]
-        tape = evaluation.build_zone_tape(hist, z_id)
-        res_fast = evaluation.evaluate_windows_on_tape(tape, cand_p, specs)
+        tape = kalman_tape.build_zone_tape(hist, z_id)
+        res_fast = kalman_tape.evaluate_windows_on_tape(tape, cand_p, specs)
         res_ref = _reference_window_residuals(hist, z_id, cand_p, specs)
         assert len(res_fast) == len(res_ref) > 25
         max_diff_c = max(
@@ -899,29 +901,29 @@ def test_fast_tape_evaluator_matches_reference_kalman_and_zoh_rollout() -> None:
 def test_lts_detection_and_filtering_in_khx_windows_episode_bank_and_cop() -> None:
     """Verifies LTS (`FLAG_LTS_BACKFILL` & legacy `v0.1.0`) filtering rules."""
     true_wk = dataclasses.replace(
-        house_config.DAY1_PRIORS_WK, k_hx_w_k=222.0, h_loss_w_k=52.0
+        priors.DAY1_PRIORS_WK, k_hx_w_k=222.0, h_loss_w_k=52.0
     )
     true_kt = dataclasses.replace(
-        house_config.DAY1_PRIORS_KT, k_hx_w_k=58.0, eta_ac=4.20
+        priors.DAY1_PRIORS_KT, k_hx_w_k=58.0, eta_ac=4.20
     )
     raw_cols = _generate_calibration_dataset(
         n_days=10, params_wk=true_wk, params_kt=true_kt
     )
 
     # 1. Synthetic RC + cosine dataset must have ZERO false-positive LTS flags.
-    is_lts_clean, miss_clean = evaluation.detect_lts_and_missing_prim_rows(
+    is_lts_clean, miss_clean = preprocessing.detect_lts_and_missing_prim_rows(
         raw_cols
     )
     assert not any(is_lts_clean)
     assert not any(miss_clean)
 
     # Synthetic minimal dict without `t_wp_out_c`/`t_wp_in_c` but finite `p_prim_th_w`
-    _, miss_synth = evaluation.detect_lts_and_missing_prim_rows(
+    _, miss_synth = preprocessing.detect_lts_and_missing_prim_rows(
         {"ts_utc": [1_760_000_000, 1_760_000_300], "p_prim_th_w": [0.0, 1800.0]}
     )
     assert miss_synth == [False, False]
 
-    _, miss_wp_nan = evaluation.detect_lts_and_missing_prim_rows(
+    _, miss_wp_nan = preprocessing.detect_lts_and_missing_prim_rows(
         {
             "ts_utc": [1_760_000_000, 1_760_000_300],
             "p_prim_th_w": [0.0, 0.0],
@@ -988,7 +990,7 @@ def test_lts_detection_and_filtering_in_khx_windows_episode_bank_and_cop() -> No
         if float(mixed_cols["f_comp_hz"][m]) > 5.0:
             mixed_cols["p_prim_th_w"][m] = 9500.0
 
-    is_lts_mix, miss_mix = evaluation.detect_lts_and_missing_prim_rows(
+    is_lts_mix, miss_mix = preprocessing.detect_lts_and_missing_prim_rows(
         mixed_cols
     )
     assert all(is_lts_mix[:1728])
@@ -999,14 +1001,14 @@ def test_lts_detection_and_filtering_in_khx_windows_episode_bank_and_cop() -> No
     khx_mix = calibration.calibrate_k_hx_robust(
         mixed_cols,
         const.DEFAULT_FLOW_RATES_L_MIN,
-        house_config.DAY1_K_HX_BY_GROUP_W_K,
+        priors.DAY1_K_HX_BY_GROUP_W_K,
     )
     assert abs(khx_mix["wk"] - 222.0) / 222.0 < 0.06
 
     # `extract_clean_regime_windows`: ZERO `"heat"` / `"ac"` windows in `0..1728`,
     # passive `"night"` allowed on LTS only when WP & AC were off on `[k0-24, k1]`.
-    hist_mix = evaluation.preprocess_history_columns(mixed_cols)
-    st_mix = evaluation.reconstruct_states_tuples(hist_mix, "wk", true_wk)
+    hist_mix = preprocessing.preprocess_history_columns(mixed_cols)
+    st_mix = kalman_tape.reconstruct_states_tuples(hist_mix, "wk", true_wk)
     wins_wk = calibration.extract_clean_regime_windows(
         hist_mix, "wk", [s[2] for s in st_mix], min_k0=144
     )
@@ -1024,8 +1026,8 @@ def test_lts_detection_and_filtering_in_khx_windows_episode_bank_and_cop() -> No
         contam_night_cols["f_comp_hz"][w_n.k0 + 5] = 20.0
         contam_night_cols["p_wp_raw_el_w"][w_n.k0 + 5] = 600.0
         contam_night_cols["p_prim_th_w"][w_n.k0 + 5] = 0.0
-    hist_cn = evaluation.preprocess_history_columns(contam_night_cols)
-    st_cn = evaluation.reconstruct_states_tuples(hist_cn, "wk", true_wk)
+    hist_cn = preprocessing.preprocess_history_columns(contam_night_cols)
+    st_cn = kalman_tape.reconstruct_states_tuples(hist_cn, "wk", true_wk)
     wins_cn = calibration.extract_clean_regime_windows(
         hist_cn, "wk", [s[2] for s in st_cn], min_k0=144
     )
@@ -1084,7 +1086,7 @@ def test_lts_detection_and_filtering_in_khx_windows_episode_bank_and_cop() -> No
 def test_three_phase_lock_free_calibration_zero_mutation_live_ticks_and_epoch() -> None:
     """Verifies 3-phase calibration API (`ctx -> plan -> apply`) & epoch guard."""
     true_wk = dataclasses.replace(
-        house_config.DAY1_PRIORS_WK,
+        priors.DAY1_PRIORS_WK,
         c_floor_wh_k=4720.0,
         r_fh_k_kw=2.17,
         h_loss_w_k=51.0,
@@ -1092,7 +1094,7 @@ def test_three_phase_lock_free_calibration_zero_mutation_live_ticks_and_epoch() 
         k_hx_w_k=220.0,
     )
     true_kt = dataclasses.replace(
-        house_config.DAY1_PRIORS_KT,
+        priors.DAY1_PRIORS_KT,
         c_floor_wh_k=1980.0,
         r_fh_k_kw=4.28,
         h_loss_w_k=36.0,
@@ -1161,7 +1163,7 @@ def test_three_phase_lock_free_calibration_zero_mutation_live_ticks_and_epoch() 
     assert aborted["accepted_wk"] is False
     assert aborted["accepted_kt"] is False
     assert eng.param_epoch == epoch_after_reset
-    assert eng.get_zone_snapshot("wk").params == house_config.DAY1_PRIORS_WK
+    assert eng.get_zone_snapshot("wk").params == priors.DAY1_PRIORS_WK
 
     # Empty plan safety
     empty_plan = eng.compute_calibration_plan(
@@ -1175,7 +1177,7 @@ def test_three_phase_lock_free_calibration_zero_mutation_live_ticks_and_epoch() 
 def test_90_day_25920_row_calibration_speed_benchmark() -> None:
     """Verifies full 90-day (`25,920`-row) calibration completes in seconds."""
     true_wk = dataclasses.replace(
-        house_config.DAY1_PRIORS_WK,
+        priors.DAY1_PRIORS_WK,
         c_floor_wh_k=4760.0,
         r_fh_k_kw=2.19,
         h_loss_w_k=52.0,
@@ -1183,7 +1185,7 @@ def test_90_day_25920_row_calibration_speed_benchmark() -> None:
         k_hx_w_k=219.0,
     )
     true_kt = dataclasses.replace(
-        house_config.DAY1_PRIORS_KT,
+        priors.DAY1_PRIORS_KT,
         c_floor_wh_k=1960.0,
         r_fh_k_kw=4.26,
         h_loss_w_k=36.2,
@@ -1222,14 +1224,14 @@ def test_f41_freeze_eta_ac_and_a_sol_f43_bound_warnings_and_f33_heat_guard() -> 
     """Verifies F4.1 freezing, F4.3 bound_warnings, F3.3 heat guard, & K_hx cap."""
     # 1. F4.1: Freeze `eta_ac` when < 4 AC windows (remove AC runs on kt)
     true_kt_no_ac = dataclasses.replace(
-        house_config.DAY1_PRIORS_KT,
+        priors.DAY1_PRIORS_KT,
         h_loss_w_k=35.0,
         eta_ac=4.70,
         k_hx_w_k=48.0,
     )
     cols_no_ac = _generate_calibration_dataset(
         n_days=8,
-        params_wk=house_config.DAY1_PRIORS_WK,
+        params_wk=priors.DAY1_PRIORS_WK,
         params_kt=true_kt_no_ac,
         solar_enabled=False,
     )
@@ -1241,7 +1243,7 @@ def test_f41_freeze_eta_ac_and_a_sol_f43_bound_warnings_and_f33_heat_guard() -> 
     # Re-generate clean kt temperatures without AC so calibration converges cleanly
     cols_clean = _generate_calibration_dataset(
         n_days=8,
-        params_wk=house_config.DAY1_PRIORS_WK,
+        params_wk=priors.DAY1_PRIORS_WK,
         params_kt=dataclasses.replace(true_kt_no_ac, eta_ac=0.0),
         solar_enabled=False,
     )
@@ -1253,30 +1255,30 @@ def test_f41_freeze_eta_ac_and_a_sol_f43_bound_warnings_and_f33_heat_guard() -> 
     out_frozen, _ = calibration.calibrate_zone_a2(
         cols_clean,
         "kt",
-        dataclasses.replace(house_config.DAY1_PRIORS_KT, eta_ac=4.20),
+        dataclasses.replace(priors.DAY1_PRIORS_KT, eta_ac=4.20),
         mode="manual",
     )
     # `eta_ac` and `a_sol_m2` must be frozen at aged prior (`3.60` / `0.40`)
     assert math.isclose(
         out_frozen.params_map_raw.eta_ac,
-        house_config.DAY1_PRIORS_KT.eta_ac,
+        priors.DAY1_PRIORS_KT.eta_ac,
         abs_tol=1e-9,
     )
     assert math.isclose(
         out_frozen.params_map_raw.a_sol_m2,
-        house_config.DAY1_PRIORS_KT.a_sol_m2,
+        priors.DAY1_PRIORS_KT.a_sol_m2,
         abs_tol=1e-9,
     )
 
     # 2. F4.3: Parameter hitting lower bound emits `bound_warnings` & persists
     true_kt_low_loss = dataclasses.replace(
-        house_config.DAY1_PRIORS_KT,
+        priors.DAY1_PRIORS_KT,
         h_loss_w_k=11.0,  # Below PARAM_BOUNDS_KT["h_loss_w_k"].lower == 12.0
         k_hx_w_k=48.0,
     )
     cols_bound = _generate_calibration_dataset(
         n_days=10,
-        params_wk=house_config.DAY1_PRIORS_WK,
+        params_wk=priors.DAY1_PRIORS_WK,
         params_kt=true_kt_low_loss,
     )
     eng_b = engine.DigitalTwinEngine()
@@ -1298,9 +1300,9 @@ def test_f41_freeze_eta_ac_and_a_sol_f43_bound_warnings_and_f33_heat_guard() -> 
     cols_high_khx = _generate_calibration_dataset(
         n_days=8,
         params_wk=dataclasses.replace(
-            house_config.DAY1_PRIORS_WK, k_hx_w_k=245.0
+            priors.DAY1_PRIORS_WK, k_hx_w_k=245.0
         ),
-        params_kt=house_config.DAY1_PRIORS_KT,
+        params_kt=priors.DAY1_PRIORS_KT,
     )
     # Artificially inflate primary thermal power 1.6x -> must clamp at eps<=0.75
     cols_high_khx["p_prim_th_w"] = [
@@ -1309,13 +1311,13 @@ def test_f41_freeze_eta_ac_and_a_sol_f43_bound_warnings_and_f33_heat_guard() -> 
     khx_capped = calibration.calibrate_k_hx_robust(
         cols_high_khx,
         const.DEFAULT_FLOW_RATES_L_MIN,
-        house_config.DAY1_K_HX_BY_GROUP_W_K,
+        priors.DAY1_K_HX_BY_GROUP_W_K,
     )
     wk_cap = min(
-        1.45 * house_config.DAY1_K_HX_BY_GROUP_W_K["wk"],
+        1.45 * priors.DAY1_K_HX_BY_GROUP_W_K["wk"],
         0.75
         * const.DEFAULT_FLOW_RATES_L_MIN["wk"]
-        * house_config.WATER_POWER_FACTOR_W_PER_LMIN_K,
+        * priors.WATER_POWER_FACTOR_W_PER_LMIN_K,
     )
     assert khx_capped["wk"] <= wk_cap + 1e-6
 
@@ -1326,32 +1328,32 @@ def test_f41_freeze_eta_ac_and_a_sol_f43_bound_warnings_and_f33_heat_guard() -> 
     khx_ignored = calibration.calibrate_k_hx_robust(
         cols_multi,
         const.DEFAULT_FLOW_RATES_L_MIN,
-        house_config.DAY1_K_HX_BY_GROUP_W_K,
+        priors.DAY1_K_HX_BY_GROUP_W_K,
     )
-    assert khx_ignored["wk"] == house_config.DAY1_K_HX_BY_GROUP_W_K["wk"]
+    assert khx_ignored["wk"] == priors.DAY1_K_HX_BY_GROUP_W_K["wk"]
 
     # 4. F3.3: Relative `heating_and_coast` holdout guard
     # Rejects when heating_and_coast degrades even if overall J_eval improves,
     # and never blocks improvements from large negative bias (-0.85 -> -0.24).
     true_wk = dataclasses.replace(
-        house_config.DAY1_PRIORS_WK,
+        priors.DAY1_PRIORS_WK,
         c_floor_wh_k=4700.0,
         r_fh_k_kw=2.20,
         h_loss_w_k=52.0,
     )
     cols_hc = _generate_calibration_dataset(
-        n_days=10, params_wk=true_wk, params_kt=house_config.DAY1_PRIORS_KT
+        n_days=10, params_wk=true_wk, params_kt=priors.DAY1_PRIORS_KT
     )
     # Start from biased prior (`h_loss=95`, producing large negative bias):
     # improving toward truth must NOT be blocked by relative bias guard.
-    bad_start = dataclasses.replace(house_config.DAY1_PRIORS_WK, h_loss_w_k=95.0)
+    bad_start = dataclasses.replace(priors.DAY1_PRIORS_WK, h_loss_w_k=95.0)
     out_imp, _ = calibration.calibrate_zone_a2(
         cols_hc, "wk", bad_start, mode="manual"
     )
     assert out_imp.accepted is True
 
     # Corrupt training heating runs only -> worsens holdout heating_and_coast
-    train_end_hc = evaluation.compute_train_holdout_split(cols_hc)
+    train_end_hc = preprocessing.compute_train_holdout_split(cols_hc)
     cols_bad_heat = {k: list(v) for k, v in cols_hc.items()}
     for k in range(train_end_hc):
         if float(cols_bad_heat["u_pump_sec"][k]) > 0.5:

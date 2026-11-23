@@ -1,4 +1,10 @@
-"""Button platform for BetonBatterij calibration, rollback, reset, and export."""
+"""Button platform for BetonBatterij calibration, rollback, reset, and export.
+
+Provides declarative action buttons delegating user-triggered maintenance
+workflows (manual MAP calibration, snapshot rollback, Day-1 prior reset, and
+CSV/JSON diagnostics export) to executor-backed `BetonBatterijCoordinator`
+methods without blocking the Home Assistant event loop.
+"""
 
 from __future__ import annotations
 
@@ -34,7 +40,13 @@ PARALLEL_UPDATES = 0
 
 @dataclass(frozen=True, kw_only=True)
 class BetonBatterijButtonEntityDescription(ButtonEntityDescription):
-    """Describe a BetonBatterij action button entity."""
+    """Describe a BetonBatterij action button entity.
+
+    Attributes:
+        object_id: Deterministic Home Assistant object ID (`button.<object_id>`).
+        press_fn: Coroutine factory invoked on `BetonBatterijCoordinator` when
+            the button is pressed.
+    """
 
     object_id: str
     press_fn: Callable[[BetonBatterijCoordinator], Awaitable[Any]]
@@ -79,7 +91,11 @@ BUTTON_DESCRIPTIONS: tuple[BetonBatterijButtonEntityDescription, ...] = (
 class BetonBatterijActionButton(
     CoordinatorEntity["BetonBatterijCoordinator"], ButtonEntity
 ):
-    """Button entity invoking an executor-backed DigitalTwinEngine action."""
+    """Button entity invoking an executor-backed coordinator maintenance action.
+
+    Stateless wrapper binding one `BetonBatterijButtonEntityDescription` to the
+    shared BetonBatterij device without mutating domain state directly.
+    """
 
     _attr_has_entity_name = True
     entity_description: BetonBatterijButtonEntityDescription

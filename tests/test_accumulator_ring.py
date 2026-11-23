@@ -36,7 +36,6 @@ from custom_components.betonbatterij.const import (
     RINGBUFFER_ROWS,
 )
 from custom_components.betonbatterij.ha_bridge.accumulator import (
-    ClockJumpGuard,
     HydraulicPowerAccumulator,
     StepSignalAccumulator,
     WaxValveTracker,
@@ -50,6 +49,7 @@ from custom_components.betonbatterij.ha_bridge.backfill import (
     _build_lts_row_at,
     replay_backfill_into_engine,
 )
+from custom_components.betonbatterij.ha_bridge.clock import ClockJumpGuard
 from custom_components.betonbatterij.ha_bridge.coordinator import (
     BetonBatterijCoordinator,
 )
@@ -58,14 +58,16 @@ from custom_components.betonbatterij.ha_bridge.storage_ring import (
 )
 from custom_components.betonbatterij.house_config import (
     HOUSE_ENTITIES,
-    LATITUDE_DEG,
     LOCAL_CONFIG_FILENAME,
-    LONGITUDE_DEG,
     ROOM_SENSORS,
     RoomSensorConfig,
     load_house_config,
 )
 from custom_components.betonbatterij.domain.engine import DigitalTwinEngine
+from custom_components.betonbatterij.domain.priors import (
+    LATITUDE_DEG,
+    LONGITUDE_DEG,
+)
 from custom_components.betonbatterij import sensor as sensor_mod
 from custom_components.betonbatterij.sensor import (
     BetonBatterijCopFitSensor,
@@ -1090,22 +1092,15 @@ def test_zone_fit_sensor_exposes_bound_warnings() -> None:
     base_eng = DigitalTwinEngine()
 
     class _BoundWarnEngine:
-        def __init__(self) -> None:
-            self.eval_report_wk = None
-            self.eval_report_kt = None
-            self.calibration_history: list[dict[str, Any]] = []
-
-        def get_zone_snapshot(self, zone: str) -> Any:
-            return base_eng.get_zone_snapshot(zone)  # type: ignore[arg-type]
-
-        def get_zone_fit_diagnostics(self, zone: str) -> dict[str, Any]:
+        def get_zone_fit_summary(self, zone: str) -> dict[str, Any]:
             assert zone == "kt"
-            return {
-                "posterior_std": {"h_loss_w_k": 2.1},
-                "correlation_matrix": {"h_loss_w_k": {"h_loss_w_k": 1.0}},
-                "collinearity_warnings": [],
-                "bound_warnings": ["h_loss_w_k at lower bound (25.0 W/K)"],
-            }
+            summary = base_eng.get_zone_fit_summary(zone)  # type: ignore[arg-type]
+            summary["fisher_1sigma_std"] = {"h_loss_w_k": 2.1}
+            summary["posterior_std"] = {"h_loss_w_k": 2.1}
+            summary["correlation_matrix"] = {"h_loss_w_k": {"h_loss_w_k": 1.0}}
+            summary["collinearity_warnings"] = []
+            summary["bound_warnings"] = ["h_loss_w_k at lower bound (25.0 W/K)"]
+            return summary
 
     class _StubCoord:
         fit_sensor_generation = 1
@@ -1463,7 +1458,11 @@ def test_coordinator_refresh_14d_eval_preserves_gang_k_hx() -> None:
             self.captured_ctx = ctx
             return ("rep_wk_stub", "rep_kt_stub")
 
-        def _refresh_cached_snapshots(self) -> None:
+        def apply_14d_evaluation_reports(
+            self, rep_wk: Any, rep_kt: Any
+        ) -> None:
+            self.eval_report_wk = rep_wk
+            self.eval_report_kt = rep_kt
             self.refreshed_snapshots = True
 
         def get_zone_snapshot(self, zone: str) -> Any:

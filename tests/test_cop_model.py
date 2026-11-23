@@ -13,9 +13,9 @@ import math
 import pytest
 
 from custom_components.betonbatterij import const
-from custom_components.betonbatterij import house_config
 from custom_components.betonbatterij.domain import contracts
 from custom_components.betonbatterij.domain import cop_model
+from custom_components.betonbatterij.domain import priors
 
 
 def _utc_ts(
@@ -44,7 +44,7 @@ class TestCopPhysicsAndMonotonicity:
         assert 0.3 < cop_model.frost_penalty_factor(0.0, 88.0) < 0.7
 
     def test_predict_cop_cv_monotonicity_and_frost_dip(self) -> None:
-        day1 = house_config.DAY1_COP_PARAMS
+        day1 = priors.DAY1_COP_PARAMS
         sups = [20.0, 24.0, 28.0, 32.0, 38.0, 45.0]
         cops_sup = [
             cop_model.predict_cop_cv(
@@ -76,7 +76,7 @@ class TestCopPhysicsAndMonotonicity:
         )
 
     def test_predict_cop_dhw_two_stage_51c_kink(self) -> None:
-        day1 = house_config.DAY1_COP_PARAMS
+        day1 = priors.DAY1_COP_PARAMS
         cop_50 = cop_model.predict_cop_dhw(
             day1, t_out_c=7.0, t_dhw_start_c=40.0, t_dhw_target_c=50.0
         )
@@ -101,7 +101,7 @@ class TestCopPhysicsAndMonotonicity:
         assert cop_above_51 == pytest.approx(1.0)
 
     def test_corrected_electrical_power(self) -> None:
-        day1 = house_config.DAY1_COP_PARAMS
+        day1 = priors.DAY1_COP_PARAMS
         assert (
             cop_model.corrected_wp_electrical_power_w(day1, 0.0, f_comp_hz=0.0)
             == 0.0
@@ -285,7 +285,7 @@ class TestP1FlankAndCopCalibration:
             "p_p1_net_w": p_p1,
         }
         fitted_w, mem_w, diag_w = cop_model.fit_cop_parameters(
-            cols_winter, house_config.DAY1_COP_PARAMS, memory=None
+            cols_winter, priors.DAY1_COP_PARAMS, memory=None
         )
 
         assert diag_w["n_cv_runs"] == 8
@@ -425,12 +425,12 @@ class TestP1FlankAndCopCalibration:
 
         cols_45m = _build_runs(cv_steps=9, dhw_steps=5)
         fit_short, _, diag_short = cop_model.fit_cop_model(
-            cols_45m, house_config.DAY1_COP_PARAMS
+            cols_45m, priors.DAY1_COP_PARAMS
         )
         assert diag_short["n_cv_runs"] == 0
         assert diag_short["n_dhw_runs"] == 3
         assert fit_short.eta_carnot_cv == pytest.approx(
-            house_config.DAY1_COP_PARAMS.eta_carnot_cv, abs=1e-9
+            priors.DAY1_COP_PARAMS.eta_carnot_cv, abs=1e-9
         )
         assert fit_short.eta_carnot_dhw == pytest.approx(
             true_params.eta_carnot_dhw, abs=0.025
@@ -438,7 +438,7 @@ class TestP1FlankAndCopCalibration:
 
         cols_60m = _build_runs(cv_steps=12, dhw_steps=5)
         fit_steady, _, diag_steady = cop_model.fit_cop_model(
-            cols_60m, house_config.DAY1_COP_PARAMS
+            cols_60m, priors.DAY1_COP_PARAMS
         )
         assert diag_steady["n_cv_runs"] == 6
         assert fit_steady.eta_carnot_cv == pytest.approx(
@@ -457,7 +457,7 @@ class TestP1FlankAndCopCalibration:
         }
         _, _, diag_eval = cop_model.fit_cop_model(
             old_train,
-            house_config.DAY1_COP_PARAMS,
+            priors.DAY1_COP_PARAMS,
             eval_columns=combined,
         )
         assert diag_eval["rmse_cop_14d"] is not None
@@ -501,7 +501,7 @@ class TestP1FlankAndCopCalibration:
 
         assert cop_model.calibrate_p1_power_bias(legacy_lts_cols) is None
         _, _, diag_leg = cop_model.fit_cop_model(
-            legacy_lts_cols, house_config.DAY1_COP_PARAMS
+            legacy_lts_cols, priors.DAY1_COP_PARAMS
         )
         assert diag_leg["n_cv_runs"] == 0
 
@@ -517,14 +517,14 @@ class TestP1FlankAndCopCalibration:
         )
         assert cop_model.calibrate_p1_power_bias(explicit_cols) is None
         _, _, diag_exp = cop_model.fit_cop_model(
-            explicit_cols, house_config.DAY1_COP_PARAMS
+            explicit_cols, priors.DAY1_COP_PARAMS
         )
         assert diag_exp["n_cv_runs"] == 0
 
         gap_cols = dict(explicit_cols, flags=[0] * n)
         gap_cols["flags"][10] = const.FLAG_GAP_BRIDGED
         _, _, diag_gap = cop_model.fit_cop_model(
-            gap_cols, house_config.DAY1_COP_PARAMS
+            gap_cols, priors.DAY1_COP_PARAMS
         )
         # Splitting a 20-step run at step 10 leaves 6 + 13 steps (1 valid run)
         assert diag_gap["n_cv_runs"] == 1

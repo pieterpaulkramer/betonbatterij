@@ -1,4 +1,9 @@
-"""ConfigFlow and OptionsFlow for BetonBatterij (Layer 1 Shadow Mode)."""
+"""ConfigFlow and OptionsFlow for BetonBatterij (Layer 1 Shadow Mode).
+
+Handles single-instance 1-click onboarding (`BetonBatterijConfigFlow`) and
+runtime tuning of the 10 manifold rotameter flow rates (`BetonBatterijOptionsFlow`)
+validated against `[FLOW_RATE_MIN_L_MIN, FLOW_RATE_MAX_L_MIN]`.
+"""
 
 from __future__ import annotations
 
@@ -20,6 +25,8 @@ from .const import (
     DEFAULT_FLOW_RATES_L_MIN,
     DOMAIN,
     FLOW_OPTION_KEYS,
+    FLOW_RATE_MAX_L_MIN,
+    FLOW_RATE_MIN_L_MIN,
 )
 
 ENTRY_TITLE: str = "BetonBatterij — Laag 1 Shadow Mode"
@@ -34,7 +41,8 @@ def build_rotameter_options_schema(
         current_options: Existing `ConfigEntry.options` mapping for defaults.
 
     Returns:
-        Validated Voluptuous schema enforcing `[0.1, 25.0] L/min` per group.
+        Validated Voluptuous schema enforcing
+        `[FLOW_RATE_MIN_L_MIN, FLOW_RATE_MAX_L_MIN]` L/min per hydraulic group.
     """
     opts = current_options or {}
     schema_dict: dict[Any, Any] = {}
@@ -45,7 +53,7 @@ def build_rotameter_options_schema(
         )
         schema_dict[vol.Required(opt_key, default=default_val)] = vol.All(
             vol.Coerce(float),
-            vol.Range(min=0.1, max=25.0),
+            vol.Range(min=FLOW_RATE_MIN_L_MIN, max=FLOW_RATE_MAX_L_MIN),
         )
     return vol.Schema(schema_dict)
 
@@ -99,7 +107,7 @@ class BetonBatterijOptionsFlow(OptionsFlow):
     async def async_step_init(
         self, user_input: dict[str, Any] | None = None
     ) -> ConfigFlowResult:
-        """Manage manifold rotameter flow rate options (`0.1 .. 25.0 L/min`)."""
+        """Manage manifold rotameter flow rate options."""
         if user_input is not None:
             cleaned = {
                 FLOW_OPTION_KEYS[group]: round(

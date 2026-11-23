@@ -14,10 +14,11 @@ import math
 import pytest
 
 from custom_components.betonbatterij import const
-from custom_components.betonbatterij import house_config
 from custom_components.betonbatterij.domain import engine
 from custom_components.betonbatterij.domain import hydraulics
+from custom_components.betonbatterij.domain import priors
 from custom_components.betonbatterij.domain import solar_weather
+from custom_components.betonbatterij.domain import zoh_kalman
 
 
 def _utc_ts(
@@ -100,7 +101,7 @@ class TestSolarGeometryAndProjection:
             solar_weather.project_solar_irradiance(ts_jun, p_pv_w=5100.0)
         )
 
-        kwp = house_config.PV_PEAK_KWP
+        kwp = priors.PV_PEAK_KWP
         r_dec = i_wk_dec / (2600.0 / kwp)
         r_mar = i_wk_mar / (4600.0 / kwp)
         r_jun = i_wk_jun / (5100.0 / kwp)
@@ -123,7 +124,7 @@ class TestSolarGeometryAndProjection:
         i_wk, _, _, _ = solar_weather.project_solar_irradiance(
             ts_dec, p_pv_w=p_pv_cloudy
         )
-        i_dak = p_pv_cloudy / house_config.PV_PEAK_KWP
+        i_dak = p_pv_cloudy / priors.PV_PEAK_KWP
         assert (i_wk / i_dak) == pytest.approx(0.54, abs=0.01)
 
     def test_sun_behind_south_facade_gives_zero_direct_beam(self) -> None:
@@ -356,17 +357,17 @@ class TestOutdoorInterfloorAndInternalLoads:
         assert q_dry == pytest.approx(-2.5 * 200.0)
 
     def test_surface_temperature_voltage_divider(self) -> None:
-        t_surf_wk = solar_weather.estimate_surface_temp(
+        t_surf_wk = zoh_kalman.estimate_surface_temp(
             20.0,
             24.0,
-            house_config.DAY1_PRIORS_WK.r_fh_k_kw,
-            house_config.AREA_WK_M2,
+            priors.DAY1_PRIORS_WK.r_fh_k_kw,
+            priors.AREA_WK_M2,
         )
-        t_surf_kt = solar_weather.estimate_surface_temp(
+        t_surf_kt = zoh_kalman.estimate_surface_temp(
             20.0,
             24.0,
-            house_config.DAY1_PRIORS_KT.r_fh_k_kw,
-            house_config.AREA_KT_M2,
+            priors.DAY1_PRIORS_KT.r_fh_k_kw,
+            priors.AREA_KT_M2,
         )
         assert 22.4 < t_surf_wk < 23.2
         assert t_surf_wk < t_surf_kt < 23.8
@@ -410,7 +411,7 @@ class TestChoiceC3Hydraulics:
             t_buf_bot_raw_c=24.33,
         )
         expected_r2 = 0.5 * 30.0 + 0.5 * (
-            24.33 + house_config.BUF_BOT_SENSOR_OFFSET_C
+            24.33 + priors.BUF_BOT_SENSOR_OFFSET_C
         )
         assert t_sup_r2 == pytest.approx(expected_r2)
 
@@ -497,14 +498,14 @@ class TestChoiceC3Hydraulics:
         )
         assert res_def.gamma_cal == pytest.approx(1.0)
         q_bg_expected = (
-            house_config.WATER_POWER_FACTOR_W_PER_LMIN_K * 7.0 * 3.0
+            priors.WATER_POWER_FACTOR_W_PER_LMIN_K * 7.0 * 3.0
         )
         assert res_def.q_fh_wk_w == pytest.approx(q_bg_expected * (5.0 / 7.0))
         assert res_def.q_fh_by_group_w["gang"] == pytest.approx(
             q_bg_expected * (2.0 / 7.0)
         )
         assert res_def.q_leak_1e_to_wk_w == pytest.approx(
-            house_config.BETA_DOWN_1E_LEAK
+            priors.BETA_DOWN_1E_LEAK
             * (
                 res_def.q_fh_by_group_w["slaapkamer"]
                 + res_def.q_fh_by_group_w["kamer_1e_zuid"]
@@ -524,13 +525,13 @@ class TestChoiceC3Hydraulics:
         self,
     ) -> None:
         """Verifies eps-NTU flow scaling (never linear 2x) and engine sync."""
-        k_old = house_config.DAY1_K_HX_BY_GROUP_W_K["wk"]  # 245.0 @ 5 L/min
+        k_old = priors.DAY1_K_HX_BY_GROUP_W_K["wk"]  # 245.0 @ 5 L/min
         k_doubled_flow = hydraulics.scale_k_hx_eps_ntu(k_old, 5.0, 10.0)
         # Doubling flow increases K_hx physically by ~10..35%, never 2.0x (490)
         assert k_old * 1.10 < k_doubled_flow < k_old * 1.35
         assert (
             k_doubled_flow
-            < 0.75 * 10.0 * house_config.WATER_POWER_FACTOR_W_PER_LMIN_K
+            < 0.75 * 10.0 * priors.WATER_POWER_FACTOR_W_PER_LMIN_K
         )
         # Round-trip reversibility
         assert hydraulics.scale_k_hx_eps_ntu(
@@ -608,7 +609,7 @@ class TestChoiceC3Hydraulics:
             k_doubled_flow, rel=1e-9
         )
         expected_kt = hydraulics.scale_k_hx_eps_ntu(
-            house_config.DAY1_K_HX_BY_GROUP_W_K["kantoor"], 1.0, 2.0
+            priors.DAY1_K_HX_BY_GROUP_W_K["kantoor"], 1.0, 2.0
         )
         assert eng.get_zone_snapshot("kt").params.k_hx_w_k == pytest.approx(
             expected_kt, rel=1e-9

@@ -1,8 +1,19 @@
 """DigitalTwinEngine facade for Home Assistant (`ha_bridge`) and Layer 2.
 
-Implements Component 5 §4 (`05-software-architectuur-opslag-en-interfaces.md`).
-100% pure Python stdlib — zero `homeassistant.*`, `numpy`, or `scipy` imports.
+Owns the stateful pure-Python Layer-1 Digital Twin orchestration:
+- Real-time 5-minute online estimation (`process_5m_window`) and 48-hour
+  post-calibration replay (`replay_48h_from_columns`),
+- Lock-free 3-phase batch calibration (`capture_calibration_context`, static
+  `compute_calibration_plan`, `apply_calibration_plan`), 8-deep rollback stack,
+  and Day-1 reset,
+- Read-only `ThermalTwinProtocol` query, rollout, preheat, coasting, COP, and
+  solver-export API for Layer-2 MPC/MILP consumers, and
+- Complete JSON-safe state serialization (`to_state_dict`, `load_state_dict`).
+
+Does not own Home Assistant entities, recorder/backfill queries, or disk
+storage (`ha_bridge/`). Zero `homeassistant.*`, `numpy`, or `scipy` imports.
 """
+
 from __future__ import annotations
 
 import collections
@@ -13,112 +24,20 @@ import pathlib
 from typing import Any, Literal
 
 from custom_components.betonbatterij import const
-from custom_components.betonbatterij import house_config
 from custom_components.betonbatterij.domain import calibration
 from custom_components.betonbatterij.domain import contracts
 from custom_components.betonbatterij.domain import cop_model
 from custom_components.betonbatterij.domain import evaluation
 from custom_components.betonbatterij.domain import hydraulics
+from custom_components.betonbatterij.domain import kalman_tape
+from custom_components.betonbatterij.domain import preprocessing
+from custom_components.betonbatterij.domain import priors
+from custom_components.betonbatterij.domain import reporting
 from custom_components.betonbatterij.domain import solar_weather
 from custom_components.betonbatterij.domain import zoh_kalman
 
 SNAPSHOT_STACK_MAX_DEPTH: int = 8
 MAX_CALIBRATION_HISTORY: int = 32
-
-
-def _opt_row_temp(
-    raw_row: Mapping[str, float | int],
-    key: str,
-) -> float | None:
-    """Reads an optional finite temperature (`>= -100 °C`) from `raw_row`."""
-    if key not in raw_row:
-        return None
-    val = raw_row[key]
-    if val is None:
-        return None
-    fval = float(val)
-    if not math.isfinite(fval) or fval < -100.0:
-        return None
-    return fval
-
-
-def _row_float(
-    raw_row: Mapping[str, float | int],
-    key: str,
-    default: float = 0.0,
-    alt_key: str | None = None,
-) -> float:
-    """Reads a finite float from `raw_row[key]` (or `alt_key`)."""
-    val = raw_row.get(key)
-    if val is None and alt_key is not None:
-        val = raw_row.get(alt_key)
-    if val is None:
-        return default
-    fval = float(val)
-    if not math.isfinite(fval):
-        return default
-    return fval
-
-
-def _zone_params_to_dict(params: contracts.ZoneParameters) -> dict[str, float]:
-    """Serializes `ZoneParameters` to a float dictionary."""
-    return {k: float(v) for k, v in dataclasses.asdict(params).items()}
-
-
-def _zone_params_from_dict(
-    data: Mapping[str, Any],
-    fallback: contracts.ZoneParameters,
-) -> contracts.ZoneParameters:
-    """Deserializes `ZoneParameters` with `fallback` defaults."""
-    base = dataclasses.asdict(fallback)
-    for k in base:
-        if k in data and data[k] is not None:
-            base[k] = float(data[k])
-    return contracts.ZoneParameters(**base)
-
-
-def _cop_params_to_dict(params: contracts.CopParameters) -> dict[str, float]:
-    """Serializes `CopParameters` to a float dictionary."""
-    return {k: float(v) for k, v in dataclasses.asdict(params).items()}
-
-
-def _cop_params_from_dict(
-    data: Mapping[str, Any] | None,
-) -> contracts.CopParameters:
-    """Deserializes `CopParameters` with `DAY1_COP_PARAMS` defaults."""
-    if not data:
-        return house_config.DAY1_COP_PARAMS
-    base = dataclasses.asdict(house_config.DAY1_COP_PARAMS)
-    for k in base:
-        if k in data and data[k] is not None:
-            base[k] = float(data[k])
-    return contracts.CopParameters(**base)
-
-
-def _discretize_2x2(
-    params: contracts.ZoneParameters,
-    dt_s: float,
-) -> tuple[
-    tuple[tuple[float, float], tuple[float, float]],
-    tuple[float, float],
-    tuple[float, float],
-]:
-    """Extracts exact 2x2 ZOH matrices `(phi_2x2, gamma_fh, gamma_ac_el_ref)`."""
-    a_d, b_d, _ = zoh_kalman.discretize_zoh_3x3(
-        params=params,
-        dt_s=dt_s,
-        v_wind_ms=3.0,
-    )
-    phi_2x2 = (
-        (float(a_d[0][0]), float(a_d[0][1])),
-        (float(a_d[1][0]), float(a_d[1][1])),
-    )
-    gamma_fh = (float(b_d[0][4]), float(b_d[1][4]))
-    gamma_ac = (
-        params.eta_ac * float(b_d[0][6]),
-        params.eta_ac * float(b_d[1][6]),
-    )
-    return phi_2x2, gamma_fh, gamma_ac
 
 
 def _clone_memory(
@@ -142,21 +61,21 @@ def _evaluate_both_zones_14d(
     lat_deg: float,
     lon_deg: float,
     *,
-    precomputed_hist_eval: evaluation.PreprocessedHistory | None = None,
-    precomputed_hist_prior: evaluation.PreprocessedHistory | None = None,
+    precomputed_hist_eval: preprocessing.PreprocessedHistory | None = None,
+    precomputed_hist_prior: preprocessing.PreprocessedHistory | None = None,
 ) -> tuple[contracts.ZoneEvaluationReport, contracts.ZoneEvaluationReport]:
     """Computes 14d `ZoneEvaluationReport`s for `wk` and `kt` purely."""
     ts_all = columns.get("ts_utc", ())
     n_total = len(ts_all)
-    hist_eval_shared: evaluation.PreprocessedHistory | None = None
-    hist_prior_shared: evaluation.PreprocessedHistory | None = None
+    hist_eval_shared: preprocessing.PreprocessedHistory | None = None
+    hist_prior_shared: preprocessing.PreprocessedHistory | None = None
     if n_total >= evaluation.SPINUP_48H_STEPS:
         start_slice = max(0, n_total - evaluation.MAX_EVAL_SLICE_STEPS)
         n_eval = n_total - start_slice
         sub_cols: Mapping[str, Sequence[float | int]] | None = None
-        khx_eval = dict(house_config.DAY1_K_HX_BY_GROUP_W_K)
+        khx_eval = dict(priors.DAY1_K_HX_BY_GROUP_W_K)
         for g_name, val in k_hx_by_group.items():
-            khx_eval["kantoor" if g_name == "kt" else g_name] = float(val)
+            khx_eval[preprocessing.zone_to_hydraulic_group(g_name)] = float(val)
         khx_eval["wk"] = params_wk.k_hx_w_k
         khx_eval["kantoor"] = params_kt.k_hx_w_k
 
@@ -172,16 +91,20 @@ def _evaluate_both_zones_14d(
             precomputed_hist_eval is not None
             and precomputed_hist_eval.n_rows == n_eval
         ):
-            sub_cols = evaluation.slice_columns(columns, start_slice, n_total)
-            hist_eval_shared = evaluation.recompute_history_for_khx(
+            sub_cols = preprocessing.slice_columns(
+                columns, start_slice, n_total
+            )
+            hist_eval_shared = preprocessing.recompute_history_for_khx(
                 precomputed_hist_eval,
                 sub_cols,
                 flow_rates_l_min=flow_rates_l_min,
                 k_hx_by_group=khx_eval,
             )
         else:
-            sub_cols = evaluation.slice_columns(columns, start_slice, n_total)
-            hist_eval_shared = evaluation.preprocess_history_columns(
+            sub_cols = preprocessing.slice_columns(
+                columns, start_slice, n_total
+            )
+            hist_eval_shared = preprocessing.preprocess_history_columns(
                 sub_cols,
                 flow_rates_l_min=flow_rates_l_min,
                 k_hx_by_group=khx_eval,
@@ -197,21 +120,21 @@ def _evaluate_both_zones_14d(
             hist_prior_shared = precomputed_hist_prior
         else:
             if sub_cols is None:
-                sub_cols = evaluation.slice_columns(
+                sub_cols = preprocessing.slice_columns(
                     columns, start_slice, n_total
                 )
-            hist_prior_shared = evaluation.recompute_history_for_khx(
+            hist_prior_shared = preprocessing.recompute_history_for_khx(
                 hist_eval_shared,
                 sub_cols,
                 flow_rates_l_min=flow_rates_l_min,
-                k_hx_by_group=house_config.DAY1_K_HX_BY_GROUP_W_K,
+                k_hx_by_group=priors.DAY1_K_HX_BY_GROUP_W_K,
             )
 
     eval_wk = evaluation.evaluate_14d_hindcast(
         columns,
         "wk",
         params_wk,
-        house_config.DAY1_PRIORS_WK,
+        priors.DAY1_PRIORS_WK,
         flow_rates_l_min=flow_rates_l_min,
         k_hx_by_group=k_hx_by_group,
         lat_deg=lat_deg,
@@ -223,7 +146,7 @@ def _evaluate_both_zones_14d(
         columns,
         "kt",
         params_kt,
-        house_config.DAY1_PRIORS_KT,
+        priors.DAY1_PRIORS_KT,
         flow_rates_l_min=flow_rates_l_min,
         k_hx_by_group=k_hx_by_group,
         lat_deg=lat_deg,
@@ -239,8 +162,8 @@ def _fit_cop_with_mode(
     current_cop: contracts.CopParameters,
     memory_cop: contracts.ParameterPosteriorMemory | None,
     mode: Literal["manual", "auto_weekly"],
-    lat_deg: float = house_config.LATITUDE_DEG,
-    lon_deg: float = house_config.LONGITUDE_DEG,
+    lat_deg: float = priors.LATITUDE_DEG,
+    lon_deg: float = priors.LONGITUDE_DEG,
     eval_columns: Mapping[str, Sequence[float | int]] | None = None,
 ) -> tuple[
     contracts.CopParameters,
@@ -259,7 +182,7 @@ def _fit_cop_with_mode(
     diag = dict(diag_raw)
 
     if mode == "auto_weekly" and fitted_cop != current_cop:
-        bnds = house_config.COP_PARAM_BOUNDS
+        bnds = priors.COP_PARAM_BOUNDS
         final_cop = contracts.CopParameters(
             eta_carnot_cv=min(
                 bnds["eta_carnot_cv"].upper,
@@ -322,10 +245,10 @@ class DigitalTwinEngine:
         cop_params: Active heat pump `CopParameters`.
         hindcast_wk: Live 72-step 6h open-loop FIFO tracker for `wk`.
         hindcast_kt: Live 72-step 6h open-loop FIFO tracker for `kt`.
-        episode_bank: Choice D3 365-day `SeasonalEpisodeBank`.
-        memory_wk: Choice D2 seasonal posterior memory for `wk`.
-        memory_kt: Choice D2 seasonal posterior memory for `kt`.
-        memory_cop: Choice D2 seasonal posterior memory for COP parameters.
+        episode_bank: Stratified 365-day `SeasonalEpisodeBank`.
+        memory_wk: Seasonal posterior memory for `wk`.
+        memory_kt: Seasonal posterior memory for `kt`.
+        memory_cop: Seasonal posterior memory for COP parameters.
         eval_report_wk: Latest 14-day multi-regime evaluation report for `wk`.
         eval_report_kt: Latest 14-day multi-regime evaluation report for `kt`.
         cop_diagnostics: Latest COP fit and RMSE diagnostics dictionary.
@@ -352,23 +275,23 @@ class DigitalTwinEngine:
             k_hx_by_group_w_k: Optional `K_hx` [W/K] per hydraulic group.
             cop_params: Optional heat pump `CopParameters` override.
             latitude_deg: Optional site latitude [deg N] (non-zero overrides
-                `house_config.LATITUDE_DEG`).
+                `priors.LATITUDE_DEG`).
             longitude_deg: Optional site longitude [deg E] (non-zero overrides
-                `house_config.LONGITUDE_DEG`).
+                `priors.LONGITUDE_DEG`).
         """
         self.latitude_deg: float = (
             float(latitude_deg)
             if latitude_deg is not None
             and math.isfinite(latitude_deg)
             and float(latitude_deg) != 0.0
-            else house_config.LATITUDE_DEG
+            else priors.LATITUDE_DEG
         )
         self.longitude_deg: float = (
             float(longitude_deg)
             if longitude_deg is not None
             and math.isfinite(longitude_deg)
             and float(longitude_deg) != 0.0
-            else house_config.LONGITUDE_DEG
+            else priors.LONGITUDE_DEG
         )
         self._flow_rates_l_min: dict[str, float] = dict(
             const.DEFAULT_FLOW_RATES_L_MIN
@@ -379,20 +302,20 @@ class DigitalTwinEngine:
             )
 
         self._k_hx_by_group_w_k: dict[str, float] = dict(
-            house_config.DAY1_K_HX_BY_GROUP_W_K
+            priors.DAY1_K_HX_BY_GROUP_W_K
         )
         if k_hx_by_group_w_k:
             for g, v in k_hx_by_group_w_k.items():
-                self._k_hx_by_group_w_k["kantoor" if g == "kt" else g] = float(
-                    v
-                )
+                self._k_hx_by_group_w_k[
+                    preprocessing.zone_to_hydraulic_group(g)
+                ] = float(v)
 
         p_wk = params_wk or dataclasses.replace(
-            house_config.DAY1_PRIORS_WK,
+            priors.DAY1_PRIORS_WK,
             k_hx_w_k=self._k_hx_by_group_w_k["wk"],
         )
         p_kt = params_kt or dataclasses.replace(
-            house_config.DAY1_PRIORS_KT,
+            priors.DAY1_PRIORS_KT,
             k_hx_w_k=self._k_hx_by_group_w_k["kantoor"],
         )
         self._k_hx_by_group_w_k["wk"] = p_wk.k_hx_w_k
@@ -412,7 +335,7 @@ class DigitalTwinEngine:
             k_hx_by_group_w_k=self._k_hx_by_group_w_k,
         )
         self.cop_params: contracts.CopParameters = (
-            cop_params or house_config.DAY1_COP_PARAMS
+            cop_params or priors.DAY1_COP_PARAMS
         )
         self.hindcast_wk: evaluation.LiveHindcastTracker = (
             evaluation.LiveHindcastTracker(
@@ -483,11 +406,16 @@ class DigitalTwinEngine:
         )
 
         st = est.state
-        t_surf = evaluation.estimate_zone_surface_temp(
+        t_surf = zoh_kalman.estimate_zone_surface_temp(
             zone, st.t_air_c, st.t_floor_c, params
         )
         stored_wh = params.c_floor_wh_k * (st.t_floor_c - st.t_air_c)
         rmse_6h = ev.overall_6h.rmse_end_c if ev is not None else None
+        warmup_rem = (
+            int(hind.warmup_remaining_min)
+            if (est.initialized or len(hind.queue) > 0)
+            else 0
+        )
 
         return contracts.ZoneSnapshot(
             zone=zone,
@@ -503,6 +431,7 @@ class DigitalTwinEngine:
             stored_slab_energy_wh=stored_wh,
             params=params,
             rmse_6h_c=rmse_6h,
+            warmup_remaining_min=warmup_rem,
         )
 
     def _refresh_cached_snapshots(self) -> None:
@@ -540,73 +469,58 @@ class DigitalTwinEngine:
             Dictionary of 8 trajectory values (`t_floor_*`, `d_est_*`, `q_fh_*`,
             `t_hind6h_*`) to persist in the RingBuffer row.
         """
-        ts_utc = int(
-            raw_row.get("ts_utc", self._last_ts_utc + int(round(dt_s)))
+        parsed = preprocessing.parse_raw_step(
+            raw_row,
+            default_ts_utc=self._last_ts_utc + int(round(dt_s)),
+            default_t_wk=(
+                self.estimator_wk.state.t_air_c
+                if self.estimator_wk.initialized
+                else 19.5
+            ),
+            default_t_kt=(
+                self.estimator_kt.state.t_air_c
+                if self.estimator_kt.initialized
+                else 19.0
+            ),
         )
-        has_flags = "flags" in raw_row
-        default_fl = (
-            const.FLAG_VALID_WK | const.FLAG_VALID_KT | const.FLAG_AANWEZIG
-        )
-        fl = int(raw_row["flags"]) if has_flags else default_fl
-
+        ts_utc = parsed.ts_utc
+        fl = parsed.flags
         eff_stale_wk = stale_wk or (
-            has_flags and not (fl & const.FLAG_VALID_WK)
+            parsed.has_flags and not (fl & const.FLAG_VALID_WK)
         )
         eff_stale_kt = stale_kt or (
-            has_flags and not (fl & const.FLAG_VALID_KT)
+            parsed.has_flags and not (fl & const.FLAG_VALID_KT)
         )
-        aanwezig = (
-            bool(fl & const.FLAG_AANWEZIG)
-            if has_flags
-            else bool(raw_row.get("aanwezig", True))
-        )
+        aanwezig = parsed.aanwezig
 
-        t_dak = _opt_row_temp(raw_row, "t_out_dak_c")
-        t_wea = _opt_row_temp(raw_row, "t_out_weather_c")
-        t_hm = _opt_row_temp(raw_row, "t_out_hm_c")
-        if t_dak is None and t_wea is None and t_hm is None:
-            t_dak = _opt_row_temp(raw_row, "t_out_c")
-        if t_hm is not None:
+        if parsed.t_hm_c is not None:
             self._hm_ema_c = (
-                t_hm
+                parsed.t_hm_c
                 if self._hm_ema_c is None
-                else (t_hm / 6.0) + (5.0 / 6.0) * self._hm_ema_c
+                else (parsed.t_hm_c / 6.0) + (5.0 / 6.0) * self._hm_ema_c
             )
         t_out_c = solar_weather.select_outdoor_temp(
             ts_utc=ts_utc,
-            t_dak_c=t_dak,
-            t_weather_c=t_wea,
+            t_dak_c=parsed.t_dak_c,
+            t_weather_c=parsed.t_weather_c,
             t_hm_ema_c=self._hm_ema_c,
             lat_deg=self.latitude_deg,
             lon_deg=self.longitude_deg,
         )
-        v_wind = max(0.0, _row_float(raw_row, "v_wind_ms", 3.0))
+        v_wind = parsed.v_wind_ms
 
         pv_fb_hint = bool(fl & const.FLAG_PV_FALLBACK)
-        if (
-            "i_sol_wk_wm2" in raw_row
-            and "i_sol_kt_wm2" in raw_row
-            and "p_pv_w" not in raw_row
-        ):
-            i_sol_wk = max(0.0, _row_float(raw_row, "i_sol_wk_wm2", 0.0))
-            i_sol_kt = max(0.0, _row_float(raw_row, "i_sol_kt_wm2", 0.0))
+        if parsed.has_preproj_solar:
+            i_sol_wk = parsed.i_sol_wk_preproj_wm2
+            i_sol_kt = parsed.i_sol_kt_preproj_wm2
         else:
-            if "p_pv_w" in raw_row:
-                raw_pv = raw_row["p_pv_w"]
-                p_pv = math.nan if raw_pv is None else float(raw_pv)
-            else:
-                p_pv = 0.0
-            p_pv_fc = _row_float(raw_row, "p_pv_forecast_w", 0.0)
-            epex = _row_float(raw_row, "epex_eur_kwh", 0.20)
-            scr_s = _row_float(raw_row, "screen_small_pos", 100.0)
-            scr_l = _row_float(raw_row, "screen_large_pos", 100.0)
             i_wk_raw, i_kt_raw, _, _ = solar_weather.project_solar_irradiance(
                 ts_utc=ts_utc,
-                p_pv_w=p_pv,
-                p_pv_forecast_w=p_pv_fc,
-                epex_eur_kwh=epex,
-                screen_small_pos=scr_s,
-                screen_large_pos=scr_l,
+                p_pv_w=parsed.p_pv_w,
+                p_pv_forecast_w=parsed.p_pv_forecast_w,
+                epex_eur_kwh=parsed.epex_eur_kwh,
+                screen_small_pos=parsed.screen_small_pos,
+                screen_large_pos=parsed.screen_large_pos,
                 pv_stale=pv_fb_hint,
                 lat_deg=self.latitude_deg,
                 lon_deg=self.longitude_deg,
@@ -614,135 +528,42 @@ class DigitalTwinEngine:
             i_sol_wk = max(0.0, i_wk_raw)
             i_sol_kt = max(0.0, i_kt_raw)
 
-        t_wk = _row_float(
-            raw_row,
-            "t_air_wk_c",
-            (
-                self.estimator_wk.state.t_air_c
-                if self.estimator_wk.initialized
-                else 19.5
-            ),
-        )
-        t_kt = _row_float(
-            raw_row,
-            "t_air_kantoor_c",
-            (
-                self.estimator_kt.state.t_air_c
-                if self.estimator_kt.initialized
-                else 19.0
-            ),
-            "t_air_kt_c",
-        )
-        room_temps: dict[str, float | None] = {
-            "wk": t_wk,
-            "gang": t_wk - 0.8,
-            "slaapkamer": _row_float(raw_row, "t_air_slaapkamer_c", 18.0),
-            "badkamer": _row_float(raw_row, "t_air_badkamer_c", 18.5),
-            "werkkamer_1e": _row_float(raw_row, "t_air_werkkamer_1e_c", 18.0),
-            "kamer_1e_midden": _row_float(
-                raw_row, "t_air_kamer_1e_midden_c", 18.0
-            ),
-            "kamer_1e_zuid": _row_float(
-                raw_row, "t_air_kamer_1e_zuid_c", 18.0
-            ),
-            "kantoor": t_kt,
-            "badkamer_boven": _row_float(
-                raw_row, "t_air_badkamer_boven_c", 18.0
-            ),
-            "logeerkamer": _row_float(raw_row, "t_air_logeerkamer_c", 17.5),
-        }
-
-        u_bg = min(
-            1.0, max(0.0, _row_float(raw_row, "u_eff_bg", 0.0, "u_eff_wk"))
-        )
-        u_kt_v = min(
-            1.0,
-            max(0.0, _row_float(raw_row, "u_eff_kantoor", 0.0, "u_eff_kt")),
-        )
-        u_pump = min(1.0, max(0.0, _row_float(raw_row, "u_pump_sec", 0.0)))
-        u_valves: dict[str, float] = {
-            "wk": u_bg,
-            "gang": u_bg,
-            "slaapkamer": min(
-                1.0, max(0.0, _row_float(raw_row, "u_eff_slaapkamer", 0.0))
-            ),
-            "badkamer": min(
-                1.0, max(0.0, _row_float(raw_row, "u_eff_badkamer", 0.0))
-            ),
-            "werkkamer_1e": min(
-                1.0, max(0.0, _row_float(raw_row, "u_eff_werkkamer_1e", 0.0))
-            ),
-            "kamer_1e_midden": min(
-                1.0,
-                max(0.0, _row_float(raw_row, "u_eff_kamer_1e_midden", 0.0)),
-            ),
-            "kamer_1e_zuid": min(
-                1.0, max(0.0, _row_float(raw_row, "u_eff_kamer_1e_zuid", 0.0))
-            ),
-            "kantoor": u_kt_v,
-            "badkamer_boven": min(
-                1.0, max(0.0, _row_float(raw_row, "u_eff_badkamer_boven", 0.0))
-            ),
-            "logeerkamer": min(
-                1.0, max(0.0, _row_float(raw_row, "u_eff_logeerkamer", 0.0))
-            ),
-        }
-
-        threeway_room = (
-            bool(raw_row["threeway_room"])
-            if "threeway_room" in raw_row
-            else ((fl & const.FLAG_DHW_TANK) == 0)
-        )
-        wp_defrost = bool(
-            raw_row.get("wp_defrost", bool(fl & const.FLAG_DEFROST_WP))
-        )
-        v_prim = max(0.0, _row_float(raw_row, "v_prim_l_min", 0.0))
-        p_prim = _row_float(raw_row, "p_prim_th_w", 0.0)
-        f_hz = max(0.0, _row_float(raw_row, "f_comp_hz", 0.0))
-
-        t_top_e = _row_float(raw_row, "t_buf_top_end_c", 22.0, "t_buf_top_c")
-        t_top_s = _row_float(raw_row, "t_buf_top_start_c", t_top_e)
-        t_bot_e = _row_float(
-            raw_row, "t_buf_bot_end_c", t_top_e - 1.0, "t_buf_bot_c"
-        )
-        t_bot_s = _row_float(raw_row, "t_buf_bot_start_c", t_bot_e)
-        t_bg_sup = _opt_row_temp(raw_row, "t_bg_sup_c")
-        t_bg_ret = _opt_row_temp(raw_row, "t_bg_ret_c")
-
-        p_ac = max(0.0, _row_float(raw_row, "p_el_ac_kt_w", 0.0))
-        ac_mode = _row_float(raw_row, "ac_mode_code", 0.0)
-        p_desk = _opt_row_temp(raw_row, "p_desk_kt_w")
-        pir_kt = _row_float(raw_row, "pir_occ_kt", 0.0)
-        p_grow = max(0.0, _row_float(raw_row, "p_growlights_kt_w", 0.0))
-        ac_def = bool(fl & const.FLAG_DEFROST_AC)
+        t_wk = parsed.t_air_wk_c
+        t_kt = parsed.t_air_kt_c
+        room_temps = parsed.room_temps
+        u_pump = parsed.u_pump_sec
+        u_valves = parsed.u_valves
+        v_prim = parsed.v_prim_l_min
+        t_top_e = parsed.t_buf_top_end_c
+        max_gap = const.MAX_RESTART_BRIDGE_GAP_S
 
         q_int_kt, q_ac_kt = solar_weather.compute_internal_and_ac_loads_kt(
-            p_desk_w=p_desk,
-            pir_occ=pir_kt,
-            p_growlights_w=p_grow,
-            p_el_ac_w=p_ac,
-            ac_mode_code=ac_mode,
-            ac_defrost=ac_def,
+            p_desk_w=parsed.p_desk_kt_w,
+            pir_occ=parsed.pir_occ_kt,
+            p_growlights_w=parsed.p_growlights_kt_w,
+            p_el_ac_w=parsed.p_el_ac_kt_w,
+            ac_mode_code=parsed.ac_mode_code,
+            ac_defrost=parsed.ac_defrost,
             t_out_c=t_out_c,
             eta_ac=self._params_kt.eta_ac,
             desk_state=self._desk_state_kt,
-            dt_s=min(dt_s, 10800.0),
+            dt_s=min(dt_s, max_gap),
         )
         t_up_wk, t_dn_kt = solar_weather.compute_interfloor_boundaries(
             room_temps_c=room_temps,
             last_valid_cache=self._interfloor_cache,
             ts_utc=ts_utc,
         )
-        t_dn_wk = house_config.T_GROUND_MEAN_C
+        t_dn_wk = priors.T_GROUND_MEAN_C
 
         # Initialize estimators on very first tick or >3h outage
-        if not self.estimator_wk.initialized or dt_s > 10800.0:
+        if not self.estimator_wk.initialized or dt_s > max_gap:
             ex_init_wk = contracts.ExogenousStepInput(
                 t_out_c=t_out_c,
                 v_wind_ms=v_wind,
                 i_sol_wm2=i_sol_wk,
                 t_down_c=t_dn_wk,
-                q_int_known_w=house_config.BASELOAD_WK_W,
+                q_int_known_w=priors.BASELOAD_WK_W,
                 t_up_c=t_up_wk,
             )
             self.estimator_wk.cold_start(
@@ -753,10 +574,10 @@ class DigitalTwinEngine:
                 u_pump=u_pump,
                 t_buf_top_c=t_top_e,
             )
-            if dt_s > 10800.0:
+            if dt_s > max_gap:
                 self.hindcast_wk.clear()
 
-        if not self.estimator_kt.initialized or dt_s > 10800.0:
+        if not self.estimator_kt.initialized or dt_s > max_gap:
             ex_init_kt = contracts.ExogenousStepInput(
                 t_out_c=t_out_c,
                 v_wind_ms=v_wind,
@@ -773,40 +594,38 @@ class DigitalTwinEngine:
                 u_pump=u_pump,
                 t_buf_top_c=t_top_e,
             )
-            if dt_s > 10800.0:
+            if dt_s > max_gap:
                 self.hindcast_kt.clear()
 
         hyd_res = self.hydraulics.step(
-            dt_s=min(dt_s, 10800.0),
+            dt_s=min(dt_s, max_gap),
             u_pump_sec=u_pump,
             u_valves=u_valves,
-            threeway_room=threeway_room,
-            wp_defrost=wp_defrost,
+            threeway_room=parsed.threeway_room,
+            wp_defrost=parsed.wp_defrost,
             v_prim_l_min=v_prim,
-            p_prim_th_w=p_prim,
-            f_comp_hz=f_hz,
-            t_buf_top_start_c=t_top_s,
+            p_prim_th_w=parsed.p_prim_th_w,
+            f_comp_hz=parsed.f_comp_hz,
+            t_buf_top_start_c=parsed.t_buf_top_start_c,
             t_buf_top_end_c=t_top_e,
-            t_buf_bot_start_c=t_bot_s,
-            t_buf_bot_end_c=t_bot_e,
+            t_buf_bot_start_c=parsed.t_buf_bot_start_c,
+            t_buf_bot_end_c=parsed.t_buf_bot_end_c,
             t_floor_wk_c=self.estimator_wk.state.t_floor_c,
             t_floor_kt_c=self.estimator_kt.state.t_floor_c,
             room_temps_c=room_temps,
-            t_bg_sup_c=t_bg_sup,
-            t_bg_ret_c=t_bg_ret,
+            t_bg_sup_c=parsed.t_bg_sup_c,
+            t_bg_ret_c=parsed.t_bg_ret_c,
             bg_ret_offset_c=0.0,
         )
         q_fh_wk = hyd_res.q_fh_wk_w
         q_fh_kt = hyd_res.q_fh_kt_w
         if u_pump <= 1e-4 and v_prim <= 1e-4:
-            if _row_float(raw_row, "q_fh_wk_w", 0.0) > 0.0:
-                q_fh_wk = _row_float(raw_row, "q_fh_wk_w", 0.0)
-            if _row_float(raw_row, "q_fh_kt_w", 0.0) > 0.0:
-                q_fh_kt = _row_float(raw_row, "q_fh_kt_w", 0.0)
+            if parsed.q_fh_wk_override_w > 0.0:
+                q_fh_wk = parsed.q_fh_wk_override_w
+            if parsed.q_fh_kt_override_w > 0.0:
+                q_fh_kt = parsed.q_fh_kt_override_w
 
-        q_int_wk = house_config.BASELOAD_WK_W + max(
-            0.0, hyd_res.q_leak_1e_to_wk_w
-        )
+        q_int_wk = priors.BASELOAD_WK_W + max(0.0, hyd_res.q_leak_1e_to_wk_w)
         exog_wk = contracts.ExogenousStepInput(
             t_out_c=t_out_c,
             v_wind_ms=v_wind,
@@ -824,25 +643,25 @@ class DigitalTwinEngine:
             t_up_c=0.0,
         )
 
-        t_surf_meas_wk = _opt_row_temp(raw_row, "t_floor_surf_meas_wk_c")
+        t_surf_meas_wk = parsed.t_surf_meas_wk_c
         meas_wk = None if eff_stale_wk else t_wk
         meas_kt = None if eff_stale_kt else t_kt
         if (
             not temp_changed_wk
             and meas_wk is not None
-            and self.estimator_wk._last_meas_temp_c is not None
-            and abs(meas_wk - self.estimator_wk._last_meas_temp_c) >= 1e-4
+            and self.estimator_wk.last_meas_temp_c is not None
+            and abs(meas_wk - self.estimator_wk.last_meas_temp_c) >= 1e-4
         ):
             temp_changed_wk = True
         if (
             not temp_changed_kt
             and meas_kt is not None
-            and self.estimator_kt._last_meas_temp_c is not None
-            and abs(meas_kt - self.estimator_kt._last_meas_temp_c) >= 1e-4
+            and self.estimator_kt.last_meas_temp_c is not None
+            and abs(meas_kt - self.estimator_kt.last_meas_temp_c) >= 1e-4
         ):
             temp_changed_kt = True
 
-        if 450.0 < dt_s <= 10800.0:
+        if 450.0 < dt_s <= max_gap:
             # Bridge short restart gap before regular tick semantics
             gap_extra = dt_s - float(const.DT_STEP_S)
             self.hindcast_wk.bridge_gap(
@@ -853,11 +672,11 @@ class DigitalTwinEngine:
             )
             step_hind_dt = float(const.DT_STEP_S)
         else:
-            step_hind_dt = dt_s if dt_s <= 10800.0 else float(const.DT_STEP_S)
+            step_hind_dt = dt_s if dt_s <= max_gap else float(const.DT_STEP_S)
 
         state_wk = self.estimator_wk.step(
             ts_utc=ts_utc,
-            dt_s=min(dt_s, 10800.0),
+            dt_s=min(dt_s, max_gap),
             exog=exog_wk,
             q_fh_w=q_fh_wk,
             q_ac_w=0.0,
@@ -871,7 +690,7 @@ class DigitalTwinEngine:
         )
         state_kt = self.estimator_kt.step(
             ts_utc=ts_utc,
-            dt_s=min(dt_s, 10800.0),
+            dt_s=min(dt_s, max_gap),
             exog=exog_kt,
             q_fh_w=q_fh_kt,
             q_ac_w=q_ac_kt,
@@ -928,7 +747,7 @@ class DigitalTwinEngine:
             return
 
         start_idx = max(0, n_total - evaluation.SPINUP_48H_STEPS)
-        sub_cols = evaluation.slice_columns(columns, start_idx, n_total)
+        sub_cols = preprocessing.slice_columns(columns, start_idx, n_total)
 
         self._k_hx_by_group_w_k["wk"] = self._params_wk.k_hx_w_k
         self._k_hx_by_group_w_k["kantoor"] = self._params_kt.k_hx_w_k
@@ -937,7 +756,7 @@ class DigitalTwinEngine:
             k_hx_by_group_w_k=self._k_hx_by_group_w_k,
         )
 
-        hist = evaluation.preprocess_history_columns(
+        hist = preprocessing.preprocess_history_columns(
             sub_cols,
             flow_rates_l_min=self._flow_rates_l_min,
             k_hx_by_group=self._k_hx_by_group_w_k,
@@ -945,8 +764,8 @@ class DigitalTwinEngine:
             lat_deg=self.latitude_deg,
             lon_deg=self.longitude_deg,
         )
-        exog_wk = evaluation.build_zone_exog_list(hist, "wk")
-        exog_kt = evaluation.build_zone_exog_list(hist, "kt")
+        exog_wk = preprocessing.build_zone_exog_list(hist, "wk")
+        exog_kt = preprocessing.build_zone_exog_list(hist, "kt")
 
         states_wk, q_fh_wk_arr, _, est_wk = (
             evaluation.reconstruct_kalman_states(
@@ -1015,10 +834,10 @@ class DigitalTwinEngine:
         return {
             "ts_utc": int(ts_utc if ts_utc is not None else self._last_ts_utc),
             "reason": reason,
-            "params_wk": _zone_params_to_dict(self._params_wk),
-            "params_kt": _zone_params_to_dict(self._params_kt),
+            "params_wk": self._params_wk.to_dict(),
+            "params_kt": self._params_kt.to_dict(),
             "k_hx_by_group_w_k": dict(self._k_hx_by_group_w_k),
-            "cop_params": _cop_params_to_dict(self.cop_params),
+            "cop_params": self.cop_params.to_dict(),
             "memory_wk": calibration.posterior_memory_to_dict(self.memory_wk),
             "memory_kt": calibration.posterior_memory_to_dict(self.memory_kt),
             "memory_cop": calibration.posterior_memory_to_dict(
@@ -1030,23 +849,29 @@ class DigitalTwinEngine:
 
     def _apply_snapshot_dict(self, snap: Mapping[str, Any]) -> None:
         """Restores active parameters and seasonal memory from `snap`."""
-        self._params_wk = _zone_params_from_dict(
-            snap.get("params_wk", {}), house_config.DAY1_PRIORS_WK
+        self._params_wk = contracts.ZoneParameters.from_dict(
+            snap.get("params_wk"), defaults=priors.DAY1_PRIORS_WK
         )
-        self._params_kt = _zone_params_from_dict(
-            snap.get("params_kt", {}), house_config.DAY1_PRIORS_KT
+        self._params_kt = contracts.ZoneParameters.from_dict(
+            snap.get("params_kt"), defaults=priors.DAY1_PRIORS_KT
         )
 
         khx_raw = snap.get("k_hx_by_group_w_k")
-        self._k_hx_by_group_w_k = dict(house_config.DAY1_K_HX_BY_GROUP_W_K)
+        self._k_hx_by_group_w_k = dict(priors.DAY1_K_HX_BY_GROUP_W_K)
         if isinstance(khx_raw, Mapping):
             self._k_hx_by_group_w_k.update(
-                {str(k): float(v) for k, v in khx_raw.items()}
+                {
+                    str(k): float(v)
+                    for k, v in khx_raw.items()
+                    if preprocessing.is_finite_number(v)
+                }
             )
         self._k_hx_by_group_w_k["wk"] = self._params_wk.k_hx_w_k
         self._k_hx_by_group_w_k["kantoor"] = self._params_kt.k_hx_w_k
 
-        self.cop_params = _cop_params_from_dict(snap.get("cop_params"))
+        self.cop_params = contracts.CopParameters.from_dict(
+            snap.get("cop_params"), defaults=priors.DAY1_COP_PARAMS
+        )
         self.memory_wk = calibration.posterior_memory_from_dict(
             snap.get("memory_wk")
         )
@@ -1094,13 +919,16 @@ class DigitalTwinEngine:
             "last_ts_utc": int(self._last_ts_utc),
         }
 
+    @staticmethod
     def compute_calibration_plan(
-        self,
         columns: Mapping[str, Sequence[float | int]],
         context: Mapping[str, Any],
         mode: Literal["manual", "auto_weekly"] = "manual",
     ) -> dict[str, Any]:
-        """Computes a lock-free calibration plan without reading/mutating `self`.
+        """Computes a lock-free calibration plan with zero state mutation.
+
+        Implemented as a `@staticmethod` to structurally guarantee that
+        background executor calibration cannot read or mutate engine state.
 
         Args:
             columns: Snapshot of full RingBuffer telemetry columns.
@@ -1121,10 +949,8 @@ class DigitalTwinEngine:
         mem_kt_in = _clone_memory(context.get("memory_kt"))
         mem_cop_in = _clone_memory(context.get("memory_cop"))
         snapshot_depth = int(context.get("snapshot_depth", 0))
-        lat_deg = float(context.get("latitude_deg", house_config.LATITUDE_DEG))
-        lon_deg = float(
-            context.get("longitude_deg", house_config.LONGITUDE_DEG)
-        )
+        lat_deg = float(context.get("latitude_deg", priors.LATITUDE_DEG))
+        lon_deg = float(context.get("longitude_deg", priors.LONGITUDE_DEG))
         last_ts_utc = int(context.get("last_ts_utc", 0))
 
         ts_seq = columns.get("ts_utc", ())
@@ -1174,10 +1000,10 @@ class DigitalTwinEngine:
         pre_snap = {
             "ts_utc": ts_now if n_total > 0 else last_ts_utc,
             "reason": f"{mode}_calibration",
-            "params_wk": _zone_params_to_dict(params_wk),
-            "params_kt": _zone_params_to_dict(params_kt),
+            "params_wk": params_wk.to_dict(),
+            "params_kt": params_kt.to_dict(),
             "k_hx_by_group_w_k": dict(k_hx_by_group),
-            "cop_params": _cop_params_to_dict(cop_params),
+            "cop_params": cop_params.to_dict(),
             "memory_wk": calibration.posterior_memory_to_dict(mem_wk_in),
             "memory_kt": calibration.posterior_memory_to_dict(mem_kt_in),
             "memory_cop": calibration.posterior_memory_to_dict(mem_cop_in),
@@ -1195,19 +1021,19 @@ class DigitalTwinEngine:
         else:
             local_bank = calibration.SeasonalEpisodeBank()
 
-        # Shared raw-aware chronological Train / Holdout split (F1)
-        is_lts_all, _ = evaluation.detect_lts_and_missing_prim_rows(columns)
-        train_end = evaluation.compute_train_holdout_split(
+        # Shared raw-aware chronological Train / Holdout split
+        is_lts_all, _ = preprocessing.detect_lts_and_missing_prim_rows(columns)
+        train_end = preprocessing.compute_train_holdout_split(
             columns, is_lts_row=is_lts_all
         )
 
         # Curate EpisodeBank strictly from training split (no holdout leakage)
-        hist_train_init: evaluation.PreprocessedHistory | None = None
+        hist_train_init: preprocessing.PreprocessedHistory | None = None
         if n_total >= 4 * const.STEPS_PER_DAY and train_end < n_total:
             train_slice: Mapping[str, Sequence[float | int]] = (
-                evaluation.slice_columns(columns, 0, train_end)
+                preprocessing.slice_columns(columns, 0, train_end)
             )
-            hist_train_init = evaluation.preprocess_history_columns(
+            hist_train_init = preprocessing.preprocess_history_columns(
                 train_slice,
                 flow_rates_l_min=flow_rates,
                 k_hx_by_group=k_hx_by_group,
@@ -1226,7 +1052,7 @@ class DigitalTwinEngine:
         else:
             train_slice = dict(columns)
 
-        # 1. Calibrate steady-state K_hx on training split
+        # 1. Calibrate steady-state K_hx on training split (damped once in auto_weekly)
         raw_khx = calibration.calibrate_k_hx_robust(
             train_slice,
             flow_rates,
@@ -1235,20 +1061,21 @@ class DigitalTwinEngine:
             lon_deg=lon_deg,
             precomputed_hist=hist_train_init,
         )
-        if mode == "auto_weekly":
+        khx_damped_here = mode == "auto_weekly"
+        if khx_damped_here:
             cand_khx = {
                 g: 0.80
-                * k_hx_by_group.get(g, house_config.DAY1_K_HX_BY_GROUP_W_K[g])
-                + 0.20 * raw_khx.get(g, house_config.DAY1_K_HX_BY_GROUP_W_K[g])
+                * k_hx_by_group.get(g, priors.DAY1_K_HX_BY_GROUP_W_K[g])
+                + 0.20 * raw_khx.get(g, priors.DAY1_K_HX_BY_GROUP_W_K[g])
                 for g in const.ALL_HYDRAULIC_GROUPS
             }
         else:
             cand_khx = dict(raw_khx)
 
         # Share precomputed train/holdout history across `wk` and `kt`
-        hist_train_cand: evaluation.PreprocessedHistory | None = None
-        hist_hold_cand: evaluation.PreprocessedHistory | None = None
-        hist_hold_prior: evaluation.PreprocessedHistory | None = None
+        hist_train_cand: preprocessing.PreprocessedHistory | None = None
+        hist_hold_cand: preprocessing.PreprocessedHistory | None = None
+        hist_hold_prior: preprocessing.PreprocessedHistory | None = None
         if n_total >= 4 * const.STEPS_PER_DAY and train_end < n_total:
             if (
                 hist_train_init is not None
@@ -1256,14 +1083,14 @@ class DigitalTwinEngine:
             ):
                 hist_train_cand = hist_train_init
             elif hist_train_init is not None:
-                hist_train_cand = evaluation.recompute_history_for_khx(
+                hist_train_cand = preprocessing.recompute_history_for_khx(
                     hist_train_init,
                     train_slice,
                     flow_rates_l_min=flow_rates,
                     k_hx_by_group=cand_khx,
                 )
             else:
-                hist_train_cand = evaluation.preprocess_history_columns(
+                hist_train_cand = preprocessing.preprocess_history_columns(
                     train_slice,
                     flow_rates_l_min=flow_rates,
                     k_hx_by_group=cand_khx,
@@ -1274,10 +1101,10 @@ class DigitalTwinEngine:
             holdout_slice_start = max(
                 0, train_end - evaluation.SPINUP_48H_STEPS
             )
-            holdout_cols = evaluation.slice_columns(
+            holdout_cols = preprocessing.slice_columns(
                 columns, holdout_slice_start, n_total
             )
-            hist_hold_cand = evaluation.preprocess_history_columns(
+            hist_hold_cand = preprocessing.preprocess_history_columns(
                 holdout_cols,
                 flow_rates_l_min=flow_rates,
                 k_hx_by_group=cand_khx,
@@ -1285,16 +1112,16 @@ class DigitalTwinEngine:
                 lat_deg=lat_deg,
                 lon_deg=lon_deg,
             )
-            evaluation.get_zone_tape(hist_hold_cand, "wk")
-            evaluation.get_zone_tape(hist_hold_cand, "kt")
-            hist_hold_prior = evaluation.recompute_history_for_khx(
+            kalman_tape.get_zone_tape(hist_hold_cand, "wk")
+            kalman_tape.get_zone_tape(hist_hold_cand, "kt")
+            hist_hold_prior = preprocessing.recompute_history_for_khx(
                 hist_hold_cand,
                 holdout_cols,
                 flow_rates_l_min=flow_rates,
-                k_hx_by_group=house_config.DAY1_K_HX_BY_GROUP_W_K,
+                k_hx_by_group=priors.DAY1_K_HX_BY_GROUP_W_K,
             )
 
-        # 2. Calibrate `wk` and `kt` (Choice A2 + B2 + D2 + D3 + Holdout Gate)
+        # 2. Calibrate `wk` and `kt` (Joint Trajectory MAP + Holdout Gate)
         out_wk, mem_wk = calibration.calibrate_zone_a2(
             columns,
             "wk",
@@ -1310,6 +1137,7 @@ class DigitalTwinEngine:
             precomputed_holdout_hist=hist_hold_cand,
             precomputed_holdout_prior_hist=hist_hold_prior,
             is_lts_row=is_lts_all,
+            khx_already_damped=khx_damped_here,
         )
         out_kt, mem_kt = calibration.calibrate_zone_a2(
             columns,
@@ -1326,11 +1154,14 @@ class DigitalTwinEngine:
             precomputed_holdout_hist=hist_hold_cand,
             precomputed_holdout_prior_hist=hist_hold_prior,
             is_lts_row=is_lts_all,
+            khx_already_damped=khx_damped_here,
         )
 
         # 3. Calibrate heat pump COP model on `train_slice` once raw rows exist
         n_non_lts_train = sum(
-            1 for idx in range(min(train_end, len(is_lts_all))) if not is_lts_all[idx]
+            1
+            for idx in range(min(train_end, len(is_lts_all)))
+            if not is_lts_all[idx]
         )
         cop_cols = train_slice if n_non_lts_train > 0 else columns
         new_cop, mem_cop, cop_diag = _fit_cop_with_mode(
@@ -1378,7 +1209,7 @@ class DigitalTwinEngine:
                 columns,
                 "kt",
                 next_params_kt,
-                house_config.DAY1_PRIORS_KT,
+                priors.DAY1_PRIORS_KT,
                 flow_rates_l_min=flow_rates,
                 k_hx_by_group=next_khx,
                 lat_deg=lat_deg,
@@ -1391,7 +1222,7 @@ class DigitalTwinEngine:
                 columns,
                 "wk",
                 next_params_wk,
-                house_config.DAY1_PRIORS_WK,
+                priors.DAY1_PRIORS_WK,
                 flow_rates_l_min=flow_rates,
                 k_hx_by_group=next_khx,
                 lat_deg=lat_deg,
@@ -1637,10 +1468,10 @@ class DigitalTwinEngine:
         """
         self.snapshot_stack.append(self._capture_snapshot(reason="pre_reset"))
 
-        self._params_wk = house_config.DAY1_PRIORS_WK
-        self._params_kt = house_config.DAY1_PRIORS_KT
-        self._k_hx_by_group_w_k = dict(house_config.DAY1_K_HX_BY_GROUP_W_K)
-        self.cop_params = house_config.DAY1_COP_PARAMS
+        self._params_wk = priors.DAY1_PRIORS_WK
+        self._params_kt = priors.DAY1_PRIORS_KT
+        self._k_hx_by_group_w_k = dict(priors.DAY1_K_HX_BY_GROUP_W_K)
+        self.cop_params = priors.DAY1_COP_PARAMS
         self.memory_wk = None
         self.memory_kt = None
         self.memory_cop = None
@@ -1713,6 +1544,21 @@ class DigitalTwinEngine:
             lon,
         )
 
+    def apply_14d_evaluation_reports(
+        self,
+        rep_wk: contracts.ZoneEvaluationReport,
+        rep_kt: contracts.ZoneEvaluationReport,
+    ) -> None:
+        """Applies newly computed 14-day evaluation reports and refreshes cache.
+
+        Args:
+            rep_wk: Evaluated 14-day hindcast report for `wk`.
+            rep_kt: Evaluated 14-day hindcast report for `kt`.
+        """
+        self.eval_report_wk = rep_wk
+        self.eval_report_kt = rep_kt
+        self._refresh_cached_snapshots()
+
     def refresh_14d_evaluation(
         self,
         columns: Mapping[str, Sequence[float | int]],
@@ -1725,13 +1571,11 @@ class DigitalTwinEngine:
         Returns:
             Dictionary `{"wk": ZoneEvaluationReport, "kt": ZoneEvaluationReport}`.
         """
-        self.eval_report_wk, self.eval_report_kt = (
-            self.compute_14d_evaluation_reports(columns)
-        )
-        self._refresh_cached_snapshots()
+        rep_wk, rep_kt = self.compute_14d_evaluation_reports(columns)
+        self.apply_14d_evaluation_reports(rep_wk, rep_kt)
         return {
-            "wk": self.eval_report_wk,
-            "kt": self.eval_report_kt,
+            "wk": rep_wk,
+            "kt": rep_kt,
         }
 
     def export_diagnostics(
@@ -1768,7 +1612,7 @@ class DigitalTwinEngine:
             "k_hx_by_group_w_k": dict(self._k_hx_by_group_w_k),
             "zones": {
                 "wk": {
-                    "parameters_active": _zone_params_to_dict(self._params_wk),
+                    "parameters_active": self._params_wk.to_dict(),
                     "posterior_std": dict(self._last_posterior_std_wk),
                     "correlation_matrix": dict(self._last_corr_wk),
                     "collinearity_warnings": list(self._last_collinear_wk),
@@ -1776,15 +1620,13 @@ class DigitalTwinEngine:
                     "parameters_previous_snapshot": (
                         prev_snap.get("params_wk") if prev_snap else None
                     ),
-                    "parameters_day1_prior": _zone_params_to_dict(
-                        house_config.DAY1_PRIORS_WK
-                    ),
+                    "parameters_day1_prior": priors.DAY1_PRIORS_WK.to_dict(),
                     "evaluation_14d": evaluation.zone_eval_report_to_dict(
                         self.eval_report_wk
                     ),
                 },
                 "kt": {
-                    "parameters_active": _zone_params_to_dict(self._params_kt),
+                    "parameters_active": self._params_kt.to_dict(),
                     "posterior_std": dict(self._last_posterior_std_kt),
                     "correlation_matrix": dict(self._last_corr_kt),
                     "collinearity_warnings": list(self._last_collinear_kt),
@@ -1792,26 +1634,22 @@ class DigitalTwinEngine:
                     "parameters_previous_snapshot": (
                         prev_snap.get("params_kt") if prev_snap else None
                     ),
-                    "parameters_day1_prior": _zone_params_to_dict(
-                        house_config.DAY1_PRIORS_KT
-                    ),
+                    "parameters_day1_prior": priors.DAY1_PRIORS_KT.to_dict(),
                     "evaluation_14d": evaluation.zone_eval_report_to_dict(
                         self.eval_report_kt
                     ),
                 },
             },
             "cop_model": {
-                "parameters_active": _cop_params_to_dict(self.cop_params),
-                "parameters_day1_prior": _cop_params_to_dict(
-                    house_config.DAY1_COP_PARAMS
-                ),
+                "parameters_active": self.cop_params.to_dict(),
+                "parameters_day1_prior": priors.DAY1_COP_PARAMS.to_dict(),
                 "diagnostics": dict(self.cop_diagnostics),
             },
             "snapshot_stack_depth": len(self.snapshot_stack),
             "calibration_history": list(self.calibration_history),
         }
 
-        return evaluation.export_csv_and_report(
+        return reporting.export_csv_and_report(
             export_dir,
             columns,
             fit_report,
@@ -1820,8 +1658,25 @@ class DigitalTwinEngine:
         )
 
     # ========================================================================
-    # Layer-2 Pure-Python Prediction, Control & Solver API (Component 5 §4.2)
+    # Layer-2 Pure-Python Prediction, Control & Solver API
     # ========================================================================
+    def get_cop_parameters(self) -> contracts.CopParameters:
+        """Returns the active calibrated heat-pump `CopParameters`."""
+        return self.cop_params
+
+    def predict_live_expected_cop(self, raw_row: Mapping[str, Any]) -> float:
+        """Predicts authoritative live expected space-heating COP from `raw_row`.
+
+        Args:
+            raw_row: Latest raw 5-minute telemetry row mapping.
+
+        Returns:
+            Expected space-heating COP (`>= 1.0`) with DHW/restwarmte guard.
+        """
+        return cop_model.predict_live_expected_cop_from_row(
+            self.cop_params, raw_row, self.cop_diagnostics
+        )
+
     def get_zone_fit_diagnostics(
         self,
         zone: contracts.ZoneId,
@@ -1839,6 +1694,129 @@ class DigitalTwinEngine:
             "correlation_matrix": dict(self._last_corr_kt),
             "collinearity_warnings": list(self._last_collinear_kt),
             "bound_warnings": list(self._last_bound_warnings_kt),
+        }
+
+    def get_zone_fit_summary(
+        self,
+        zone: contracts.ZoneId,
+    ) -> dict[str, Any]:
+        """Returns a complete JSON-safe diagnostic fit summary for `zone`.
+
+        Packages active/Day-1 parameters, 14-day hindcast metrics, Fisher
+        uncertainties, warnings, and the latest calibration record so diagnostic
+        sensors do not poke private engine attributes directly.
+
+        Args:
+            zone: Target zone identifier (`"wk"` or `"kt"`).
+
+        Returns:
+            Dictionary containing `rmse_6h_c`, `parameters_active`,
+            `parameters_day1_prior`, `params`, `eval_report`, `overall_6h`,
+            `regime_rmses`, `fisher_1sigma_std`, `posterior_std`,
+            `correlation_matrix`, `collinearity_warnings`, `bound_warnings`,
+            `last_calibration`, and `recent_calibration_history`.
+        """
+        snap = self.get_zone_snapshot(zone)
+        report = self.eval_report_wk if zone == "wk" else self.eval_report_kt
+        day1_priors = (
+            priors.DAY1_PRIORS_WK if zone == "wk" else priors.DAY1_PRIORS_KT
+        )
+
+        rmse_val: float | None = None
+        overall_dict: dict[str, Any] = {}
+        regime_dict: dict[str, Any] = {}
+        if report is not None:
+            rep_d = reporting.sanitize_json_payload(
+                evaluation.zone_eval_report_to_dict(report)
+            )
+            if isinstance(rep_d, Mapping):
+                overall_dict = dict(rep_d.get("overall_6h") or {})
+                rmse_raw = overall_dict.get("rmse_end_c")
+                if preprocessing.is_finite_number(rmse_raw):
+                    rmse_val = float(rmse_raw)
+                by_reg = rep_d.get("by_regime") or {}
+                if isinstance(by_reg, Mapping):
+                    regime_dict = {
+                        str(k): dict(v)
+                        for k, v in by_reg.items()
+                        if isinstance(v, Mapping)
+                    }
+        if rmse_val is None and preprocessing.is_finite_number(snap.rmse_6h_c):
+            rmse_val = float(snap.rmse_6h_c)
+
+        fit_diag = reporting.sanitize_json_payload(
+            self.get_zone_fit_diagnostics(zone)
+        )
+        fisher_std = dict(fit_diag.get("posterior_std") or {})
+        corr_matrix = dict(fit_diag.get("correlation_matrix") or {})
+        collinear_warns = list(fit_diag.get("collinearity_warnings") or [])
+        bound_warns = list(fit_diag.get("bound_warnings") or [])
+
+        last_cal_summary: dict[str, Any] = {}
+        acc_key = f"accepted_{zone}"
+        reason_key = f"reason_{zone}"
+        jb_key = f"holdout_j_{zone}_before"
+        ja_key = f"holdout_j_{zone}_after"
+        for item in reversed(self.calibration_history):
+            d_item = reporting.sanitize_json_payload(item)
+            if not isinstance(d_item, Mapping):
+                continue
+            if acc_key in d_item:
+                ev_str = str(d_item.get("event") or "")
+                mode_val = d_item.get("mode") or (
+                    ev_str.removeprefix("calibration_")
+                    if ev_str.startswith("calibration_")
+                    else ev_str
+                )
+                last_cal_summary = {
+                    "accepted": d_item.get(acc_key),
+                    "reason": d_item.get(reason_key),
+                    "mode": mode_val,
+                    "ts_utc": d_item.get("ts_utc"),
+                    "holdout_j_before": d_item.get(jb_key),
+                    "holdout_j_after": d_item.get(ja_key),
+                }
+                break
+            if d_item.get("zone") == zone:
+                if not fisher_std:
+                    fisher_std = dict(d_item.get("posterior_std") or {})
+                if not corr_matrix:
+                    corr_matrix = dict(d_item.get("correlation_matrix") or {})
+                if not collinear_warns:
+                    collinear_warns = list(
+                        d_item.get("collinearity_warnings") or []
+                    )
+                if not bound_warns:
+                    bound_warns = list(d_item.get("bound_warnings") or [])
+                last_cal_summary = {
+                    "accepted": d_item.get("accepted"),
+                    "reason": d_item.get("reason"),
+                    "mode": d_item.get("mode"),
+                    "ts_utc": d_item.get("ts_utc"),
+                }
+                break
+
+        return {
+            "rmse_6h_c": rmse_val,
+            "params": snap.params,
+            "parameters_active": reporting.sanitize_json_payload(
+                snap.params.to_dict()
+            ),
+            "parameters_day1_prior": reporting.sanitize_json_payload(
+                day1_priors.to_dict()
+            ),
+            "eval_report": report,
+            "overall_6h": overall_dict,
+            "regime_rmses": regime_dict,
+            "fisher_1sigma_std": fisher_std,
+            "posterior_std": fisher_std,
+            "correlation_matrix": corr_matrix,
+            "collinearity_warnings": collinear_warns,
+            "bound_warnings": bound_warns,
+            "last_calibration": last_cal_summary,
+            "recent_calibration_history": reporting.sanitize_json_payload(
+                list(self.calibration_history[-8:])
+            ),
         }
 
     def get_zone_snapshot(
@@ -1898,7 +1876,7 @@ class DigitalTwinEngine:
                     )
                 )
             if zone == "kt" and actuator.p_el_ac_w > 25.0:
-                q_ac = evaluation.compute_ac_heating_power_w(
+                q_ac = solar_weather.compute_ac_heating_power_w(
                     p_el_ac_w=float(actuator.p_el_ac_w),
                     ac_mode_code=1.0,
                     ac_defrost=False,
@@ -1914,7 +1892,7 @@ class DigitalTwinEngine:
             q_ac_w=q_ac,
             dt_s=dt_s,
         )
-        t_surf = evaluation.estimate_zone_surface_temp(
+        t_surf = zoh_kalman.estimate_zone_surface_temp(
             zone, st_next.t_air_c, st_next.t_floor_c, params
         )
         q_fl_to_air = (st_next.t_floor_c - st_next.t_air_c) * (
@@ -2099,7 +2077,7 @@ class DigitalTwinEngine:
         energy_kwh = 0.0
 
         for idx, exog in enumerate(exog_forecast):
-            t_surf_now = evaluation.estimate_zone_surface_temp(
+            t_surf_now = zoh_kalman.estimate_zone_surface_temp(
                 zone, st.t_air_c, st.t_floor_c, params
             )
             u_eff = 0.0 if t_surf_now >= max_surface_temp_c else 1.0
@@ -2195,36 +2173,7 @@ class DigitalTwinEngine:
             `LinearizedDiscreteModel` with exact ZOH matrices and `tau_coast`.
         """
         params = self._params_wk if zone == "wk" else self._params_kt
-        phi_2x2, gamma_fh, gamma_ac = _discretize_2x2(params, dt_s)
-
-        h_fh = 1000.0 / params.r_fh_k_kw
-        h_down = params.h_down_w_k
-        series_down = (
-            (h_fh * h_down) / (h_fh + h_down) if (h_fh + h_down) > 1e-9 else 0.0
-        )
-        steady_loss = params.h_loss_w_k + params.h_up_w_k + series_down
-
-        c_air_j = 3600.0 * params.c_air_wh_k
-        c_floor_j = 3600.0 * params.c_floor_wh_k
-        a00 = -(h_fh + params.h_loss_w_k + params.h_up_w_k) / c_air_j
-        a01 = h_fh / c_air_j
-        a10 = h_fh / c_floor_j
-        a11 = -(h_fh + h_down) / c_floor_j
-        tr = a00 + a11
-        det = a00 * a11 - a01 * a10
-        disc = max(0.0, tr * tr - 4.0 * det)
-        lambda_slow = 0.5 * (tr + math.sqrt(disc))
-        tau_coast_h = -1.0 / (min(-1e-9, lambda_slow) * 3600.0)
-
-        return contracts.LinearizedDiscreteModel(
-            zone=zone,
-            dt_s=float(dt_s),
-            phi_2x2=phi_2x2,
-            gamma_fh=gamma_fh,
-            gamma_ac_el_ref=gamma_ac,
-            steady_loss_total_w_k=steady_loss,
-            effective_tau_coast_h=tau_coast_h,
-        )
+        return zoh_kalman.export_2r2c_solver_model(zone, params, dt_s=dt_s)
 
     def update_flow_rates(self, flow_rates_l_min: Mapping[str, float]) -> None:
         """Updates manifold rotameter flow rates [L/min] from HA OptionsFlow."""
@@ -2259,12 +2208,12 @@ class DigitalTwinEngine:
             "desk_state_kt": dict(self._desk_state_kt),
             "flow_rates_l_min": dict(self._flow_rates_l_min),
             "k_hx_by_group_w_k": dict(self._k_hx_by_group_w_k),
-            "params_wk": _zone_params_to_dict(self._params_wk),
-            "params_kt": _zone_params_to_dict(self._params_kt),
+            "params_wk": self._params_wk.to_dict(),
+            "params_kt": self._params_kt.to_dict(),
             "estimator_wk": self.estimator_wk.to_dict(),
             "estimator_kt": self.estimator_kt.to_dict(),
             "hydraulics": self.hydraulics.to_dict(),
-            "cop_params": _cop_params_to_dict(self.cop_params),
+            "cop_params": self.cop_params.to_dict(),
             "hindcast_wk": self.hindcast_wk.to_dict(),
             "hindcast_kt": self.hindcast_kt.to_dict(),
             "memory_wk": calibration.posterior_memory_to_dict(self.memory_wk),
@@ -2294,7 +2243,7 @@ class DigitalTwinEngine:
             "bound_warnings_wk": list(self._last_bound_warnings_wk),
             "bound_warnings_kt": list(self._last_bound_warnings_kt),
         }
-        sanitized: dict[str, Any] = evaluation.sanitize_json_payload(raw_state)
+        sanitized: dict[str, Any] = reporting.sanitize_json_payload(raw_state)
         sanitized["episode_bank"] = self.episode_bank.to_dict()
         return sanitized
 
@@ -2302,11 +2251,16 @@ class DigitalTwinEngine:
         """Restores complete engine state from `betonbatterij.state` dict."""
         if not data:
             return
-        if "last_ts_utc" in data:
-            self._last_ts_utc = int(data["last_ts_utc"])
+        ts_raw = data.get("last_ts_utc")
+        if preprocessing.is_finite_number(ts_raw):
+            self._last_ts_utc = int(ts_raw)
         if "hm_ema_c" in data:
             hm_raw = data["hm_ema_c"]
-            self._hm_ema_c = float(hm_raw) if hm_raw is not None else None
+            self._hm_ema_c = (
+                float(hm_raw)
+                if preprocessing.is_finite_number(hm_raw)
+                else None
+            )
 
         if isinstance(data.get("interfloor_cache"), Mapping):
             self._interfloor_cache = {}
@@ -2314,7 +2268,8 @@ class DigitalTwinEngine:
                 if (
                     isinstance(pair, Sequence)
                     and len(pair) == 2
-                    and pair[0] is not None
+                    and preprocessing.is_finite_number(pair[0])
+                    and preprocessing.is_finite_number(pair[1])
                 ):
                     self._interfloor_cache[str(k)] = (
                         float(pair[0]),
@@ -2328,7 +2283,7 @@ class DigitalTwinEngine:
                 {
                     str(k): float(v)
                     for k, v in data["flow_rates_l_min"].items()
-                    if v is not None
+                    if preprocessing.is_finite_number(v)
                 }
             )
         if isinstance(data.get("k_hx_by_group_w_k"), Mapping):
@@ -2336,17 +2291,17 @@ class DigitalTwinEngine:
                 {
                     str(k): float(v)
                     for k, v in data["k_hx_by_group_w_k"].items()
-                    if v is not None
+                    if preprocessing.is_finite_number(v)
                 }
             )
 
         if isinstance(data.get("params_wk"), Mapping):
-            self._params_wk = _zone_params_from_dict(
-                data["params_wk"], house_config.DAY1_PRIORS_WK
+            self._params_wk = contracts.ZoneParameters.from_dict(
+                data["params_wk"], defaults=priors.DAY1_PRIORS_WK
             )
         if isinstance(data.get("params_kt"), Mapping):
-            self._params_kt = _zone_params_from_dict(
-                data["params_kt"], house_config.DAY1_PRIORS_KT
+            self._params_kt = contracts.ZoneParameters.from_dict(
+                data["params_kt"], defaults=priors.DAY1_PRIORS_KT
             )
 
         if isinstance(data.get("estimator_wk"), Mapping):
@@ -2367,7 +2322,9 @@ class DigitalTwinEngine:
             )
 
         if "cop_params" in data:
-            self.cop_params = _cop_params_from_dict(data.get("cop_params"))
+            self.cop_params = contracts.CopParameters.from_dict(
+                data.get("cop_params"), defaults=priors.DAY1_COP_PARAMS
+            )
 
         if isinstance(data.get("hindcast_wk"), Mapping):
             self.hindcast_wk = evaluation.LiveHindcastTracker.from_dict(
@@ -2413,30 +2370,50 @@ class DigitalTwinEngine:
                 if isinstance(snap, Mapping):
                     self.snapshot_stack.append(dict(snap))
 
-        self._last_q_fh_wk_w = float(data.get("last_q_fh_wk_w", 0.0))
-        self._last_q_fh_kt_w = float(data.get("last_q_fh_kt_w", 0.0))
+        self._last_q_fh_wk_w = preprocessing.safe_float(
+            data.get("last_q_fh_wk_w"), 0.0
+        )
+        self._last_q_fh_kt_w = preprocessing.safe_float(
+            data.get("last_q_fh_kt_w"), 0.0
+        )
         m_wk = data.get("last_t_air_meas_wk_c")
         m_kt = data.get("last_t_air_meas_kt_c")
-        self._last_t_air_meas_wk_c = float(m_wk) if m_wk is not None else None
-        self._last_t_air_meas_kt_c = float(m_kt) if m_kt is not None else None
+        self._last_t_air_meas_wk_c = (
+            float(m_wk) if preprocessing.is_finite_number(m_wk) else None
+        )
+        self._last_t_air_meas_kt_c = (
+            float(m_kt) if preprocessing.is_finite_number(m_kt) else None
+        )
 
         if isinstance(data.get("posterior_std_wk"), Mapping):
             self._last_posterior_std_wk = {
-                str(k): float(v) for k, v in data["posterior_std_wk"].items()
+                str(k): float(v)
+                for k, v in data["posterior_std_wk"].items()
+                if preprocessing.is_finite_number(v)
             }
         if isinstance(data.get("posterior_std_kt"), Mapping):
             self._last_posterior_std_kt = {
-                str(k): float(v) for k, v in data["posterior_std_kt"].items()
+                str(k): float(v)
+                for k, v in data["posterior_std_kt"].items()
+                if preprocessing.is_finite_number(v)
             }
         if isinstance(data.get("corr_wk"), Mapping):
             self._last_corr_wk = {
-                str(k): {str(m): float(val) for m, val in row.items()}
+                str(k): {
+                    str(m): float(val)
+                    for m, val in row.items()
+                    if preprocessing.is_finite_number(val)
+                }
                 for k, row in data["corr_wk"].items()
                 if isinstance(row, Mapping)
             }
         if isinstance(data.get("corr_kt"), Mapping):
             self._last_corr_kt = {
-                str(k): {str(m): float(val) for m, val in row.items()}
+                str(k): {
+                    str(m): float(val)
+                    for m, val in row.items()
+                    if preprocessing.is_finite_number(val)
+                }
                 for k, row in data["corr_kt"].items()
                 if isinstance(row, Mapping)
             }

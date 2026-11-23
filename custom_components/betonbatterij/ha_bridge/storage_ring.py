@@ -1,8 +1,9 @@
-"""Columnar 90-day RingBuffer and rotating weekly Store chunks (Choice F3).
+"""Columnar 90-day RingBuffer and rotating weekly Store chunks.
 
 `ColumnarRingBuffer` uses CPython `array('I')` and `array('f')` buffers with
-zero top-level `homeassistant.*` imports (`~4.35 MB` flat RAM, zero PyObject
-overhead, and `zlib` + `crc32` + `base64` chunk serialization).
+zero top-level `homeassistant.*` imports (`~6.46 MiB` (`6.77 MB`) flat RAM for
+`28,224 × 60 × 4 bytes`, zero PyObject overhead, and `zlib` + `crc32` +
+`base64` chunk serialization).
 """
 
 from __future__ import annotations
@@ -183,7 +184,7 @@ class ColumnarRingBuffer:
             max_rows: Maximum number of most-recent valid rows to return.
 
         Returns:
-            Dictionary mapping all 58 `RINGBUFFER_ALL_COLS` names to lists.
+            Dictionary mapping all 60 `RINGBUFFER_ALL_COLS` names to lists.
         """
         if max_rows <= 0 or self._row_count == 0:
             return {col: [] for col in RINGBUFFER_ALL_COLS}
@@ -465,12 +466,21 @@ class HARingBufferStore:
         return self.ringbuffer.row_count
 
     async def async_save_dirty(self) -> int:
-        """Persist only modified weekly chunk slots to disk."""
+        """Persist only modified weekly chunk slots to disk.
+
+        Discards each slot from `dirty_slots` before suspending on `async_save`
+        (restoring it on failure) so concurrent writes arriving during the I/O
+        await remain marked dirty for the next flush.
+        """
         slots_to_save = sorted(self.ringbuffer.dirty_slots)
         saved_count = 0
         for slot in slots_to_save:
             payload = self.ringbuffer.encode_chunk(slot)
-            await self._stores[slot].async_save(payload)
             self.ringbuffer.dirty_slots.discard(slot)
+            try:
+                await self._stores[slot].async_save(payload)
+            except Exception:
+                self.ringbuffer.dirty_slots.add(slot)
+                raise
             saved_count += 1
         return saved_count

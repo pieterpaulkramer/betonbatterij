@@ -1,7 +1,19 @@
-"""Exact 3x3 ZOH state estimator, Lyapunov-Taylor fast-doubling, and guards.
+"""Exact 3x3 ZOH thermal state estimator, Lyapunov-Taylor doubling, and guards.
 
-Pure Python 3.13 standard library implementation (zero `homeassistant.*`
-imports) for Component 2 (`zoh_kalman.py`, Choice E2).
+Owns continuous-to-discrete 3x3 Zero-Order-Hold discretization (`A_d, B_d, Q_d`)
+with all 7 exogenous/actuator input couplings (`B_d = Psi(dt) @ B_c`),
+unit-basis Lyapunov-Taylor fast-doubling for `Q_d`, open-loop ZOH propagation,
+PVC floor surface temperature division (`estimate_surface_temp`,
+`estimate_zone_surface_temp`), 2R2C MILP/MPC solver export
+(`export_2r2c_solver_model`), ZHA resolution detection, Tobit deadband
+pseudo-updates, Joseph-form scalar updates, and `ZoneKalmanEstimator`.
+
+Does not own raw RingBuffer ETL (`preprocessing.py`), unrolled batch tape
+evaluation (`kalman_tape.py`), or multi-regime hindcast scoring
+(`evaluation.py`).
+
+Units: temperatures in °C, thermal capacities in Wh/K (converted to J/K),
+resistances in K/kW, conductances in W/K, powers in W, time in s.
 """
 
 from __future__ import annotations
@@ -14,18 +26,18 @@ import math
 from typing import Any, TypeAlias, TypeGuard
 
 from custom_components.betonbatterij import const
-from custom_components.betonbatterij import house_config
 from custom_components.betonbatterij.domain import contracts
-from custom_components.betonbatterij.domain import solar_weather
+from custom_components.betonbatterij.domain import preprocessing
+from custom_components.betonbatterij.domain import priors
 
-# Physical continuous-time process noise constants (Component 2 Section 1.1).
+# Physical continuous-time process noise spectral densities.
 Q_AIR_BASE_K2_S: float = 2.5e-7
 Q_FLOOR_IDLE_K2_S: float = 2.8e-8
 Q_FLOOR_PUMP_K2_S: float = 2.5e-7
 TAU_HYDR_S: float = 900.0
 Q_AIR_OPEN_WINDOW_K2_S: float = 2.0e-5
 
-# Measurement noise and guard constants (Component 2 Sections 3-5).
+# Measurement noise variances and safety guard constants.
 R_MEAS_FINE_K2: float = 0.03 * 0.03  # 0.01 °C ZHA sensor.
 R_MEAS_COARSE_K2: float = 0.08 * 0.08  # 0.1 °C ZHA sensor.
 R_MEAS_HEARTBEAT_FINE_K2: float = 0.02 * 0.02
@@ -36,17 +48,16 @@ OPEN_WINDOW_HOLD_S: float = 2100.0  # 35 min hold (K_floor = 0).
 TAU_D_VENT_S: float = 1200.0  # 20 min accelerated decay when d_est < 0.
 COLD_START_FLOOR_CAP_K: float = 0.06  # Max |dT_floor| per step in 6h start.
 COLD_START_CAP_DURATION_S: float = 21_600.0
-MAX_RESTART_BRIDGE_GAP_S: float = 10_800.0
 
 _SQRT2: float = math.sqrt(2.0)
 _INV_SQRT2PI: float = 1.0 / math.sqrt(2.0 * math.pi)
 
-_Mat3: TypeAlias = tuple[
+Mat3: TypeAlias = tuple[
     tuple[float, float, float],
     tuple[float, float, float],
     tuple[float, float, float],
 ]
-_Mat3x7: TypeAlias = tuple[
+Mat3x7: TypeAlias = tuple[
     tuple[float, ...],
     tuple[float, ...],
     tuple[float, ...],
@@ -54,11 +65,83 @@ _Mat3x7: TypeAlias = tuple[
 
 
 def _is_finite(val: float | int | None) -> TypeGuard[float | int]:
-    """Checks whether `val` is a finite `float` or `int`."""
-    return val is not None and math.isfinite(val)
+    """Checks whether `val` is a finite non-boolean `float` or `int`."""
+    return (
+        val is not None
+        and not isinstance(val, bool)
+        and math.isfinite(val)
+    )
 
 
-def _matmul3(a: _Mat3, b: _Mat3) -> _Mat3:
+def surface_temp_divider_gamma(
+    zone: contracts.ZoneId,
+    r_fh_k_kw: float,
+    h_surf_w_m2k: float = priors.H_SURF_UPWARD_W_M2K,
+) -> float:
+    """Computes clamped PVC surface temperature divider ratio `gamma_surf`."""
+    area_m2 = priors.AREA_WK_M2 if zone == "wk" else priors.AREA_KT_M2
+    if area_m2 <= 0.0 or h_surf_w_m2k <= 0.0 or r_fh_k_kw <= 0.0:
+        return 0.60
+    r_surf_k_kw = 1000.0 / (h_surf_w_m2k * area_m2)
+    return max(0.10, min(0.95, r_surf_k_kw / r_fh_k_kw))
+
+
+def estimate_surface_temp(
+    t_air_c: float,
+    t_floor_c: float,
+    r_fh_k_kw: float,
+    area_m2: float,
+    h_surf_w_m2k: float = priors.H_SURF_UPWARD_W_M2K,
+) -> float:
+    """Estimates top-of-PVC floor surface temperature via thermal divider.
+
+    Args:
+        t_air_c: Room air temperature [°C].
+        t_floor_c: Concrete slab core temperature [°C].
+        r_fh_k_kw: Total slab-core-to-air thermal resistance [K/kW].
+        area_m2: Heated zone floor surface area [m²].
+        h_surf_w_m2k: Upward surface heat-transfer coefficient [W/(m²·K)].
+
+    Returns:
+        Estimated PVC top-surface temperature [°C], using divider ratio
+        `gamma_surf` clamped to `[0.10, 0.95]`.
+    """
+    if area_m2 <= 0.0 or h_surf_w_m2k <= 0.0 or r_fh_k_kw <= 0.0:
+        gamma_surf = 0.60
+    else:
+        r_surf_k_kw = 1000.0 / (h_surf_w_m2k * area_m2)
+        gamma_surf = max(0.10, min(0.95, r_surf_k_kw / r_fh_k_kw))
+    return t_air_c + gamma_surf * (t_floor_c - t_air_c)
+
+
+def estimate_zone_surface_temp(
+    zone: contracts.ZoneId,
+    t_air_c: float,
+    t_floor_c: float,
+    params: contracts.ZoneParameters,
+) -> float:
+    """Estimates top-of-PVC floor surface temperature for `zone`.
+
+    Args:
+        zone: Zone identifier (`"wk"` or `"kt"`).
+        t_air_c: Room air temperature [°C].
+        t_floor_c: Concrete slab core temperature [°C].
+        params: Physical zone parameters providing `r_fh_k_kw`.
+
+    Returns:
+        Estimated PVC surface temperature [°C].
+    """
+    area_m2 = priors.AREA_WK_M2 if zone == "wk" else priors.AREA_KT_M2
+    return estimate_surface_temp(
+        t_air_c=t_air_c,
+        t_floor_c=t_floor_c,
+        r_fh_k_kw=params.r_fh_k_kw,
+        area_m2=area_m2,
+        h_surf_w_m2k=priors.H_SURF_UPWARD_W_M2K,
+    )
+
+
+def _matmul3(a: Mat3, b: Mat3) -> Mat3:
     """Computes out-of-place 3x3 matrix product `A @ B`."""
     return (
         (
@@ -79,7 +162,7 @@ def _matmul3(a: _Mat3, b: _Mat3) -> _Mat3:
     )
 
 
-def _matmul3_bt(a: _Mat3, b: _Mat3) -> _Mat3:
+def _matmul3_bt(a: Mat3, b: Mat3) -> Mat3:
     """Computes out-of-place 3x3 matrix product `A @ B^T`."""
     return (
         (
@@ -100,7 +183,7 @@ def _matmul3_bt(a: _Mat3, b: _Mat3) -> _Mat3:
     )
 
 
-def _add3(a: _Mat3, b: _Mat3) -> _Mat3:
+def _add3(a: Mat3, b: Mat3) -> Mat3:
     """Computes elementwise 3x3 sum `A + B`."""
     return (
         (a[0][0] + b[0][0], a[0][1] + b[0][1], a[0][2] + b[0][2]),
@@ -109,7 +192,7 @@ def _add3(a: _Mat3, b: _Mat3) -> _Mat3:
     )
 
 
-def _scale3(a: _Mat3, c: float) -> _Mat3:
+def _scale3(a: Mat3, c: float) -> Mat3:
     """Scales a 3x3 matrix by scalar `c`."""
     return (
         (a[0][0] * c, a[0][1] * c, a[0][2] * c),
@@ -119,10 +202,10 @@ def _scale3(a: _Mat3, c: float) -> _Mat3:
 
 
 def _sym_lyapunov_step(
-    a_tilde: _Mat3,
-    c_prev: _Mat3,
+    a_tilde: Mat3,
+    c_prev: Mat3,
     scale: float,
-) -> _Mat3:
+) -> Mat3:
     """Computes `scale * (A_tilde @ C_prev + (A_tilde @ C_prev)^T)`."""
     ac = _matmul3(a_tilde, c_prev)
     p00 = 2.0 * ac[0][0] * scale
@@ -138,7 +221,7 @@ def _sym_lyapunov_step(
     )
 
 
-def _sym3(m: _Mat3) -> _Mat3:
+def _sym3(m: Mat3) -> Mat3:
     """Symmetrizes a 3x3 matrix `0.5 * (M + M^T)`."""
     m01 = 0.5 * (m[0][1] + m[1][0])
     m02 = 0.5 * (m[0][2] + m[2][0])
@@ -161,11 +244,11 @@ def _effective_wind_excess(
 
 
 @functools.lru_cache(maxsize=512)
-def _discretize_ab_cached(
+def discretize_ab_cached(
     params: contracts.ZoneParameters,
     dt_s: float,
     v_wind_excess_ms: float,
-) -> tuple[_Mat3, _Mat3x7, _Mat3, int, float]:
+) -> tuple[Mat3, Mat3x7, Mat3, int, float]:
     """Computes cached deterministic ZOH `(A_d, B_d, A_tilde_c, s, h)`."""
     c_air = 3600.0 * params.c_air_wh_k
     c_floor = 3600.0 * params.c_floor_wh_k
@@ -183,7 +266,7 @@ def _discretize_ab_cached(
     ta11 = -(h_fh + h_down) / c_floor
     ta22 = -1.0 / tau_d
 
-    a_tilde_c: _Mat3 = (
+    a_tilde_c: Mat3 = (
         (ta00, ta01, ta02),
         (ta10, ta11, 0.0),
         (0.0, 0.0, ta22),
@@ -200,10 +283,10 @@ def _discretize_ab_cached(
     h = dt_s / float(1 << s_steps)
 
     m_h = _scale3(a_tilde_c, h)
-    ident: _Mat3 = ((1.0, 0.0, 0.0), (0.0, 1.0, 0.0), (0.0, 0.0, 1.0))
-    a_h: _Mat3 = ident
-    psi_h: _Mat3 = _scale3(ident, h)
-    term: _Mat3 = ident
+    ident: Mat3 = ((1.0, 0.0, 0.0), (0.0, 1.0, 0.0), (0.0, 0.0, 1.0))
+    a_h: Mat3 = ident
+    psi_h: Mat3 = _scale3(ident, h)
+    term: Mat3 = ident
 
     for k in range(1, 13):
         term = _scale3(_matmul3(m_h, term), 1.0 / k)
@@ -216,12 +299,12 @@ def _discretize_ab_cached(
         a_h, psi_h = a_next, psi_next
 
     # Unscale S^-1 * X * S.
-    a_d: _Mat3 = (
+    a_d: Mat3 = (
         (a_h[0][0], a_h[0][1], a_h[0][2] * 1.0e-3),
         (a_h[1][0], a_h[1][1], a_h[1][2] * 1.0e-3),
         (0.0, 0.0, a_h[2][2]),
     )
-    psi_d: _Mat3 = (
+    psi_d: Mat3 = (
         (psi_h[0][0], psi_h[0][1], psi_h[0][2] * 1.0e-3),
         (psi_h[1][0], psi_h[1][1], psi_h[1][2] * 1.0e-3),
         (0.0, 0.0, psi_h[2][2]),
@@ -247,7 +330,7 @@ def _discretize_ab_cached(
         0.0,
     )
 
-    b_d: _Mat3x7 = (
+    b_d: Mat3x7 = (
         tuple(psi_d[0][0] * bc0[j] + psi_d[0][1] * bc1[j] for j in range(7)),
         tuple(psi_d[1][0] * bc0[j] + psi_d[1][1] * bc1[j] for j in range(7)),
         (0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0),
@@ -256,19 +339,19 @@ def _discretize_ab_cached(
 
 
 def _lyapunov_van_loan_3x3(
-    a_tilde_c: _Mat3,
+    a_tilde_c: Mat3,
     s_steps: int,
     h: float,
     c_diag_scaled: tuple[float, float, float],
-    a_h_init: _Mat3 | None = None,
-) -> _Mat3:
+    a_h_init: Mat3 | None = None,
+) -> Mat3:
     """Integrates `Q_d` for scaled diagonal spectral density `c_diag_scaled`."""
-    c_term: _Mat3 = (
+    c_term: Mat3 = (
         (h * c_diag_scaled[0], 0.0, 0.0),
         (0.0, h * c_diag_scaled[1], 0.0),
         (0.0, 0.0, h * c_diag_scaled[2]),
     )
-    q_h: _Mat3 = c_term
+    q_h: Mat3 = c_term
 
     for p in range(1, 13):
         c_term = _sym_lyapunov_step(a_tilde_c, c_term, h / (p + 1))
@@ -279,9 +362,9 @@ def _lyapunov_van_loan_3x3(
             a_h = a_h_init
         else:
             m_h = _scale3(a_tilde_c, h)
-            ident: _Mat3 = ((1.0, 0.0, 0.0), (0.0, 1.0, 0.0), (0.0, 0.0, 1.0))
+            ident: Mat3 = ((1.0, 0.0, 0.0), (0.0, 1.0, 0.0), (0.0, 0.0, 1.0))
             a_h = ident
-            term: _Mat3 = ident
+            term: Mat3 = ident
             for k in range(1, 13):
                 term = _scale3(_matmul3(m_h, term), 1.0 / k)
                 a_h = _add3(a_h, term)
@@ -303,21 +386,21 @@ def _lyapunov_van_loan_3x3(
 
 
 @functools.lru_cache(maxsize=512)
-def _discretize_qd_basis_cached(
+def discretize_qd_basis_cached(
     params: contracts.ZoneParameters,
     dt_s: float,
     v_wind_excess_ms: float,
-) -> tuple[_Mat3, _Mat3, _Mat3]:
+) -> tuple[Mat3, Mat3, Mat3]:
     """Computes cached unit-basis discrete covariance matrices `(G_0, G_1, G_2)`."""
-    _, _, a_tilde_c, s_steps, h = _discretize_ab_cached(
+    _, _, a_tilde_c, s_steps, h = discretize_ab_cached(
         params, dt_s, v_wind_excess_ms
     )
-    a_h_base: _Mat3 | None = None
+    a_h_base: Mat3 | None = None
     if s_steps > 0:
         m_h = _scale3(a_tilde_c, h)
-        ident: _Mat3 = ((1.0, 0.0, 0.0), (0.0, 1.0, 0.0), (0.0, 0.0, 1.0))
+        ident: Mat3 = ((1.0, 0.0, 0.0), (0.0, 1.0, 0.0), (0.0, 0.0, 1.0))
         a_h_base = ident
-        term: _Mat3 = ident
+        term: Mat3 = ident
         for k in range(1, 13):
             term = _scale3(_matmul3(m_h, term), 1.0 / k)
             a_h_base = _add3(a_h_base, term)
@@ -335,13 +418,13 @@ def _discretize_qd_basis_cached(
 
 
 def _combine_qd_from_basis(
-    g0: _Mat3,
-    g1: _Mat3,
-    g2: _Mat3,
+    g0: Mat3,
+    g1: Mat3,
+    g2: Mat3,
     qc00: float,
     qc11: float,
     qc22: float,
-) -> _Mat3:
+) -> Mat3:
     """Linearly combines `(G_0, G_1, G_2)` into symmetric `Q_d`."""
     q00 = qc00 * g0[0][0] + qc11 * g1[0][0] + qc22 * g2[0][0]
     q01 = qc00 * g0[0][1] + qc11 * g1[0][1] + qc22 * g2[0][1]
@@ -391,8 +474,8 @@ def discretize_zoh_3x3(
     if dt_clean <= 0.0:
         raise ValueError(f"Expected positive dt_s, got {dt_s=}")
     v_excess = _effective_wind_excess(params, float(v_wind_ms))
-    a_d, b_d, _, _, _ = _discretize_ab_cached(params, dt_clean, v_excess)
-    g0, g1, g2 = _discretize_qd_basis_cached(params, dt_clean, v_excess)
+    a_d, b_d, _, _, _ = discretize_ab_cached(params, dt_clean, v_excess)
+    g0, g1, g2 = discretize_qd_basis_cached(params, dt_clean, v_excess)
 
     c_floor = 3600.0 * params.c_floor_wh_k
     tau_d = 3600.0 * params.tau_d_h
@@ -413,6 +496,70 @@ def discretize_zoh_3x3(
 discretize_zoh_step = discretize_zoh_3x3
 
 
+def export_2r2c_solver_model(
+    zone: contracts.ZoneId,
+    params: contracts.ZoneParameters,
+    dt_s: float = 1800.0,
+) -> contracts.LinearizedDiscreteModel:
+    """Exports linearized 2x2 ZOH matrices and slow coasting time constant.
+
+    Computes exact 2x2 ZOH state-transition and actuator input matrices at
+    nominal `3.0 m/s` wind, steady-state total thermal loss conductance, and
+    the dominant slow-eigenvalue passive coasting time constant `tau_coast_h`.
+
+    Args:
+        zone: Zone identifier (`"wk"` or `"kt"`).
+        params: Active physical `ZoneParameters`.
+        dt_s: Solver time step in seconds (default `1800.0` = 30 min).
+
+    Returns:
+        `LinearizedDiscreteModel` suitable for external MILP/MPC solvers.
+    """
+    a_d, b_d, _ = discretize_zoh_3x3(
+        params=params,
+        dt_s=dt_s,
+        v_wind_ms=3.0,
+    )
+    phi_2x2 = (
+        (float(a_d[0][0]), float(a_d[0][1])),
+        (float(a_d[1][0]), float(a_d[1][1])),
+    )
+    gamma_fh = (float(b_d[0][4]), float(b_d[1][4]))
+    gamma_ac = (
+        params.eta_ac * float(b_d[0][6]),
+        params.eta_ac * float(b_d[1][6]),
+    )
+
+    h_fh = 1000.0 / params.r_fh_k_kw
+    h_down = params.h_down_w_k
+    series_down = (
+        (h_fh * h_down) / (h_fh + h_down) if (h_fh + h_down) > 1e-9 else 0.0
+    )
+    steady_loss = params.h_loss_w_k + params.h_up_w_k + series_down
+
+    c_air_j = 3600.0 * params.c_air_wh_k
+    c_floor_j = 3600.0 * params.c_floor_wh_k
+    a00 = -(h_fh + params.h_loss_w_k + params.h_up_w_k) / c_air_j
+    a01 = h_fh / c_air_j
+    a10 = h_fh / c_floor_j
+    a11 = -(h_fh + h_down) / c_floor_j
+    tr = a00 + a11
+    det = a00 * a11 - a01 * a10
+    disc = max(0.0, tr * tr - 4.0 * det)
+    lambda_slow = 0.5 * (tr + math.sqrt(disc))
+    tau_coast_h = -1.0 / (min(-1e-9, lambda_slow) * 3600.0)
+
+    return contracts.LinearizedDiscreteModel(
+        zone=zone,
+        dt_s=float(dt_s),
+        phi_2x2=phi_2x2,
+        gamma_fh=gamma_fh,
+        gamma_ac_el_ref=gamma_ac,
+        steady_loss_total_w_k=steady_loss,
+        effective_tau_coast_h=tau_coast_h,
+    )
+
+
 def propagate_open_loop_step(
     state: contracts.ThermalState,
     params: contracts.ZoneParameters,
@@ -422,6 +569,8 @@ def propagate_open_loop_step(
     dt_s: float = float(const.DT_STEP_S),
 ) -> contracts.ThermalState:
     """Advances `state` deterministically by one cached ZOH step.
+
+    Preserves all 7 off-diagonal ZOH input couplings (`B_d = Psi(dt) @ B_c`).
 
     Args:
         state: Current `ThermalState` `[T_air, T_floor, d_est]`.
@@ -435,7 +584,7 @@ def propagate_open_loop_step(
         Updated `ThermalState` at `t + dt_s`.
     """
     v_excess = _effective_wind_excess(params, exog.v_wind_ms)
-    a_d, b_d, _, _, _ = _discretize_ab_cached(params, float(dt_s), v_excess)
+    a_d, b_d, _, _, _ = discretize_ab_cached(params, float(dt_s), v_excess)
 
     u0 = exog.t_out_c
     u1 = exog.t_up_c
@@ -559,7 +708,7 @@ def _norm_cdf(z: float) -> float:
     return 0.5 * (1.0 + math.erf(z / _SQRT2))
 
 
-def _joseph_scalar_update(
+def joseph_scalar_update(
     x_minus: tuple[float, float, float],
     p_minus: list[list[float]],
     h_row: tuple[float, float, float],
@@ -600,12 +749,12 @@ def _joseph_scalar_update(
     )
 
     k_vec = (k0, k1, k2)
-    w_mat: _Mat3 = (
+    w_mat: Mat3 = (
         (1.0 - k0 * h_row[0], -k0 * h_row[1], -k0 * h_row[2]),
         (-k1 * h_row[0], 1.0 - k1 * h_row[1], -k1 * h_row[2]),
         (-k2 * h_row[0], -k2 * h_row[1], 1.0 - k2 * h_row[2]),
     )
-    p_tup: _Mat3 = (
+    p_tup: Mat3 = (
         (p_minus[0][0], p_minus[0][1], p_minus[0][2]),
         (p_minus[1][0], p_minus[1][1], p_minus[1][2]),
         (p_minus[2][0], p_minus[2][1], p_minus[2][2]),
@@ -625,7 +774,7 @@ def _joseph_scalar_update(
     return x_plus, p_plus
 
 
-def _tobit_equivalent_innovation(
+def tobit_equivalent_innovation(
     y_center: float,
     half_width_k: float,
     mu_minus: float,
@@ -663,7 +812,7 @@ def _tobit_equivalent_innovation(
 
 
 class ZoneKalmanEstimator:
-    """Choice E2 regime-adaptive 3x3 ZOH Kalman estimator for `wk` or `kt`.
+    """Regime-adaptive 3x3 ZOH Kalman estimator for `wk` or `kt`.
 
     Attributes:
         zone: Modeled zone identifier (`"wk"` or `"kt"`).
@@ -715,11 +864,14 @@ class ZoneKalmanEstimator:
         """One-sigma uncertainty `sqrt(P_11)` [°C] of the concrete slab core."""
         return math.sqrt(max(0.0, self.cov_p[1][1]))
 
+    @property
+    def last_meas_temp_c(self) -> float | None:
+        """Most recently observed room air temperature [°C], or `None`."""
+        return self._last_meas_temp_c
+
     def _select_sigma_d_w(self, ts_utc: int, aanwezig: bool) -> float:
         """Selects context-adaptive disturbance scale `sigma_d(t)` [W]."""
-        hr, mn = solar_weather.local_hour_minute(
-            ts_utc, house_config.TIMEZONE_NAME
-        )
+        hr, mn = preprocessing.local_hour_minute(ts_utc, priors.TIMEZONE_NAME)
         mins = hr * 60 + mn
         if not aanwezig or 30 <= mins < 390:  # 00:30..06:30 local time.
             return 20.0
@@ -880,7 +1032,7 @@ class ZoneKalmanEstimator:
         aanwezig: bool = True,
         t_surf_meas_c: float | None = None,
     ) -> contracts.ThermalState:
-        """Advances state and covariance by one Choice E2 ZOH Kalman step.
+        """Advances state and covariance by one regime-adaptive ZOH Kalman step.
 
         Args:
             ts_utc: Window-end Unix timestamp in seconds (UTC).
@@ -893,7 +1045,7 @@ class ZoneKalmanEstimator:
             temp_changed: True if the ZHA temperature entity changed value.
             hum_changed: True if the paired ZHA humidity entity changed value.
             sensor_stale: True if device-wide ZHA liveness exceeded 7200 s.
-            aanwezig: Household presence flag (`input_boolean.aanwezig`).
+            aanwezig: Household presence flag.
             t_surf_meas_c: Optional PVC floor surface sensor reading [°C].
 
         Returns:
@@ -952,7 +1104,7 @@ class ZoneKalmanEstimator:
         # 1. Prior state and covariance prediction.
         if use_fast_vent_decay:
             v_excess = _effective_wind_excess(self.params, exog.v_wind_ms)
-            a_d_nom, b_d_nom, _, _, _ = _discretize_ab_cached(
+            a_d_nom, b_d_nom, _, _, _ = discretize_ab_cached(
                 self.params, step_s, v_excess
             )
             a_d_floor_row = a_d_nom[1]
@@ -997,7 +1149,7 @@ class ZoneKalmanEstimator:
             a_d[2][2] * x2_old,
         )
 
-        p_tup: _Mat3 = (
+        p_tup: Mat3 = (
             (self.cov_p[0][0], self.cov_p[0][1], self.cov_p[0][2]),
             (self.cov_p[1][0], self.cov_p[1][1], self.cov_p[1][2]),
             (self.cov_p[2][0], self.cov_p[2][1], self.cov_p[2][2]),
@@ -1033,7 +1185,7 @@ class ZoneKalmanEstimator:
                     self.open_window_active = True
 
                 gain = self._constrained_air_gain(p_minus, r_v, e_k)
-                x_plus, p_plus = _joseph_scalar_update(
+                x_plus, p_plus = joseph_scalar_update(
                     x_minus,
                     p_minus,
                     h_row=(1.0, 0.0, 0.0),
@@ -1050,7 +1202,7 @@ class ZoneKalmanEstimator:
                 )
 
                 if not self.resolution_detector.is_fine_resolution:
-                    tobit = _tobit_equivalent_innovation(
+                    tobit = tobit_equivalent_innovation(
                         y_center=y_ref,
                         half_width_k=0.10,
                         mu_minus=x_minus[0],
@@ -1062,7 +1214,7 @@ class ZoneKalmanEstimator:
                         gain = self._constrained_air_gain(
                             p_minus, r_eff, e_eff
                         )
-                        x_plus, p_plus = _joseph_scalar_update(
+                        x_plus, p_plus = joseph_scalar_update(
                             x_minus,
                             p_minus,
                             h_row=(1.0, 0.0, 0.0),
@@ -1075,7 +1227,7 @@ class ZoneKalmanEstimator:
                     gain = self._constrained_air_gain(
                         p_minus, R_MEAS_HEARTBEAT_FINE_K2, e_hb
                     )
-                    x_plus, p_plus = _joseph_scalar_update(
+                    x_plus, p_plus = joseph_scalar_update(
                         x_minus,
                         p_minus,
                         h_row=(1.0, 0.0, 0.0),
@@ -1091,21 +1243,13 @@ class ZoneKalmanEstimator:
         # 3. Optional 2nd sequential Joseph update for PVC surface sensor.
         if _is_finite(t_surf_meas_c):
             y_surf = float(t_surf_meas_c)
-            area_m2 = (
-                house_config.AREA_WK_M2
-                if self.zone == "wk"
-                else house_config.AREA_KT_M2
-            )
-            r_surf_k_kw = 1000.0 / (
-                house_config.H_SURF_UPWARD_W_M2K * area_m2
-            )
-            gamma_surf = max(
-                0.10, min(0.95, r_surf_k_kw / self.params.r_fh_k_kw)
+            gamma_surf = surface_temp_divider_gamma(
+                self.zone, self.params.r_fh_k_kw
             )
             h_surf = (1.0 - gamma_surf, gamma_surf, 0.0)
             y_surf_hat = h_surf[0] * x_plus[0] + h_surf[1] * x_plus[1]
             e_surf = y_surf - y_surf_hat
-            x_plus, p_plus = _joseph_scalar_update(
+            x_plus, p_plus = joseph_scalar_update(
                 x_plus,
                 p_plus,
                 h_row=h_surf,
@@ -1140,8 +1284,8 @@ class ZoneKalmanEstimator:
         """Bridges a Home Assistant restart gap (`<= 3 h`) via variable-dt ZOH.
 
         Uses trapezoidal averages of saved and current exogenous/actuator inputs
-        for gaps up to `10800 s`, and falls back to `cold_start()` on longer
-        outages.
+        for gaps up to `const.MAX_RESTART_BRIDGE_GAP_S` (`10800 s`), and falls
+        back to `cold_start()` on longer outages.
 
         Args:
             ts_utc: Current Unix timestamp in seconds (UTC).
@@ -1162,7 +1306,7 @@ class ZoneKalmanEstimator:
         if gap_s <= 0.0:
             return self.state
 
-        if not self.initialized or gap_s > MAX_RESTART_BRIDGE_GAP_S:
+        if not self.initialized or gap_s > const.MAX_RESTART_BRIDGE_GAP_S:
             t_init = (
                 float(t_air_meas_c)
                 if _is_finite(t_air_meas_c)
@@ -1236,7 +1380,7 @@ class ZoneKalmanEstimator:
             a_d[2][2] * x2_old,
         )
 
-        p_tup: _Mat3 = (
+        p_tup: Mat3 = (
             (self.cov_p[0][0], self.cov_p[0][1], self.cov_p[0][2]),
             (self.cov_p[1][0], self.cov_p[1][1], self.cov_p[1][2]),
             (self.cov_p[2][0], self.cov_p[2][1], self.cov_p[2][2]),
@@ -1262,7 +1406,7 @@ class ZoneKalmanEstimator:
             self.resolution_detector.observe(y_meas)
             r_v = self.resolution_detector.r_meas_k2
             e_k = y_meas - x_minus[0]
-            x_plus, p_plus = _joseph_scalar_update(
+            x_plus, p_plus = joseph_scalar_update(
                 x_minus,
                 p_minus,
                 h_row=(1.0, 0.0, 0.0),
@@ -1286,7 +1430,7 @@ class ZoneKalmanEstimator:
         """Serializes estimator state and covariance for `Store` persistence."""
         return {
             "zone": self.zone,
-            "params": dataclasses.asdict(self.params),
+            "params": self.params.to_dict(),
             "state": dataclasses.asdict(self.state),
             "cov_p": [
                 [float(self.cov_p[i][j]) for j in range(3)] for i in range(3)
@@ -1321,25 +1465,11 @@ class ZoneKalmanEstimator:
         zone: contracts.ZoneId = "kt" if zone_raw == "kt" else "wk"
 
         p_raw = data.get("params")
-        if isinstance(p_raw, Mapping):
-            params = contracts.ZoneParameters(
-                c_air_wh_k=float(p_raw["c_air_wh_k"]),
-                c_floor_wh_k=float(p_raw["c_floor_wh_k"]),
-                r_fh_k_kw=float(p_raw["r_fh_k_kw"]),
-                h_loss_w_k=float(p_raw["h_loss_w_k"]),
-                h_down_w_k=float(p_raw["h_down_w_k"]),
-                alpha_sol=float(p_raw["alpha_sol"]),
-                a_sol_m2=float(p_raw["a_sol_m2"]),
-                tau_d_h=float(p_raw["tau_d_h"]),
-                eta_ac=float(p_raw["eta_ac"]),
-                k_hx_w_k=float(p_raw["k_hx_w_k"]),
-                h_up_w_k=float(p_raw.get("h_up_w_k", 0.0)),
-                c_wind=float(p_raw.get("c_wind", 0.0)),
-            )
-        else:
+        if not isinstance(p_raw, Mapping):
             raise ValueError(
                 "Missing 'params' mapping in ZoneKalmanEstimator.from_dict."
             )
+        params = contracts.ZoneParameters.from_dict(p_raw)
 
         est = cls(zone=zone, params=params)
 

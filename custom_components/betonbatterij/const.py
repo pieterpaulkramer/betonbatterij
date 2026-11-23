@@ -1,8 +1,12 @@
 """Shared constants for the BetonBatterij integration (Layer 1 Digital Twin).
 
-Defines domain identifiers, storage keys, manifold rotameter option keys,
-bitmask flags, and the canonical 58-column RingBuffer schema. Contains zero
-`homeassistant.*` imports so offline tests can import it directly.
+Owns shared domain identifiers, storage keys, manifold rotameter option keys,
+status bitmask flags, the canonical 60-column RingBuffer schema (2 uint32 +
+58 float32), and shared physical/runtime bounds (`FLOW_RATE_*`,
+`MAX_RESTART_BRIDGE_GAP_S`).
+
+Contains zero `homeassistant.*` imports so both `domain/` and offline tests can
+import it directly without Home Assistant installed.
 """
 
 from __future__ import annotations
@@ -13,6 +17,9 @@ VERSION: str = "0.1.1"
 DT_STEP_S: int = 300
 STEPS_PER_HOUR: int = 12
 STEPS_PER_DAY: int = 288
+MAX_RESTART_BRIDGE_GAP_S: float = 10_800.0  # 3.0 h max restart gap bridge
+FLOW_RATE_MIN_L_MIN: float = 0.1
+FLOW_RATE_MAX_L_MIN: float = 25.0
 RINGBUFFER_DAYS: int = 90
 RINGBUFFER_ROWS: int = RINGBUFFER_DAYS * STEPS_PER_DAY  # 25,920 rows
 RINGBUFFER_CHUNK_ROWS: int = 7 * STEPS_PER_DAY  # 2,016 rows per weekly chunk

@@ -1,10 +1,15 @@
-"""Waterside hydraulic energy balance and Choice C3 hybrid floor distribution.
+"""Waterside hydraulic energy balance and epsilon-NTU floor heat distribution.
 
-Pure Python 3.13 standard library implementation (zero `homeassistant.*`
-imports) for Component 1 Section 3 (`HydraulicModel`, 200 L buffer return
-mixing, telescoped 30-min calorimetric watcher `gamma_cal`, 1-node unmodeled
-slab proxies, downward 1st-floor ceiling leak, and optional clamp-on BG manifold
-sensors).
+Owns the secondary manifold model (`HydraulicModel`), 200 L buffer return-water
+bypass mixing, 30-minute telescoped calorimetric scaling (`gamma_cal`), 1-node
+slab proxies for unmodeled hydraulic loops, downward 1st-floor ceiling heat
+leakage into `wk`, and optional ground-floor clamp-on supply/return overrides.
+
+Does not own room air/slab Kalman state estimation (`zoh_kalman.py`) or raw
+telemetry ingestion (`preprocessing.py`).
+
+Units: temperatures in °C, thermal powers in W, conductances in W/K, flow rates
+in L/min, time in s.
 """
 
 from __future__ import annotations
@@ -16,7 +21,7 @@ import math
 from typing import Any, TypeGuard
 
 from custom_components.betonbatterij import const
-from custom_components.betonbatterij import house_config
+from custom_components.betonbatterij.domain import priors
 
 GAMMA_CAL_MIN: float = 0.75
 GAMMA_CAL_MAX: float = 1.25
@@ -36,17 +41,17 @@ _ZERO_GROUP_POWERS: dict[str, float] = {
 def _build_proxy_specs() -> tuple[
     tuple[str, float, float, float, float, str], ...
 ]:
-    """Precomputes 300s ZOH decay factors for the 8 unmodeled slab proxies."""
+    """Precomputes 300 s ZOH decay factors for the 8 unmodeled slab proxies."""
     specs: list[tuple[str, float, float, float, float, str]] = []
     for g, (
         c_floor_wh_k,
         r_fh_k_kw,
-    ) in house_config.UNMODELED_GROUP_THERMAL_PROPS.items():
+    ) in priors.UNMODELED_GROUP_THERMAL_PROPS.items():
         h_fh_w_k = 1000.0 / r_fh_k_kw
         tau_s = (c_floor_wh_k * 3600.0) / h_fh_w_k
         alpha_300 = math.exp(-300.0 / tau_s)
         upward_share = (
-            1.0 - house_config.BETA_DOWN_1E_LEAK
+            1.0 - priors.BETA_DOWN_1E_LEAK
             if g in _LEAKING_1E_GROUPS
             else 1.0
         )
@@ -74,7 +79,7 @@ def scale_k_hx_eps_ntu(
     flow_old_l_min: float,
     flow_new_l_min: float,
 ) -> float:
-    """Scales floor pipe conductance `K_hx` via epsilon-NTU heat-exchanger law.
+    """Scales floor pipe conductance `K_hx` via the epsilon-NTU law.
 
     Args:
         k_hx_old: Existing effective pipe conductance [W/K].
@@ -90,8 +95,8 @@ def scale_k_hx_eps_ntu(
         or abs(flow_new_l_min - flow_old_l_min) < 1e-6
     ):
         return float(k_hx_old)
-    c_old = flow_old_l_min * house_config.WATER_POWER_FACTOR_W_PER_LMIN_K
-    c_new = flow_new_l_min * house_config.WATER_POWER_FACTOR_W_PER_LMIN_K
+    c_old = flow_old_l_min * priors.WATER_POWER_FACTOR_W_PER_LMIN_K
+    c_new = flow_new_l_min * priors.WATER_POWER_FACTOR_W_PER_LMIN_K
     eps_old = min(0.95, max(1e-4, k_hx_old / max(1e-3, c_old)))
     ua_pipe = -c_old * math.log(1.0 - eps_old)
     return c_new * (1.0 - math.exp(-ua_pipe / max(1e-3, c_new)))
@@ -131,7 +136,7 @@ class HydraulicStepResult:
 
 
 class HydraulicModel:
-    """Choice C3 uniform epsilon-NTU (`K_hx`) model with 30-min scale watcher.
+    """Uniform epsilon-NTU (`K_hx`) floor distribution with 30-min watcher.
 
     Attributes:
         flow_rates_l_min: Configured rotameter flow rates per group [L/min].
@@ -190,7 +195,7 @@ class HydraulicModel:
                     if (v := self._lookup_group_val(k_hx_by_group_w_k, g))
                     is not None
                     else scale_k_hx_eps_ntu(
-                        house_config.DAY1_K_HX_BY_GROUP_W_K[g],
+                        priors.DAY1_K_HX_BY_GROUP_W_K[g],
                         const.DEFAULT_FLOW_RATES_L_MIN[g],
                         self.flow_rates_l_min[g],
                     ),
@@ -202,7 +207,7 @@ class HydraulicModel:
                 g: max(
                     1.0,
                     scale_k_hx_eps_ntu(
-                        house_config.DAY1_K_HX_BY_GROUP_W_K[g],
+                        priors.DAY1_K_HX_BY_GROUP_W_K[g],
                         const.DEFAULT_FLOW_RATES_L_MIN[g],
                         self.flow_rates_l_min[g],
                     ),
@@ -212,7 +217,7 @@ class HydraulicModel:
 
         self._proxy_specs = _PROXY_SPECS
         self.t_floor_proxy_c: dict[str, float] = {
-            g: 19.0 for g in house_config.UNMODELED_GROUP_THERMAL_PROPS
+            g: 19.0 for g in priors.UNMODELED_GROUP_THERMAL_PROPS
         }
         self._proxy_initialized: set[str] = set()
         self.gamma_cal: float = 1.0
@@ -261,12 +266,12 @@ class HydraulicModel:
         t_buf_top_c: float,
         t_buf_bot_raw_c: float,
     ) -> float:
-        """Computes secondary manifold supply temperature across Regimes 1-3.
+        """Computes secondary manifold supply temperature across hydraulic regimes.
 
         Applies `BUF_BOT_SENSOR_OFFSET_C` (`-0.33 °C`) to the raw bottom sensor.
         Accounts for bottom return-water bypass mixing when `threeway_room` is
         True and `v_sec_total_l_min > v_prim_l_min > 1.0`, and uses
-        `t_buf_top_c` directly during Regime 3 buffer harvest.
+        `t_buf_top_c` directly during passive buffer harvesting.
 
         Args:
             threeway_room: True when the primary 3-way valve is set to `Room`.
@@ -278,9 +283,7 @@ class HydraulicModel:
         Returns:
             Effective secondary supply water temperature [°C].
         """
-        t_bot_cal_c = (
-            float(t_buf_bot_raw_c) + house_config.BUF_BOT_SENSOR_OFFSET_C
-        )
+        t_bot_cal_c = float(t_buf_bot_raw_c) + priors.BUF_BOT_SENSOR_OFFSET_C
         v_prim = (
             0.0
             if not _is_valid_num(v_prim_l_min)
@@ -403,7 +406,9 @@ class HydraulicModel:
                         proxies[g] = a300 * proxies[g] + oma300 * t_air_g
                     else:
                         alpha = math.exp(-step_s / tau_s)
-                        proxies[g] = alpha * proxies[g] + (1.0 - alpha) * t_air_g
+                        proxies[g] = (
+                            alpha * proxies[g] + (1.0 - alpha) * t_air_g
+                        )
 
             return HydraulicStepResult(
                 q_fh_by_group_w=_ZERO_GROUP_POWERS.copy(),
@@ -462,7 +467,7 @@ class HydraulicModel:
         )
 
         # 200 L buffer tank calorimetric balance from window boundary values.
-        bot_off = house_config.BUF_BOT_SENSOR_OFFSET_C
+        bot_off = priors.BUF_BOT_SENSOR_OFFSET_C
         t_buf_mean_start = 0.5 * (
             float(t_buf_top_start_c) + float(t_buf_bot_start_c) + bot_off
         )
@@ -470,7 +475,7 @@ class HydraulicModel:
             float(t_buf_top_end_c) + float(t_buf_bot_end_c) + bot_off
         )
         d_e_buf_w = (
-            house_config.C_BUF_J_K * (t_buf_mean_end - t_buf_mean_start) / step_s
+            priors.C_BUF_J_K * (t_buf_mean_end - t_buf_mean_start) / step_s
         )
         p_prim_clean = (
             0.0 if not _is_valid_num(p_prim_th_w) else float(p_prim_th_w)
@@ -480,7 +485,7 @@ class HydraulicModel:
             (p_prim_into_buf_w - d_e_buf_w) if u_pump > 0.01 else 0.0
         )
 
-        # Unscaled Choice C2 epsilon-NTU group heat transfers.
+        # Unscaled epsilon-NTU group heat transfers.
         q_c2_by_group: dict[str, float] = {}
         for g in const.ALL_HYDRAULIC_GROUPS:
             if g == "wk":
@@ -518,7 +523,7 @@ class HydraulicModel:
             )
             if len(self._cal_window) == TELESCOPE_STEPS:
                 e_prim_j = sum(item[0] for item in self._cal_window)
-                d_e_buf_telescoped_j = house_config.C_BUF_J_K * (
+                d_e_buf_telescoped_j = priors.C_BUF_J_K * (
                     self._cal_window[-1][2] - self._cal_window[0][1]
                 )
                 e_sec_cal_j = e_prim_j - d_e_buf_telescoped_j
@@ -529,7 +534,7 @@ class HydraulicModel:
                         GAMMA_CAL_MIN, min(GAMMA_CAL_MAX, raw_gamma)
                     )
         else:
-            # Hold gamma_cal during Regime 3 harvest, DHW runs, or defrosts.
+            # Hold gamma_cal during buffer harvesting, DHW runs, or defrosts.
             self._cal_window.clear()
 
         q_fh_by_group_w: dict[str, float] = {
@@ -554,7 +559,7 @@ class HydraulicModel:
             v_bg = v_wk + v_gang
             if v_bg > 1e-6:
                 q_bg_total_w = (
-                    house_config.WATER_POWER_FACTOR_W_PER_LMIN_K
+                    priors.WATER_POWER_FACTOR_W_PER_LMIN_K
                     * v_bg
                     * (float(t_bg_sup_c) - t_bg_ret_cal)
                 )
@@ -565,7 +570,7 @@ class HydraulicModel:
                 q_fh_by_group_w["gang"] = 0.0
 
         # Downward thermal leak from active 1st-floor loops above living room.
-        q_leak_1e_to_wk_w = house_config.BETA_DOWN_1E_LEAK * (
+        q_leak_1e_to_wk_w = priors.BETA_DOWN_1E_LEAK * (
             q_fh_by_group_w["slaapkamer"]
             + q_fh_by_group_w["kamer_1e_zuid"]
             + q_fh_by_group_w["werkkamer_1e"]
@@ -704,7 +709,7 @@ class HydraulicModel:
 
         saved_proxies = data.get("t_floor_proxy_c")
         if isinstance(saved_proxies, Mapping):
-            for g in house_config.UNMODELED_GROUP_THERMAL_PROPS:
+            for g in priors.UNMODELED_GROUP_THERMAL_PROPS:
                 if g in saved_proxies and _is_valid_num(saved_proxies[g]):
                     model.t_floor_proxy_c[g] = float(saved_proxies[g])
                     model._proxy_initialized.add(g)
@@ -712,7 +717,7 @@ class HydraulicModel:
         init_list = data.get("proxy_initialized")
         if isinstance(init_list, list):
             for g in init_list:
-                if g in house_config.UNMODELED_GROUP_THERMAL_PROPS:
+                if g in priors.UNMODELED_GROUP_THERMAL_PROPS:
                     model._proxy_initialized.add(str(g))
 
         gamma = data.get("gamma_cal")

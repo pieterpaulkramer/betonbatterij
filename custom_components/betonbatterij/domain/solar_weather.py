@@ -1,20 +1,28 @@
-"""Solar geometry, Fresnel IAM, screen attenuation, and exogenous preprocessing.
+"""Solar geometry, glazing optics, outdoor selection, and zone load models.
 
-Pure Python 3.13 standard library implementation (zero external dependencies
-and zero `homeassistant.*` imports) for Component 1 Sections 1.1-1.2 and 2.
+Owns pure-Python NOAA solar position geometry, multi-pane Fresnel incidence
+angle modifier (IAM), PV-to-facade/roof irradiance projection with exterior
+screen attenuation and negative-EPEX curtailment detection, sun-guarded outdoor
+temperature selection, soft 1st-floor interfloor boundaries, and attic-office
+internal/split-AC thermal power modeling (`compute_ac_heating_power_w`,
+`compute_internal_and_ac_loads_kt`).
+
+Does not own timezone conversions (`preprocessing.py`), PVC floor surface
+temperature estimation (`zoh_kalman.py`), or RingBuffer ETL (`preprocessing.py`).
+
+Units: angles in degrees, irradiance in W/m², temperatures in °C, thermal and
+electrical powers in W, time in s.
 """
 
 from __future__ import annotations
 
 from collections.abc import Mapping
-import datetime
 import functools
 import math
 from typing import Any, TypeGuard
-import zoneinfo
 
 from custom_components.betonbatterij import const
-from custom_components.betonbatterij import house_config
+from custom_components.betonbatterij.domain import priors
 
 INTERFLOOR_HOLD_MAX_S: int = 43_200  # 12 h soft hold for 1st-floor ZHA sensors.
 DESK_ON_THRESHOLD_W: float = 35.0
@@ -41,71 +49,19 @@ _ALL_1E_ROOMS: tuple[str, ...] = (
 
 
 def _is_valid_number(value: float | int | None) -> TypeGuard[float | int]:
-    """Checks whether `value` is a finite `float` or `int`."""
-    return value is not None and math.isfinite(value)
-
-
-@functools.lru_cache(maxsize=8)
-def _get_zoneinfo(tz_name: str) -> zoneinfo.ZoneInfo | None:
-    """Returns a cached `ZoneInfo` instance, or `None` if unavailable."""
-    try:
-        return zoneinfo.ZoneInfo(tz_name)
-    except (zoneinfo.ZoneInfoNotFoundError, KeyError, ValueError):
-        return None
-
-
-@functools.lru_cache(maxsize=16)
-def _eu_dst_bounds_utc(year: int) -> tuple[int, int]:
-    """Computes EU CEST start and end Unix UTC timestamps for `year`."""
-    utc = datetime.timezone.utc
-    mar31_wd = datetime.datetime(year, 3, 31, tzinfo=utc).weekday()
-    last_sun_mar = 31 - ((mar31_wd + 1) % 7)
-    dst_start = int(
-        datetime.datetime(year, 3, last_sun_mar, 1, 0, tzinfo=utc).timestamp()
+    """Checks whether `value` is a finite non-boolean `float` or `int`."""
+    return (
+        value is not None
+        and not isinstance(value, bool)
+        and math.isfinite(value)
     )
-    oct31_wd = datetime.datetime(year, 10, 31, tzinfo=utc).weekday()
-    last_sun_oct = 31 - ((oct31_wd + 1) % 7)
-    dst_end = int(
-        datetime.datetime(year, 10, last_sun_oct, 1, 0, tzinfo=utc).timestamp()
-    )
-    return dst_start, dst_end
-
-
-def local_hour_minute(
-    ts_utc: int,
-    tz_name: str = house_config.TIMEZONE_NAME,
-) -> tuple[int, int]:
-    """Converts a Unix UTC timestamp to local `(hour, minute)`.
-
-    Uses cached `zoneinfo.ZoneInfo` when OS timezone data is available and falls
-    back to exact European Union CET/CEST transition rules on bare Windows
-    installs without the external `tzdata` package.
-
-    Args:
-        ts_utc: Unix timestamp in seconds (UTC).
-        tz_name: IANA timezone identifier (defaults to `Europe/Amsterdam`).
-
-    Returns:
-        A tuple `(hour, minute)` in local wall-clock time (`0..23`, `0..59`).
-    """
-    tz_obj = _get_zoneinfo(tz_name)
-    if tz_obj is not None:
-        dt_local = datetime.datetime.fromtimestamp(ts_utc, tz=tz_obj)
-        return dt_local.hour, dt_local.minute
-
-    utc = datetime.timezone.utc
-    dt_utc = datetime.datetime.fromtimestamp(ts_utc, tz=utc)
-    dst_start, dst_end = _eu_dst_bounds_utc(dt_utc.year)
-    offset_s = 7200 if dst_start <= ts_utc < dst_end else 3600
-    sec_of_day = math.floor(ts_utc + offset_s) % 86400
-    return sec_of_day // 3600, (sec_of_day % 3600) // 60
 
 
 @functools.lru_cache(maxsize=4096)
 def solar_position(
     ts_utc: int,
-    lat_deg: float = house_config.LATITUDE_DEG,
-    lon_deg: float = house_config.LONGITUDE_DEG,
+    lat_deg: float = priors.LATITUDE_DEG,
+    lon_deg: float = priors.LONGITUDE_DEG,
 ) -> tuple[float, float]:
     """Computes solar elevation and azimuth via NOAA solar geometry.
 
@@ -264,17 +220,16 @@ def project_solar_irradiance(
     screen_small_pos: float = 100.0,
     screen_large_pos: float = 100.0,
     pv_stale: bool = False,
-    lat_deg: float = house_config.LATITUDE_DEG,
-    lon_deg: float = house_config.LONGITUDE_DEG,
+    lat_deg: float = priors.LATITUDE_DEG,
+    lon_deg: float = priors.LONGITUDE_DEG,
 ) -> tuple[float, float, float, bool]:
     """Projects roof PV output onto living-room glazing and attic roof planes.
 
-    Implements Component 1 Section 2.2: decomposes `30°/175°` 5.74 kWp roof POA
-    irradiance via clear-sky index `k_c` into direct beam and diffuse sky
-    components, projects onto the `90°/175°` vertical South facade (with HR++
-    vs PV IAM ratio, horizon taper `< 5°`, and `0.35/0.65` exterior screen
-    attenuation) and `38°` attic roof, and detects negative-EPEX curtailment or
-    stale inverter telemetry.
+    Decomposes `30°/175°` 5.74 kWp roof plane-of-array irradiance via clear-sky
+    index `k_c` into direct beam and diffuse sky components, projects onto the
+    `90°/175°` vertical South facade (with HR++ vs PV IAM ratio, horizon taper
+    `< 5°`, and `0.35/0.65` exterior screen attenuation) and `38°` attic roof,
+    and detects negative-EPEX curtailment or stale inverter telemetry.
 
     Args:
         ts_utc: Unix timestamp in seconds (UTC).
@@ -284,6 +239,8 @@ def project_solar_irradiance(
         screen_small_pos: Small exterior screen opening (`0..100`, `100 = open`).
         screen_large_pos: Large exterior screen opening (`0..100`, `100 = open`).
         pv_stale: True when PV telemetry has been stale for more than 20 min.
+        lat_deg: Observer latitude in degrees North.
+        lon_deg: Observer longitude in degrees East.
 
     Returns:
         A tuple `(i_sol_wk_wm2, i_sol_kt_wm2, tau_screen_wk, pv_fallback_used)`,
@@ -303,8 +260,8 @@ def project_solar_irradiance(
         else max(0.0, min(100.0, float(screen_large_pos)))
     )
     open_frac = (
-        house_config.SCREEN_SMALL_WEIGHT * pos_small
-        + house_config.SCREEN_LARGE_WEIGHT * pos_large
+        priors.SCREEN_SMALL_WEIGHT * pos_small
+        + priors.SCREEN_LARGE_WEIGHT * pos_large
     ) / 100.0
 
     # Closed screens transmit 10% of direct beam and 45% of diffuse daylight.
@@ -341,14 +298,14 @@ def project_solar_irradiance(
     if elev_deg <= 0.0:
         return 0.0, 0.0, eta_scr_dir, pv_fallback_used
 
-    i_dak_wm2 = p_eff_w / house_config.PV_PEAK_KWP
+    i_dak_wm2 = p_eff_w / priors.PV_PEAK_KWP
 
     alpha_rad = math.radians(elev_deg)
     sin_alpha = math.sin(alpha_rad)
     cos_alpha = math.cos(alpha_rad)
 
-    beta_pv_rad = math.radians(house_config.PV_TILT_DEG)
-    d_az_pv_deg = _angular_diff_deg(az_deg, house_config.PV_AZIMUTH_DEG)
+    beta_pv_rad = math.radians(priors.PV_TILT_DEG)
+    d_az_pv_deg = _angular_diff_deg(az_deg, priors.PV_AZIMUTH_DEG)
     cos_d_az_pv = math.cos(math.radians(d_az_pv_deg))
     cos_dak_pos = max(
         0.0,
@@ -356,13 +313,13 @@ def project_solar_irradiance(
         + cos_alpha * math.sin(beta_pv_rad) * cos_d_az_pv,
     )
 
-    d_az_wk_deg = _angular_diff_deg(az_deg, house_config.WINDOW_WK_AZIMUTH_DEG)
+    d_az_wk_deg = _angular_diff_deg(az_deg, priors.WINDOW_WK_AZIMUTH_DEG)
     if abs(d_az_wk_deg) >= 90.0:
         cos_wk_pos = 0.0
     else:
         cos_wk_pos = max(0.0, cos_alpha * math.cos(math.radians(d_az_wk_deg)))
 
-    beta_kt_rad = math.radians(house_config.ROOF_KT_TILT_DEG)
+    beta_kt_rad = math.radians(priors.ROOF_KT_TILT_DEG)
     cos_kt_pos = max(
         0.0,
         sin_alpha * math.cos(beta_kt_rad)
@@ -424,8 +381,8 @@ def select_outdoor_temp(
     t_weather_c: float | None,
     t_hm_ema_c: float | None,
     hm_bias_c: float = 0.0,
-    lat_deg: float = house_config.LATITUDE_DEG,
-    lon_deg: float = house_config.LONGITUDE_DEG,
+    lat_deg: float = priors.LATITUDE_DEG,
+    lon_deg: float = priors.LONGITUDE_DEG,
 ) -> float:
     """Selects outdoor air temperature with summer sun-guard and fallbacks.
 
@@ -439,6 +396,8 @@ def select_outdoor_temp(
         t_weather_c: Meteorological forecast outdoor temperature [°C].
         t_hm_ema_c: 30-min EMA-filtered HeishaMon outdoor sensor [°C].
         hm_bias_c: Calibrated offset added to `t_hm_ema_c` [°C].
+        lat_deg: Observer latitude in degrees North.
+        lon_deg: Observer longitude in degrees East.
 
     Returns:
         Best available outdoor dry-bulb temperature [°C].
@@ -536,6 +495,58 @@ def compute_interfloor_boundaries(
     return t_up_wk_c, t_down_kt_c
 
 
+def compute_ac_heating_power_w(
+    p_el_ac_w: float,
+    ac_mode_code: float,
+    ac_defrost: bool,
+    t_out_c: float,
+    eta_ac: float,
+    base_q_ac_w: float | None = None,
+) -> float:
+    """Computes net split-AC thermal power delivered to the `kt` air node [W].
+
+    Single source of truth for split-AC heating, defrost heat extraction, and
+    cooling/dry thermal loads across real-time processing, history replay,
+    trajectory calibration, and forward simulation.
+
+    Args:
+        p_el_ac_w: Measured split-AC electrical power [W].
+        ac_mode_code: Numeric AC mode (`const.AC_MODE_*`).
+        ac_defrost: True when split-AC outdoor unit defrost is active.
+        t_out_c: Outdoor air temperature [°C].
+        eta_ac: Net split-AC heating efficiency at desk height @ 7 °C [-].
+        base_q_ac_w: Optional precomputed baseline AC load for non-heating
+            modes [W]. When `None`, cooling (`-3.5 * P_net`) and dry
+            (`-2.5 * P_net`) modes are computed directly.
+
+    Returns:
+        Net convective thermal power delivered to `kt` air node [W] (negative
+        during defrost or cooling/dry modes).
+    """
+    p_ac = 0.0 if not _is_valid_number(p_el_ac_w) else max(0.0, float(p_el_ac_w))
+    mode = (
+        0
+        if not _is_valid_number(ac_mode_code)
+        else int(round(float(ac_mode_code)))
+    )
+    t_out = 7.0 if not _is_valid_number(t_out_c) else float(t_out_c)
+
+    if ac_defrost:
+        if base_q_ac_w is not None and base_q_ac_w < 0.0:
+            return float(base_q_ac_w)
+        return -min(200.0, 50.0 + 0.15 * max(0.0, p_ac - 3.0))
+    if mode == int(const.AC_MODE_HEAT) and p_ac > 25.0:
+        cop_scale = max(0.60, min(1.35, 1.0 + 0.025 * (t_out - 7.0)))
+        return (p_ac - 3.0) * float(eta_ac) * cop_scale
+    if base_q_ac_w is not None:
+        return float(base_q_ac_w)
+    if mode == int(const.AC_MODE_COOL) and p_ac > 25.0:
+        return -3.5 * (p_ac - 3.0)
+    if mode == int(const.AC_MODE_DRY) and p_ac > 25.0:
+        return -2.5 * (p_ac - 3.0)
+    return 0.0
+
+
 def compute_internal_and_ac_loads_kt(
     p_desk_w: float | None,
     pir_occ: float,
@@ -580,8 +591,8 @@ def compute_internal_and_ac_loads_kt(
         else max(0.0, float(p_growlights_w))
     )
 
-    if _is_valid_number(p_desk_w):
-        p_desk = max(0.0, float(p_desk_w))
+    if _is_valid_number(p_desk_w) and float(p_desk_w) >= 0.0:
+        p_desk = float(p_desk_w)
         prev_active = bool(state.get("desk_active", False))
         if p_desk >= DESK_ON_THRESHOLD_W:
             active_now = True
@@ -625,55 +636,12 @@ def compute_internal_and_ac_loads_kt(
         q_workplace_w = PIR_WORKPLACE_GAIN_W if pir_present else 0.0
 
     q_int_kt_w = q_grow_w + q_workplace_w
-
-    # MHI Split-AC thermal output or heat extraction.
-    p_ac = 0.0 if not _is_valid_number(p_el_ac_w) else max(0.0, float(p_el_ac_w))
-    mode = (
-        0
-        if not _is_valid_number(ac_mode_code)
-        else int(round(float(ac_mode_code)))
+    q_ac_kt_w = compute_ac_heating_power_w(
+        p_el_ac_w=p_el_ac_w,
+        ac_mode_code=ac_mode_code,
+        ac_defrost=ac_defrost,
+        t_out_c=t_out_c,
+        eta_ac=eta_ac,
+        base_q_ac_w=None,
     )
-    t_out = 7.0 if not _is_valid_number(t_out_c) else float(t_out_c)
-
-    if ac_defrost:
-        p_net = max(0.0, p_ac - 3.0)
-        q_ac_kt_w = -min(200.0, 50.0 + 0.15 * p_net)
-    elif mode == int(const.AC_MODE_HEAT) and p_ac > 25.0:
-        cop_scale = max(0.60, min(1.35, 1.0 + 0.025 * (t_out - 7.0)))
-        q_ac_kt_w = (p_ac - 3.0) * float(eta_ac) * cop_scale
-    elif mode == int(const.AC_MODE_COOL) and p_ac > 25.0:
-        q_ac_kt_w = -3.5 * (p_ac - 3.0)
-    elif mode == int(const.AC_MODE_DRY) and p_ac > 25.0:
-        q_ac_kt_w = -2.5 * (p_ac - 3.0)
-    else:
-        q_ac_kt_w = 0.0
-
     return q_int_kt_w, q_ac_kt_w
-
-
-def estimate_surface_temp(
-    t_air_c: float,
-    t_floor_c: float,
-    r_fh_k_kw: float,
-    area_m2: float,
-    h_surf_w_m2k: float = house_config.H_SURF_UPWARD_W_M2K,
-) -> float:
-    """Estimates top-of-PVC floor surface temperature via thermal divider.
-
-    Args:
-        t_air_c: Room air temperature [°C].
-        t_floor_c: Concrete slab core temperature [°C].
-        r_fh_k_kw: Total slab-core-to-air thermal resistance [K/kW].
-        area_m2: Heated zone floor surface area [m²].
-        h_surf_w_m2k: Upward surface heat-transfer coefficient [W/(m²·K)].
-
-    Returns:
-        Estimated PVC top-surface temperature [°C], using divider ratio
-        `gamma_surf` clamped to `[0.10, 0.95]`.
-    """
-    if area_m2 <= 0.0 or h_surf_w_m2k <= 0.0 or r_fh_k_kw <= 0.0:
-        gamma_surf = 0.60
-    else:
-        r_surf_k_kw = 1000.0 / (h_surf_w_m2k * area_m2)
-        gamma_surf = max(0.10, min(0.95, r_surf_k_kw / r_fh_k_kw))
-    return t_air_c + gamma_surf * (t_floor_c - t_air_c)

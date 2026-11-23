@@ -1,7 +1,17 @@
-"""Panasonic 9 kW T-CAP COP curve model, P1 bias calibration, and MAP fitter.
+"""Heat-pump COP curve model, P1 electrical bias calibration, and MAP fitter.
 
-Pure Python 3.13 standard library implementation (zero `homeassistant.*`
-imports) for Component 6 (`cop_model.py`).
+Owns the Panasonic 9 kW T-CAP Carnot COP model for space heating
+(`predict_cop_cv`), two-stage domestic hot water (`predict_cop_dhw`), smooth
+evaporator frost penalty (`frost_penalty_factor`), authoritative live expected
+CV-COP evaluation from raw telemetry (`predict_live_expected_cop_from_row`),
+nocturnal P1 electrical power bias identification (`calibrate_p1_power_bias`),
+and Huber IRLS/LM parameter fitting (`fit_cop_parameters`).
+
+Does not own zone thermal 2R2C dynamics (`zoh_kalman.py`), waterside manifold
+hydraulics (`hydraulics.py`), or Home Assistant sensor publishing.
+
+Units: temperatures in °C, relative humidity in %, electrical/thermal powers in
+W, compressor frequency in Hz, COP dimensionless (`>= 1.0`).
 """
 
 from __future__ import annotations
@@ -12,24 +22,24 @@ import statistics
 from typing import Any, TypeAlias, TypeGuard
 
 from custom_components.betonbatterij import const
-from custom_components.betonbatterij import house_config
 from custom_components.betonbatterij.domain import contracts
-from custom_components.betonbatterij.domain import evaluation
+from custom_components.betonbatterij.domain import preprocessing
+from custom_components.betonbatterij.domain import priors
 from custom_components.betonbatterij.domain import solar_weather
 
 MIN_CV_RUN_STEPS: int = 12  # >= 60 min steady CV run (incl. 15 min startup).
 DHW_COMP_MAX_TEMP_C: float = 51.0
 DHW_FIT_MAX_TEMP_C: float = 50.5
 BACKUP_HEATER_POWER_W: float = 3000.0
-MEMORY_DECAY_GAMMA: float = 2.0 ** (-1.0 / 52.0)  # 52-week half-life (D2).
+MEMORY_DECAY_GAMMA: float = preprocessing.MEMORY_WEEKLY_GAMMA
 
 _CvRunSample: TypeAlias = tuple[int, float, float, float, float]
 _DhwRunSample: TypeAlias = tuple[int, float, float, float, float, float]
 
 
 def _is_finite(val: float | int | None) -> TypeGuard[float | int]:
-    """Checks whether `val` is a finite `float` or `int`."""
-    return val is not None and math.isfinite(val)
+    """Checks whether `val` is a finite non-boolean `float` or `int`."""
+    return preprocessing.is_finite_number(val)
 
 
 def frost_penalty_factor(t_out_c: float, rh_out_pct: float = 80.0) -> float:
@@ -89,6 +99,66 @@ def predict_cop_cv(
         * (1.0 - params.beta_defrost * frost)
     )
     return max(1.0, cop)
+
+
+def predict_live_expected_cop_from_row(
+    cop_params: contracts.CopParameters,
+    raw_row: Mapping[str, Any],
+    cop_diagnostics: Mapping[str, Any] | None = None,
+) -> float:
+    """Computes authoritative live expected CV-COP from a raw telemetry row.
+
+    Applies the unified DHW / residual boiler-water guard: whenever
+    `FLAG_DHW_TANK` is active or `t_wp_out_c > 40.0 °C`, the supply temperature
+    is read strictly from `t_buf_top_end_c` / `t_buf_top_start_c` in
+    `(15.0, 40.0] °C` (defaulting to `30.0 °C`), and COP is always computed via
+    `predict_cop_cv`.
+
+    Args:
+        cop_params: Active calibrated `CopParameters`.
+        raw_row: Latest raw 5-minute telemetry row mapping.
+        cop_diagnostics: Optional diagnostic mapping (retained for signature
+            uniformity; `predict_cop_cv` is always authoritative).
+
+    Returns:
+        Expected live space-heating COP (`>= 1.0`).
+    """
+    del cop_diagnostics  # `predict_cop_cv` is the single authoritative formula.
+
+    t_out = 7.0
+    for col in ("t_out_dak_c", "t_out_weather_c", "t_out_hm_c"):
+        cand = raw_row.get(col)
+        if _is_finite(cand):
+            t_out = float(cand)
+            break
+
+    raw_flags = raw_row.get("flags", 0)
+    flags_val = int(raw_flags) if _is_finite(raw_flags) else 0
+    is_dhw_tank = bool(flags_val & const.FLAG_DHW_TANK)
+
+    wp_out_raw = raw_row.get("t_wp_out_c")
+    wp_out_hot_dhw = _is_finite(wp_out_raw) and float(wp_out_raw) > 40.0
+
+    t_sup = 30.0
+    if is_dhw_tank or wp_out_hot_dhw:
+        for col in ("t_buf_top_end_c", "t_buf_top_start_c"):
+            cand = raw_row.get(col)
+            if _is_finite(cand) and 15.0 < float(cand) <= 40.0:
+                t_sup = float(cand)
+                break
+    else:
+        for col in ("t_wp_out_c", "t_buf_top_end_c", "t_buf_top_start_c"):
+            cand = raw_row.get(col)
+            if _is_finite(cand) and 15.0 < float(cand) <= 40.0:
+                t_sup = float(cand)
+                break
+
+    rh_out = 80.0
+    cand_rh = raw_row.get("rh_out_pct")
+    if _is_finite(cand_rh) and 0.0 <= float(cand_rh) <= 100.0:
+        rh_out = float(cand_rh)
+
+    return predict_cop_cv(cop_params, t_out, t_sup, rh_out)
 
 
 def predict_cop_dhw(
@@ -185,7 +255,7 @@ def corrected_wp_electrical_power_w(
 
 def calibrate_p1_power_bias(
     columns: Mapping[str, Sequence[float | int]],
-    tz_name: str = house_config.TIMEZONE_NAME,
+    tz_name: str = priors.TIMEZONE_NAME,
 ) -> float | None:
     """Estimates `delta_p_wp_bias_w` from clean nocturnal (`00:30-06:00`) flanks.
 
@@ -217,7 +287,7 @@ def calibrate_p1_power_bias(
 
     flags_col = columns.get("flags")
     p_ac_col = columns.get("p_el_ac_kt_w")
-    is_lts_row, _ = evaluation.detect_lts_and_missing_prim_rows(columns)
+    is_lts_row, _ = preprocessing.detect_lts_and_missing_prim_rows(columns)
 
     is_off: list[bool] = [False] * n
     is_on: list[bool] = [False] * n
@@ -227,7 +297,7 @@ def calibrate_p1_power_bias(
         if i < len(is_lts_row) and is_lts_row[i]:
             continue
         if ts_col is not None:
-            hr, mn = solar_weather.local_hour_minute(int(ts_col[i]), tz_name)
+            hr, mn = preprocessing.local_hour_minute(int(ts_col[i]), tz_name)
             mins = hr * 60 + mn
             night_ok = 30 <= mins < 360  # 00:30..06:00 local time.
         else:
@@ -374,7 +444,7 @@ def calibrate_p1_power_bias(
     if not flank_estimates:
         return None
 
-    bnd = house_config.COP_PARAM_BOUNDS["delta_p_wp_bias_w"]
+    bnd = priors.COP_PARAM_BOUNDS["delta_p_wp_bias_w"]
     return max(
         bnd.lower, min(bnd.upper, float(statistics.median(flank_estimates)))
     )
@@ -396,8 +466,8 @@ def _step_outdoor_temp(
     columns: Mapping[str, Sequence[float | int]],
     idx: int,
     ts_i: int,
-    lat_deg: float = house_config.LATITUDE_DEG,
-    lon_deg: float = house_config.LONGITUDE_DEG,
+    lat_deg: float = priors.LATITUDE_DEG,
+    lon_deg: float = priors.LONGITUDE_DEG,
 ) -> float:
     """Resolves outdoor temperature at row `idx`."""
     direct = _optional_float_at(columns, "t_out_c", idx)
@@ -427,50 +497,18 @@ def _step_primary_th_w(
     t_in_val = _optional_float_at(columns, "t_wp_in_c", idx)
     if v_val is not None and t_out_val is not None and t_in_val is not None:
         return (
-            house_config.WATER_POWER_FACTOR_W_PER_LMIN_K
+            priors.WATER_POWER_FACTOR_W_PER_LMIN_K
             * v_val
             * (t_out_val - t_in_val)
         )
     return 0.0
 
 
-def _age_cop_memory(
-    memory: contracts.ParameterPosteriorMemory | None,
-) -> tuple[dict[str, float], dict[str, float], dict[str, float]]:
-    """Ages Choice D2 precision memory toward Day-1 priors (52-week half-life)."""
-    mu_prior: dict[str, float] = {}
-    tau_prior: dict[str, float] = {}
-    tau_day1: dict[str, float] = {}
-    for name, bnd in house_config.COP_PARAM_BOUNDS.items():
-        t_d1 = 1.0 / (bnd.prior_std * bnd.prior_std)
-        tau_day1[name] = t_d1
-        if (
-            memory is not None
-            and name in memory.mean
-            and name in memory.precision
-        ):
-            t_prev = max(0.1 * t_d1, float(memory.precision[name]))
-            m_prev = float(memory.mean[name])
-            t_aged = (1.0 - MEMORY_DECAY_GAMMA) * t_d1 + (
-                MEMORY_DECAY_GAMMA * t_prev
-            )
-            m_aged = (
-                (1.0 - MEMORY_DECAY_GAMMA) * t_d1 * bnd.prior_mean
-                + MEMORY_DECAY_GAMMA * t_prev * m_prev
-            ) / t_aged
-            tau_prior[name] = t_aged
-            mu_prior[name] = max(bnd.lower, min(bnd.upper, m_aged))
-        else:
-            tau_prior[name] = t_d1
-            mu_prior[name] = bnd.prior_mean
-    return mu_prior, tau_prior, tau_day1
-
-
 def _extract_cop_runs(
     columns: Mapping[str, Sequence[float | int]],
     bias_ref_params: contracts.CopParameters,
-    lat_deg: float = house_config.LATITUDE_DEG,
-    lon_deg: float = house_config.LONGITUDE_DEG,
+    lat_deg: float = priors.LATITUDE_DEG,
+    lon_deg: float = priors.LONGITUDE_DEG,
 ) -> tuple[list[_CvRunSample], list[_DhwRunSample]]:
     """Extracts qualifying CV (`>= 60 min`) and DHW (`<= 50.5 °C`) runs."""
     f_comp = columns.get("f_comp_hz", ())
@@ -481,9 +519,11 @@ def _extract_cop_runs(
         n = min(n, len(ts_col))
     flags_col = columns.get("flags")
     t_sup_key = (
-        "t_wp_out_c" if columns.get("t_wp_out_c") is not None else "t_buf_top_end_c"
+        "t_wp_out_c"
+        if columns.get("t_wp_out_c") is not None
+        else "t_buf_top_end_c"
     )
-    is_lts_row, missing_prim_th = evaluation.detect_lts_and_missing_prim_rows(
+    is_lts_row, missing_prim_th = preprocessing.detect_lts_and_missing_prim_rows(
         columns
     )
 
@@ -535,7 +575,7 @@ def _extract_cop_runs(
                 else:
                     break
 
-            if end_i - start_i >= MIN_CV_RUN_STEPS:  # >= 60 min (skip 15 min startup).
+            if end_i - start_i >= MIN_CV_RUN_STEPS:
                 e_th_wh = 0.0
                 e_el_wh = 0.0
                 t_outs: list[float] = []
@@ -728,8 +768,8 @@ def _fit_cv_carnot_huber(
     huber_delta = 1.35
     lam = 1e-2
 
-    bnd_eta = house_config.COP_PARAM_BOUNDS["eta_carnot_cv"]
-    bnd_beta = house_config.COP_PARAM_BOUNDS["beta_defrost"]
+    bnd_eta = priors.COP_PARAM_BOUNDS["eta_carnot_cv"]
+    bnd_beta = priors.COP_PARAM_BOUNDS["beta_defrost"]
 
     eta_cv = float(mu_prior["eta_carnot_cv"])
     beta_def = float(mu_prior["beta_defrost"])
@@ -798,7 +838,7 @@ def _fit_dhw_carnot_huber(
     sigma_cop = 0.20
     inv_var = 1.0 / (sigma_cop * sigma_cop)
     huber_delta = 1.35
-    bnd_dhw = house_config.COP_PARAM_BOUNDS["eta_carnot_dhw"]
+    bnd_dhw = priors.COP_PARAM_BOUNDS["eta_carnot_dhw"]
 
     eta_dhw = mu_prior_dhw
     fisher_dhw = 0.0
@@ -841,20 +881,20 @@ def fit_cop_parameters(
     columns: Mapping[str, Sequence[float | int]],
     current_params: contracts.CopParameters,
     memory: contracts.ParameterPosteriorMemory | None = None,
-    lat_deg: float = house_config.LATITUDE_DEG,
-    lon_deg: float = house_config.LONGITUDE_DEG,
+    lat_deg: float = priors.LATITUDE_DEG,
+    lon_deg: float = priors.LONGITUDE_DEG,
     eval_columns: Mapping[str, Sequence[float | int]] | None = None,
 ) -> tuple[
     contracts.CopParameters,
     contracts.ParameterPosteriorMemory,
     dict[str, Any],
 ]:
-    """Calibrates `CopParameters` via Huber IRLS/LM and Choice D2 memory.
+    """Calibrates `CopParameters` via Huber IRLS/LM and seasonal memory.
 
     Args:
         columns: Columnar telemetry mapping from `ColumnarRingBuffer`.
         current_params: Currently active `CopParameters`.
-        memory: Optional Choice D2 precision-weighted seasonal memory.
+        memory: Optional precision-weighted seasonal posterior memory.
         lat_deg: Observer latitude in degrees North.
         lon_deg: Observer longitude in degrees East.
         eval_columns: Optional full column mapping used to compute 14-day
@@ -865,11 +905,13 @@ def fit_cop_parameters(
         `diagnostics` includes `rmse_cop_14d`, `prior_rmse_cop_14d`,
         `n_cv_runs`, `n_dhw_runs`, `p1_bias_calibrated_w`, and `posterior_std`.
     """
-    mu_prior, tau_prior, tau_day1 = _age_cop_memory(memory)
+    mu_prior, tau_prior, tau_day1 = preprocessing.age_precision_memory(
+        memory, priors.COP_PARAM_BOUNDS, MEMORY_DECAY_GAMMA
+    )
 
     # 1. Calibrate electrical bias from P1 nocturnal flanks (information-gated).
     p1_bias_meas = calibrate_p1_power_bias(columns)
-    bnd_bias = house_config.COP_PARAM_BOUNDS["delta_p_wp_bias_w"]
+    bnd_bias = priors.COP_PARAM_BOUNDS["delta_p_wp_bias_w"]
     if p1_bias_meas is not None:
         tau_obs_bias = 1.0 / (10.0 * 10.0)
         tau_post_bias = min(
@@ -907,7 +949,7 @@ def fit_cop_parameters(
         columns, bias_ref_params, lat_deg=lat_deg, lon_deg=lon_deg
     )
 
-    # 3. Fit CV Carnot + defrost penalty with Choice D2 information gating.
+    # 3. Fit CV Carnot + defrost penalty with Fisher information gating.
     if cv_runs:
         eta_cv, beta_def, fisher_eta_cv, fisher_beta = _fit_cv_carnot_huber(
             cv_runs, mu_prior, tau_prior
@@ -948,7 +990,7 @@ def fit_cop_parameters(
         mem_beta_mean = beta_def
         mem_beta_tau = tau_prior["beta_defrost"]
 
-    # 4. Fit DHW Carnot efficiency with Choice D2 information gating.
+    # 4. Fit DHW Carnot efficiency with Fisher information gating.
     if dhw_runs:
         eta_dhw, fisher_eta_dhw = _fit_dhw_carnot_huber(
             dhw_runs,
@@ -1014,7 +1056,7 @@ def fit_cop_parameters(
 
     sq_err_fit: list[float] = []
     sq_err_prior: list[float] = []
-    day1 = house_config.DAY1_COP_PARAMS
+    day1 = priors.DAY1_COP_PARAMS
     for ts_e, t_out_r, t_sup_r, rh_r, y_obs in eval_cv_runs:
         if ts_e >= cutoff_14d:
             sq_err_fit.append(

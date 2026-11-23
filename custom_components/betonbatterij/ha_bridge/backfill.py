@@ -24,14 +24,13 @@ from ..const import (
     FLAG_AANWEZIG,
     FLAG_AC_COOL_KT,
     FLAG_LTS_BACKFILL,
-    FLAG_OPEN_WIN_KT,
-    FLAG_OPEN_WIN_WK,
     FLAG_PUMP_SEC_ON,
     FLAG_VALID_KT,
     FLAG_VALID_WK,
     RINGBUFFER_DAYS,
     RINGBUFFER_ROWS,
 )
+from ..domain.priors import WATER_POWER_FACTOR_W_PER_LMIN_K
 from ..house_config import (
     HOUSE_ENTITIES,
     ROOM_SENSORS,
@@ -39,6 +38,7 @@ from ..house_config import (
     RoomSensorConfig,
 )
 from .accumulator import WindowAccumulatorCore, convert_power_to_w
+from .row_utils import apply_engine_outputs_to_row, make_empty_raw_row
 from .storage_ring import ColumnarRingBuffer
 
 if TYPE_CHECKING:
@@ -205,7 +205,7 @@ def replay_backfill_into_engine(
                 stale_kt=not valid_kt,
                 dt_s=float(DT_STEP_S),
             )
-            _apply_backfill_outputs(engine, row, outputs)
+            apply_engine_outputs_to_row(row, outputs, engine=engine)
             ringbuffer.append_row(row)
             rows_added += 1
 
@@ -278,7 +278,7 @@ def replay_backfill_into_engine(
                 stale_kt=closed.stale_kt,
                 dt_s=float(DT_STEP_S),
             )
-            _apply_backfill_outputs(engine, row, outputs)
+            apply_engine_outputs_to_row(row, outputs, engine=engine)
             ringbuffer.append_row(row)
             rows_added += 1
 
@@ -287,22 +287,6 @@ def replay_backfill_into_engine(
         engine.refresh_14d_evaluation(cols)
 
     return rows_added
-
-
-def _apply_backfill_outputs(
-    engine: DigitalTwinEngine,
-    row: dict[str, float | int],
-    outputs: Mapping[str, float | int],
-) -> None:
-    """Merge engine outputs and open-window flags into a backfilled row."""
-    row.update(outputs)
-    if hasattr(engine, "get_zone_snapshot"):
-        flags = int(row.get("flags", 0))
-        if engine.get_zone_snapshot("wk").open_window_active:
-            flags |= FLAG_OPEN_WIN_WK
-        if engine.get_zone_snapshot("kt").open_window_active:
-            flags |= FLAG_OPEN_WIN_KT
-        row["flags"] = flags
 
 
 def _build_lts_row_at(
@@ -350,7 +334,9 @@ def _build_lts_row_at(
         and math.isfinite(t_wp_out)
         and math.isfinite(t_wp_in)
     ):
-        p_prim_th_w = 69.73 * v_prim * (t_wp_out - t_wp_in)
+        p_prim_th_w = (
+            WATER_POWER_FACTOR_W_PER_LMIN_K * v_prim * (t_wp_out - t_wp_in)
+        )
     else:
         p_prim_th_w = float("nan")
 
@@ -456,71 +442,64 @@ def _build_lts_row_at(
     else:
         ac_mode_code = AC_MODE_OFF
 
-    return {
-        "ts_utc": ts,
-        "flags": flags,
-        "u_eff_bg": u_bg,
-        "u_eff_slaapkamer": 0.0,
-        "u_eff_badkamer": 0.0,
-        "u_eff_werkkamer_1e": 0.0,
-        "u_eff_kamer_1e_midden": 0.0,
-        "u_eff_kamer_1e_zuid": 0.0,
-        "u_eff_kantoor": 0.0,
-        "u_eff_badkamer_boven": 0.0,
-        "u_eff_logeerkamer": 0.0,
-        "u_pump_sec": u_pump,
-        "t_air_wk_c": t_wk,
-        "t_air_slaapkamer_c": _room_t("slaapkamer"),
-        "t_air_badkamer_c": _room_t("badkamer"),
-        "t_air_werkkamer_1e_c": _room_t("werkkamer_1e"),
-        "t_air_kamer_1e_midden_c": _room_t("kamer_1e_midden"),
-        "t_air_kamer_1e_zuid_c": _room_t("kamer_1e_zuid"),
-        "t_air_kantoor_c": t_kt,
-        "t_air_badkamer_boven_c": _room_t("badkamer_boven"),
-        "t_air_logeerkamer_c": _room_t("logeerkamer"),
-        "v_prim_l_min": v_prim,
-        "t_wp_out_c": t_wp_out,
-        "t_wp_in_c": t_wp_in,
-        "p_prim_th_w": p_prim_th_w,
-        "f_comp_hz": max(0.0, _s(entities.wp_compressor_freq, 0.0)),
-        "p_wp_raw_el_w": p_wp_el_w,
-        "t_buf_top_start_c": buf_top_start,
-        "t_buf_top_end_c": buf_top_end,
-        "t_buf_bot_start_c": buf_bot_start,
-        "t_buf_bot_end_c": buf_bot_end,
-        "t_dhw_top_c": _s(entities.dhw_top_temp),
-        "t_dhw_bot_c": _s(entities.dhw_bot_temp),
-        "p_p1_net_w": p_p1_net_w,
-        "t_out_dak_c": t_dak,
-        "t_out_weather_c": float("nan"),
-        "t_out_hm_c": t_hm,
-        "rh_out_pct": _s(entities.outdoor_humidity_dak, 80.0),
-        "v_wind_ms": 3.0,
-        "p_pv_w": p_pv_w,
-        "p_pv_forecast_w": max(0.0, _s(entities.pv_forecast_now_w, 0.0)),
-        "epex_eur_kwh": _s(entities.epex_price_eur_kwh),
-        "screen_small_pos": 100.0,
-        "screen_large_pos": 100.0,
-        "p_el_ac_kt_w": p_ac_w,
-        "ac_mode_code": ac_mode_code,
-        "p_desk_kt_w": p_desk_w,
-        "pir_occ_kt": 0.0,
-        "p_growlights_kt_w": p_grow_w,
-        "t_bg_sup_c": _s(entities.bg_manifold_supply_temp),
-        "t_bg_ret_c": (
-            _s(entities.bg_manifold_return_temp)
-            + entities.bg_manifold_return_offset_c
-        ),
-        "t_floor_surf_meas_wk_c": _s(entities.floor_surface_sensor_wk),
-        "t_floor_wk_c": float("nan"),
-        "d_est_wk_w": float("nan"),
-        "q_fh_wk_w": float("nan"),
-        "t_hind6h_wk_c": float("nan"),
-        "t_floor_kt_c": float("nan"),
-        "d_est_kt_w": float("nan"),
-        "q_fh_kt_w": float("nan"),
-        "t_hind6h_kt_c": float("nan"),
-    }
+    row = make_empty_raw_row(ts, flags)
+    row.update(
+        {
+            "u_eff_bg": u_bg,
+            "u_eff_slaapkamer": 0.0,
+            "u_eff_badkamer": 0.0,
+            "u_eff_werkkamer_1e": 0.0,
+            "u_eff_kamer_1e_midden": 0.0,
+            "u_eff_kamer_1e_zuid": 0.0,
+            "u_eff_kantoor": 0.0,
+            "u_eff_badkamer_boven": 0.0,
+            "u_eff_logeerkamer": 0.0,
+            "u_pump_sec": u_pump,
+            "t_air_wk_c": t_wk,
+            "t_air_slaapkamer_c": _room_t("slaapkamer"),
+            "t_air_badkamer_c": _room_t("badkamer"),
+            "t_air_werkkamer_1e_c": _room_t("werkkamer_1e"),
+            "t_air_kamer_1e_midden_c": _room_t("kamer_1e_midden"),
+            "t_air_kamer_1e_zuid_c": _room_t("kamer_1e_zuid"),
+            "t_air_kantoor_c": t_kt,
+            "t_air_badkamer_boven_c": _room_t("badkamer_boven"),
+            "t_air_logeerkamer_c": _room_t("logeerkamer"),
+            "v_prim_l_min": v_prim,
+            "t_wp_out_c": t_wp_out,
+            "t_wp_in_c": t_wp_in,
+            "p_prim_th_w": p_prim_th_w,
+            "f_comp_hz": max(0.0, _s(entities.wp_compressor_freq, 0.0)),
+            "p_wp_raw_el_w": p_wp_el_w,
+            "t_buf_top_start_c": buf_top_start,
+            "t_buf_top_end_c": buf_top_end,
+            "t_buf_bot_start_c": buf_bot_start,
+            "t_buf_bot_end_c": buf_bot_end,
+            "t_dhw_top_c": _s(entities.dhw_top_temp),
+            "t_dhw_bot_c": _s(entities.dhw_bot_temp),
+            "p_p1_net_w": p_p1_net_w,
+            "t_out_dak_c": t_dak,
+            "t_out_hm_c": t_hm,
+            "rh_out_pct": _s(entities.outdoor_humidity_dak, 80.0),
+            "v_wind_ms": 3.0,
+            "p_pv_w": p_pv_w,
+            "p_pv_forecast_w": max(0.0, _s(entities.pv_forecast_now_w, 0.0)),
+            "epex_eur_kwh": _s(entities.epex_price_eur_kwh),
+            "screen_small_pos": 100.0,
+            "screen_large_pos": 100.0,
+            "p_el_ac_kt_w": p_ac_w,
+            "ac_mode_code": ac_mode_code,
+            "p_desk_kt_w": p_desk_w,
+            "pir_occ_kt": 0.0,
+            "p_growlights_kt_w": p_grow_w,
+            "t_bg_sup_c": _s(entities.bg_manifold_supply_temp),
+            "t_bg_ret_c": (
+                _s(entities.bg_manifold_return_temp)
+                + entities.bg_manifold_return_offset_c
+            ),
+            "t_floor_surf_meas_wk_c": _s(entities.floor_surface_sensor_wk),
+        }
+    )
+    return row
 
 
 def _extract_lts_point_ts(row: Mapping[str, Any]) -> int | None:
@@ -580,18 +559,18 @@ async def async_run_cold_start_backfill(
     )
     watched_ids = probe_acc.watched_entity_ids()
 
+    # Snapshot entity units on the event loop; `hass.states` is not thread-safe.
+    lts_units: dict[str, str | None] = {}
+    for eid in watched_ids:
+        st = hass.states.get(eid)
+        if st is not None:
+            lts_units[eid] = st.attributes.get("unit_of_measurement")
+
     def _query_recorder_db() -> tuple[
         dict[str, list[tuple[int, float]]],
-        dict[str, str | None],
         list[HistoricalStateEvent],
     ]:
         lts_points: dict[str, list[tuple[int, float]]] = {}
-        lts_units: dict[str, str | None] = {}
-
-        for eid in watched_ids:
-            st = hass.states.get(eid)
-            if st is not None:
-                lts_units[eid] = st.attributes.get("unit_of_measurement")
 
         for period in ("hour", "5minute"):
             try:
@@ -671,11 +650,11 @@ async def async_run_cold_start_backfill(
                     )
                 )
 
-        return lts_points, lts_units, raw_events
+        return lts_points, raw_events
 
     try:
         rec_instance = get_instance(hass)
-        lts_points, lts_units, raw_events = (
+        lts_points, raw_events = (
             await rec_instance.async_add_executor_job(_query_recorder_db)
         )
     except Exception as err:  # noqa: BLE001
