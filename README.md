@@ -95,6 +95,7 @@ ______________________________________________________________________
 | [`tests/`](tests/)                                                     | Volledige offline `pytest`-suite voor ZOH-discretisatie, Kalman-filters, hydrauliek, COP-model, MAP-kalibratie, 90-dagen ringbuffer en lokale configuratie, plus Docker E2E-tests (`tests/e2e/`).                                                         |
 | [`local_ha_test/`](local_ha_test/)                                     | Lokale Docker Home Assistant Core testopstelling (`docker-compose.yml`, virtueel huis met 9 scenario's en E2E smoke-test).                                                                                                                                |
 | [`.github/workflows/ci.yml`](.github/workflows/ci.yml)                 | GitHub Actions CI: offline unit tests (Python 3.12 & 3.13), Ruff lint, Home Assistant Hassfest, HACS-validatie en Docker HA E2E smoke-test.                                                                                                               |
+| [`.github/workflows/release.yml`](.github/workflows/release.yml)       | GitHub Actions Release: maakt bij een nieuwe `"version"` in `manifest.json` op `main` automatisch de bijbehorende git-tag (`v<version>`) en GitHub Release aan.                                                                                           |
 
 ### Lokaal Testen
 
@@ -112,6 +113,19 @@ python -m pytest -m "e2e or e2e_full" -v
 
 Zie [`local_ha_test/README.md`](local_ha_test/README.md) voor alle details,
 scenario's en PowerShell-commando's.
+
+### Uitbrengen van een Release
+
+[`custom_components/betonbatterij/manifest.json`](custom_components/betonbatterij/manifest.json)
+is de enige bron van waarheid voor het versienummer:
+
+1. Verhoog `"version"` in `manifest.json` (bijv. `"0.1.2"` of `"0.2.0-beta.1"`).
+1. Commit en push naar `main`.
+1. [`.github/workflows/release.yml`](.github/workflows/release.yml) controleert
+   of tag `v<version>` al bestaat. Zo niet, dan maakt de workflow automatisch de
+   git-tag op die exacte commit aan en publiceert direct de GitHub Release met
+   automatisch gegenereerde release notes (versies met `-`, zoals
+   `0.2.0-beta.1`, worden automatisch als pre-release gemarkeerd).
 
 ______________________________________________________________________
 

@@ -1,0 +1,35 @@
+name: Release
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - custom_components/betonbatterij/manifest.json
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: Tag & publish release from manifest.json
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Create GitHub Release if version is new
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          VERSION=$(jq -r '.version' custom_components/betonbatterij/manifest.json)
+          TAG="v${VERSION}"
+
+          if git ls-remote --exit-code --tags origin "refs/tags/${TAG}" >/dev/null 2>&1; then
+            echo "Tag ${TAG} already exists; skipping release."
+            exit 0
+          fi
+
+          args=(release create "${TAG}" --target "${GITHUB_SHA}" --title "${TAG}" --generate-notes)
+          if [[ "${VERSION}" == *-* ]]; then
+            args+=(--prerelease)
+          fi
+          gh "${args[@]}"
