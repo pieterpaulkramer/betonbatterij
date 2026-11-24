@@ -1627,3 +1627,101 @@ def test_engine_buffer_offsets_calibration_damping_rollback_and_reset() -> None:
     assert eng.rollback_parameters(columns=None) is True
     assert eng.buffer_offsets == manual_offsets
     assert eng.hydraulics.buffer_offsets == manual_offsets
+
+
+def test_heating_and_coast_bias_veto_respects_substantial_j_gain(
+    monkeypatch: Any,
+) -> None:
+    """Allows moderate |bias_end| (<=0.35 C) when J_eval drops >=0.05 C."""
+    true_wk = dataclasses.replace(priors.DAY1_PRIORS_WK, h_loss_w_k=52.0)
+    cols = _generate_calibration_dataset(
+        n_days=8, params_wk=true_wk, params_kt=priors.DAY1_PRIORS_KT
+    )
+
+    scenario = {
+        "ov_before": 0.51,
+        "ov_after": 0.35,
+        "hc_before": 0.45,
+        "hc_after": 0.34,
+        "bias_before": 0.10,
+        "bias_after": 0.31,
+    }
+
+    def _metrics(
+        reg: str, n_win: int, j_val: float, bias_val: float
+    ) -> contracts.RegimeHindcastMetrics:
+        return contracts.RegimeHindcastMetrics(
+            regime=reg,
+            horizon_steps=72,
+            n_windows=n_win,
+            rmse_end_c=j_val,
+            rmse_path_c=j_val,
+            mae_end_c=j_val,
+            bias_end_c=bias_val,
+            j_eval_c=j_val,
+            prior_rmse_end_c=0.55,
+            skill_score_pct=20.0,
+        )
+
+    call_idx = 0
+
+    def _fake_eval(
+        _cols: Any,
+        zone: contracts.ZoneId,
+        *_args: Any,
+        **_kwargs: Any,
+    ) -> contracts.ZoneEvaluationReport:
+        nonlocal call_idx
+        is_before = (call_idx % 2) == 0
+        call_idx += 1
+        j_ov = scenario["ov_before"] if is_before else scenario["ov_after"]
+        j_hc = scenario["hc_before"] if is_before else scenario["hc_after"]
+        b_hc = scenario["bias_before"] if is_before else scenario["bias_after"]
+        return contracts.ZoneEvaluationReport(
+            zone=zone,
+            ts_evaluated_utc=1_760_000_000,
+            overall_6h=_metrics("overall_6h", 40, j_ov, b_hc),
+            by_regime={
+                "heating_and_coast": _metrics(
+                    "heating_and_coast", 20, j_hc, b_hc
+                ),
+            },
+        )
+
+    monkeypatch.setattr(evaluation, "evaluate_14d_hindcast", _fake_eval)
+
+    # 1. Large J_eval improvement (-0.16 C) + |bias_end| 0.10 -> 0.31 C: ACCEPT
+    out_acc, _ = calibration.calibrate_zone_a2(
+        cols, "wk", priors.DAY1_PRIORS_WK, mode="manual"
+    )
+    assert out_acc.accepted is True
+
+    # 2. Marginal J_eval gain (-0.01 C) + |bias_end| 0.10 -> 0.22 C: REJECT
+    scenario.update(
+        ov_before=0.35,
+        ov_after=0.34,
+        hc_before=0.34,
+        hc_after=0.33,
+        bias_before=0.10,
+        bias_after=0.22,
+    )
+    out_marg, _ = calibration.calibrate_zone_a2(
+        cols, "wk", priors.DAY1_PRIORS_WK, mode="manual"
+    )
+    assert out_marg.accepted is False
+    assert "|bias_end| degraded" in out_marg.reason
+
+    # 3. Severe |bias_end| (> 0.35 C) still REJECTED even with large J_eval gain
+    scenario.update(
+        ov_before=0.55,
+        ov_after=0.38,
+        hc_before=0.50,
+        hc_after=0.38,
+        bias_before=0.10,
+        bias_after=0.38,
+    )
+    out_sev, _ = calibration.calibrate_zone_a2(
+        cols, "wk", priors.DAY1_PRIORS_WK, mode="manual"
+    )
+    assert out_sev.accepted is False
+    assert "|bias_end| degraded" in out_sev.reason

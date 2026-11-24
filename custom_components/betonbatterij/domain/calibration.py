@@ -2531,15 +2531,33 @@ def calibrate_zone_a2(
             elif (
                 m_before.bias_end_c is not None
                 and m_after.bias_end_c is not None
-                and abs(m_after.bias_end_c) > 0.15
                 and abs(m_after.bias_end_c) > abs(m_before.bias_end_c) + 0.03
             ):
-                accepted = False
-                reject_reasons.append(
-                    f"Regime 'heating_and_coast' |bias_end| degraded "
-                    f"({abs(m_before.bias_end_c):.4f} -> "
-                    f"{abs(m_after.bias_end_c):.4f} °C)"
+                abs_b_before = abs(m_before.bias_end_c)
+                abs_b_after = abs(m_after.bias_end_c)
+                hc_j_gain = (
+                    (m_before.j_eval_c - m_after.j_eval_c)
+                    if (
+                        m_before.j_eval_c is not None
+                        and m_after.j_eval_c is not None
+                    )
+                    else 0.0
                 )
+                ov_j_gain = (
+                    (j_before - j_after)
+                    if (j_before is not None and j_after is not None)
+                    else 0.0
+                )
+                if abs_b_after > 0.35 or (
+                    abs_b_after > 0.15
+                    and hc_j_gain < 0.05
+                    and ov_j_gain < 0.05
+                ):
+                    accepted = False
+                    reject_reasons.append(
+                        f"Regime 'heating_and_coast' |bias_end| degraded "
+                        f"({abs_b_before:.4f} -> {abs_b_after:.4f} °C)"
+                    )
             continue
         if (
             m_before.rmse_end_c is not None
