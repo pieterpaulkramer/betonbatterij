@@ -2,6 +2,7 @@
   "domain": "betonbatterij",
   "name": "BetonBatterij",
   "after_dependencies": ["recorder"],
+  "categories": ["climate", "energy"],
   "codeowners": ["@pieterpaulkramer"],
   "config_flow": true,
   "documentation": "https://github.com/pieterpaulkramer/betonbatterij",
