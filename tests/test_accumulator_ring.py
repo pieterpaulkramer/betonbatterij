@@ -1504,3 +1504,119 @@ def test_coordinator_refresh_14d_eval_preserves_gang_k_hx() -> None:
         assert coord.fit_sensor_generation == 1
 
     asyncio.run(_run())
+
+
+def test_coordinator_calibration_logs_activity_to_ha_logbook() -> None:
+    """Verify calibration start & outcome summaries emit `logbook.log` calls."""
+    from custom_components.betonbatterij.ha_bridge.coordinator import (
+        _format_calibration_activity_message,
+    )
+
+    wk_out = SimpleNamespace(
+        accepted=False,
+        reason="Regime 'heating_and_coast' |bias_end| degraded",
+        holdout_before=SimpleNamespace(
+            overall_6h=SimpleNamespace(j_eval_c=0.51)
+        ),
+        holdout_after=SimpleNamespace(
+            overall_6h=SimpleNamespace(j_eval_c=0.35)
+        ),
+    )
+    kt_out = SimpleNamespace(
+        accepted=True,
+        reason="Accepted (manual)",
+        holdout_before=SimpleNamespace(
+            overall_6h=SimpleNamespace(j_eval_c=0.58)
+        ),
+        holdout_after=SimpleNamespace(
+            overall_6h=SimpleNamespace(j_eval_c=0.37)
+        ),
+    )
+    msg = _format_calibration_activity_message(
+        "manual",
+        37.2,
+        {
+            "accepted_wk": False,
+            "accepted_kt": True,
+            "outcome_wk": wk_out,
+            "outcome_kt": kt_out,
+        },
+        {"n_cv_runs": 10, "n_dhw_runs": 8, "rmse_cop_14d": 0.49},
+    )
+    assert "37s" in msg
+    assert "wk: geweigerd (0.51 -> 0.35 °C" in msg
+    assert "kt: geaccepteerd (0.58 -> 0.37 °C)" in msg
+    assert "COP: 10 CV / 8 SWW (RMSE 0.49)" in msg
+
+    logged: list[tuple[str, str, dict[str, Any]]] = []
+
+    class _ServicesStub:
+        def has_service(self, domain: str, service: str) -> bool:
+            return domain == "logbook" and service == "log"
+
+        async def async_call(
+            self,
+            domain: str,
+            service: str,
+            data: dict[str, Any],
+            blocking: bool = False,
+        ) -> None:
+            del blocking
+            logged.append((domain, service, dict(data)))
+
+    class _HassLogbookStub:
+        def __init__(self) -> None:
+            self.config = SimpleNamespace(latitude=51.4, longitude=5.5)
+            self.services = _ServicesStub()
+
+        async def async_add_executor_job(
+            self, target: Callable[..., Any], *args: Any
+        ) -> Any:
+            return target(*args)
+
+    class _CalEngineStub:
+        cop_diagnostics = {
+            "n_cv_runs": 10,
+            "n_dhw_runs": 8,
+            "rmse_cop_14d": 0.49,
+        }
+
+        def capture_calibration_context(self) -> dict[str, Any]:
+            return {}
+
+        def compute_calibration_plan(
+            self, cols: Any, ctx: Any, mode: str
+        ) -> dict[str, Any]:
+            del cols, ctx, mode
+            return {"ok": True}
+
+        def apply_calibration_plan(
+            self, plan: Any, recent_cols: Any
+        ) -> dict[str, Any]:
+            del plan, recent_cols
+            return {
+                "accepted_any": True,
+                "accepted_wk": False,
+                "accepted_kt": True,
+                "outcome_wk": wk_out,
+                "outcome_kt": kt_out,
+            }
+
+        def get_zone_snapshot(self, zone: str) -> Any:
+            return SimpleNamespace(zone=zone)
+
+        def to_state_dict(self) -> dict[str, Any]:
+            return {"episode_bank": {}}
+
+    async def _run() -> None:
+        coord = BetonBatterijCoordinator(
+            _HassLogbookStub(),  # type: ignore[arg-type]
+            SimpleNamespace(entry_id="test_entry", options={}),  # type: ignore[arg-type]
+        )
+        coord.engine = _CalEngineStub()  # type: ignore[assignment]
+        await coord.async_trigger_manual_calibration()
+
+    asyncio.run(_run())
+    assert len(logged) == 1
+    assert logged[0][0] == "logbook" and logged[0][1] == "log"
+    assert "kt: geaccepteerd (0.58 -> 0.37 °C)" in logged[0][2]["message"]

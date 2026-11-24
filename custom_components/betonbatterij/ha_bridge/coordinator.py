@@ -117,6 +117,85 @@ def _compute_14d_eval_reports_sync(
     return rep_wk, rep_kt
 
 
+def _format_zone_outcome_summary(
+    label: str,
+    zone_out: Any,
+    accepted_fallback: bool,
+) -> str:
+    """Format a concise Dutch activity summary for one zone's calibration."""
+    if zone_out is None:
+        status = "geaccepteerd" if accepted_fallback else "geweigerd"
+        return f"{label}: {status}"
+
+    accepted = bool(getattr(zone_out, "accepted", accepted_fallback))
+    status = "geaccepteerd" if accepted else "geweigerd"
+    hb = getattr(zone_out, "holdout_before", None)
+    ha = getattr(zone_out, "holdout_after", None)
+    j_before = (
+        getattr(getattr(hb, "overall_6h", None), "j_eval_c", None)
+        if hb is not None
+        else None
+    )
+    j_after = (
+        getattr(getattr(ha, "overall_6h", None), "j_eval_c", None)
+        if ha is not None
+        else None
+    )
+
+    detail_parts: list[str] = []
+    if isinstance(j_before, (int, float)) and isinstance(j_after, (int, float)):
+        detail_parts.append(f"{float(j_before):.2f} -> {float(j_after):.2f} °C")
+    reason = str(getattr(zone_out, "reason", "") or "").strip()
+    if not accepted and reason:
+        detail_parts.append(reason[:110])
+
+    if detail_parts:
+        return f"{label}: {status} ({'; '.join(detail_parts)})"
+    return f"{label}: {status}"
+
+
+def _format_calibration_activity_message(
+    mode: str,
+    elapsed_s: float,
+    outcome: Mapping[str, Any],
+    cop_diag: Mapping[str, Any] | None = None,
+) -> str:
+    """Build a concise Home Assistant Logbook summary for a calibration run."""
+    mode_nl = "handmatig" if mode == "manual" else "wekelijks"
+    dur = f"{max(0, round(elapsed_s))}s"
+
+    if outcome.get("empty") or outcome.get("aborted_stale_epoch") or (
+        outcome.get("blocked_by_seasonal_gate")
+    ):
+        reason = str(outcome.get("reason", "overgeslagen")).strip()
+        return f"Kalibratie overgeslagen ({mode_nl}, {dur}) — {reason}"
+
+    parts = [
+        _format_zone_outcome_summary(
+            "wk",
+            outcome.get("outcome_wk"),
+            bool(outcome.get("accepted_wk", False)),
+        ),
+        _format_zone_outcome_summary(
+            "kt",
+            outcome.get("outcome_kt"),
+            bool(outcome.get("accepted_kt", False)),
+        ),
+    ]
+
+    if isinstance(cop_diag, Mapping):
+        n_cv = cop_diag.get("n_cv_runs")
+        n_dhw = cop_diag.get("n_dhw_runs")
+        rmse_cop = cop_diag.get("rmse_cop_14d")
+        if isinstance(n_cv, int) and isinstance(n_dhw, int):
+            cop_txt = f"COP: {n_cv} CV / {n_dhw} SWW"
+            if isinstance(rmse_cop, (int, float)):
+                cop_txt = f"{cop_txt} (RMSE {float(rmse_cop):.2f})"
+            parts.append(cop_txt)
+
+    return f"Kalibratie afgerond ({mode_nl}, {dur}) — {' | '.join(parts)}"
+
+
 class BetonBatterijCoordinator(DataUpdateCoordinator[dict[str, Any]]):
     """Central Home Assistant coordinator for the Layer 1 Digital Twin."""
 
@@ -652,10 +731,11 @@ class BetonBatterijCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 fallback_outcome = await self.hass.async_add_executor_job(
                     self._sync_calibrate_and_eval, cols, mode
                 )
+            elapsed_s = time.perf_counter() - t0
             _LOGGER.info(
                 "BetonBatterij %s calibration solver completed in %.2f s",
                 mode,
-                time.perf_counter() - t0,
+                elapsed_s,
             )
 
             async with self._processing_lock:
@@ -672,10 +752,50 @@ class BetonBatterijCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                     )
                 else:
                     outcome = fallback_outcome
+                cop_diag_snap = (
+                    dict(self.engine.cop_diagnostics)
+                    if isinstance(
+                        getattr(self.engine, "cop_diagnostics", None), Mapping
+                    )
+                    else None
+                )
                 await self.async_flush_storage()
                 self.fit_sensor_generation += 1
                 self.async_set_updated_data(self._build_snapshot_payload())
-                return outcome
+
+            await self._async_log_activity(
+                _format_calibration_activity_message(
+                    mode, elapsed_s, outcome, cop_diag_snap
+                ),
+                entity_id="button.betonbatterij_herbereken_parameters",
+            )
+            return outcome
+
+    async def _async_log_activity(
+        self, message: str, *, entity_id: str
+    ) -> None:
+        """Record a concise activity entry in Home Assistant's Logbook."""
+        _LOGGER.info("BetonBatterij activity: %s", message)
+        services = getattr(self.hass, "services", None)
+        if services is None or not hasattr(services, "async_call"):
+            return
+        has_service = getattr(services, "has_service", None)
+        if callable(has_service) and not has_service("logbook", "log"):
+            return
+        try:
+            await services.async_call(
+                "logbook",
+                "log",
+                {
+                    "name": "BetonBatterij",
+                    "message": message,
+                    "entity_id": entity_id,
+                    "domain": DOMAIN,
+                },
+                blocking=False,
+            )
+        except Exception as err:  # pylint: disable=broad-except
+            _LOGGER.debug("Skipping logbook activity entry: %s", err)
 
     def _sync_calibrate_and_eval(
         self, cols: dict[str, list[float | int]], mode: str
@@ -755,7 +875,12 @@ class BetonBatterijCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 await self.async_flush_storage()
                 self.fit_sensor_generation += 1
                 self.async_set_updated_data(self._build_snapshot_payload())
-                return rolled_back
+
+            await self._async_log_activity(
+                "Parameters hersteld naar vorige snapshot (rollback)",
+                entity_id="button.betonbatterij_rollback_parameters",
+            )
+            return rolled_back
 
     async def async_trigger_reset(self) -> None:
         """Reset parameters to Day-1 priors with executor eval unlocked."""
@@ -800,6 +925,11 @@ class BetonBatterijCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 await self.async_flush_storage()
                 self.fit_sensor_generation += 1
                 self.async_set_updated_data(self._build_snapshot_payload())
+
+            await self._async_log_activity(
+                "Parameters teruggezet naar Day-1 priors (reset)",
+                entity_id="button.betonbatterij_reset_parameters",
+            )
 
     async def async_trigger_export_csv(
         self, export_dir: str = EXPORT_DIR_DEFAULT
