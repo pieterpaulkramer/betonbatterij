@@ -8,14 +8,19 @@ Regimes 1, 2, and 3.
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 import datetime
 import math
 
 import pytest
 
 from custom_components.betonbatterij import const
+from custom_components.betonbatterij.domain import contracts
 from custom_components.betonbatterij.domain import engine
+from custom_components.betonbatterij.domain import evaluation
 from custom_components.betonbatterij.domain import hydraulics
+from custom_components.betonbatterij.domain import kalman_tape
+from custom_components.betonbatterij.domain import preprocessing
 from custom_components.betonbatterij.domain import priors
 from custom_components.betonbatterij.domain import solar_weather
 from custom_components.betonbatterij.domain import zoh_kalman
@@ -617,3 +622,280 @@ class TestChoiceC3Hydraulics:
         assert eng.estimator_kt.params.k_hx_w_k == pytest.approx(
             expected_kt, rel=1e-9
         )
+
+    def test_calibrate_buffer_sensor_offsets_0hz_sniffing_and_gates(
+        self,
+    ) -> None:
+        """Recovers `-1.13` & `-1.63 °C` on 0 Hz sniffing and rejects noise."""
+        n = 20
+        flags = [const.FLAG_VALID_WK | const.FLAG_VALID_KT] * n
+        f_comp_hz = [0.0] * n
+        u_pump_sec = [0.0] * n
+        v_prim = [15.0] * n
+        t_wp_out = [27.25] * n
+        t_wp_in = [27.25] * n
+        t_top_s = [28.38] * n
+        t_top_e = [28.38] * n
+        t_bot_s = [28.88] * n
+        t_bot_e = [28.88] * n
+
+        # Inject non-qualifying regimes that must be excluded cleanly:
+        # k=0: active compressor (resets 4-step equilibration until k=4)
+        f_comp_hz[0] = 22.0
+        t_top_s[0] = 35.0
+        t_top_e[0] = 35.0
+        # k=11: DHW tank flag (breaks equilibration for k=11..14)
+        flags[11] |= const.FLAG_DHW_TANK
+        t_wp_out[11] = 58.0
+        t_wp_in[11] = 52.0
+        t_top_s[11] = 39.0
+        t_top_e[11] = 39.0
+        # k=19: secondary floor pump active
+        u_pump_sec[19] = 1.0
+        t_bot_s[19] = 22.0
+        t_bot_e[19] = 22.0
+
+        cols: dict[str, Sequence[float | int]] = {
+            "ts_utc": [1_763_000_000 + k * 300 for k in range(n)],
+            "flags": flags,
+            "f_comp_hz": f_comp_hz,
+            "u_pump_sec": u_pump_sec,
+            "v_prim_l_min": v_prim,
+            "t_wp_out_c": t_wp_out,
+            "t_wp_in_c": t_wp_in,
+            "t_buf_top_start_c": t_top_s,
+            "t_buf_top_end_c": t_top_e,
+            "t_buf_bot_start_c": t_bot_s,
+            "t_buf_bot_end_c": t_bot_e,
+        }
+        # Qualifying steps: k=4..10 (7 steps) and k=15..18 (4 steps) = 11 >= 6.
+        fitted = hydraulics.calibrate_buffer_sensor_offsets(cols)
+        assert fitted.buf_top_offset_c == pytest.approx(-1.13, abs=1e-6)
+        assert fitted.buf_bot_offset_c == pytest.approx(-1.63, abs=1e-6)
+
+        # Fallback to current_offsets when < 6 valid sniffing samples exist.
+        custom_prev = contracts.BufferSensorOffsets(
+            buf_top_offset_c=-0.25, buf_bot_offset_c=-0.55
+        )
+        short_cols = preprocessing.slice_columns(cols, 0, 9)  # k=4..8 -> 5 < 6
+        assert (
+            hydraulics.calibrate_buffer_sensor_offsets(
+                short_cols, current_offsets=custom_prev
+            )
+            == custom_prev
+        )
+
+        # LTS mask & clamping to [-3.0, 3.0] deg C.
+        lts_mask = [True] * 15 + [False] * 5
+        assert (
+            hydraulics.calibrate_buffer_sensor_offsets(
+                cols, current_offsets=custom_prev, is_lts_row=lts_mask
+            )
+            == custom_prev
+        )
+        extreme_cols = dict(cols)
+        extreme_cols["t_buf_top_start_c"] = [33.0] * n
+        extreme_cols["t_buf_top_end_c"] = [33.0] * n
+        extreme_cols["t_buf_bot_start_c"] = [22.0] * n
+        extreme_cols["t_buf_bot_end_c"] = [22.0] * n
+        clamped = hydraulics.calibrate_buffer_sensor_offsets(extreme_cols)
+        assert clamped.buf_top_offset_c == pytest.approx(
+            priors.BUF_SENSOR_OFFSET_MIN_C
+        )
+        assert clamped.buf_bot_offset_c == pytest.approx(
+            priors.BUF_SENSOR_OFFSET_MAX_C
+        )
+
+    def test_hydraulic_model_applies_buffer_offsets_once(self) -> None:
+        """Verifies single offset application in supply temp, step, & dict."""
+        offsets = contracts.BufferSensorOffsets(
+            buf_top_offset_c=-1.13, buf_bot_offset_c=-1.63
+        )
+        hyd = hydraulics.HydraulicModel(buffer_offsets=offsets)
+        rooms = {g: 20.0 for g in const.ALL_HYDRAULIC_GROUPS}
+
+        # Regime 2 bypass mixing (alpha_mix = 0.5):
+        # raw top = 31.13 -> cal 30.00; raw bot = 25.63 -> cal 24.00 -> sup 27.0
+        t_sup_mix = hyd.compute_effective_supply_temp(
+            threeway_room=True,
+            v_prim_l_min=6.0,
+            v_sec_total_l_min=12.0,
+            t_buf_top_c=31.13,
+            t_buf_bot_raw_c=25.63,
+        )
+        assert t_sup_mix == pytest.approx(27.0, abs=1e-9)
+
+        # step() passes raw top/bot into compute_effective_supply_temp ONCE.
+        res_active = hyd.step(
+            dt_s=300.0,
+            u_pump_sec=1.0,
+            u_valves={"wk": 1.0, "gang": 1.0},  # 5 + 2 = 7 L/min
+            threeway_room=True,
+            wp_defrost=False,
+            v_prim_l_min=3.5,  # alpha_mix = 0.5
+            p_prim_th_w=2000.0,
+            f_comp_hz=20.0,
+            t_buf_top_start_c=31.13,
+            t_buf_top_end_c=31.13,
+            t_buf_bot_start_c=25.63,
+            t_buf_bot_end_c=25.63,
+            t_floor_wk_c=22.0,
+            t_floor_kt_c=19.0,
+            room_temps_c=rooms,
+        )
+        assert res_active.t_sup_sec_c == pytest.approx(27.0, abs=1e-9)
+        assert res_active.q_fh_wk_w == pytest.approx(
+            245.0 * (27.0 - 22.0), rel=1e-9
+        )
+
+        # Pump-off fast path also applies buf_top_offset_c once.
+        res_idle = hyd.step(
+            dt_s=300.0,
+            u_pump_sec=0.0,
+            u_valves={},
+            threeway_room=True,
+            wp_defrost=False,
+            v_prim_l_min=0.0,
+            p_prim_th_w=0.0,
+            f_comp_hz=0.0,
+            t_buf_top_start_c=28.38,
+            t_buf_top_end_c=28.38,
+            t_buf_bot_start_c=28.88,
+            t_buf_bot_end_c=28.88,
+            t_floor_wk_c=22.0,
+            t_floor_kt_c=19.0,
+            room_temps_c=rooms,
+        )
+        assert res_idle.t_sup_sec_c == pytest.approx(27.25, abs=1e-9)
+
+        # update_buffer_offsets clears _cal_window and round-trips via to_dict.
+        new_offsets = contracts.BufferSensorOffsets(
+            buf_top_offset_c=-0.50, buf_bot_offset_c=-0.90
+        )
+        hyd.update_buffer_offsets(new_offsets)
+        assert len(hyd._cal_window) == 0
+        restored = hydraulics.HydraulicModel.from_dict(hyd.to_dict())
+        assert restored.buffer_offsets == new_offsets
+
+    def test_preprocess_final_state_buffer_offsets_and_harvest_gamma_parity(
+        self,
+    ) -> None:
+        """Verifies final hyd state, single offset, harvest gamma, & split."""
+        offsets = contracts.BufferSensorOffsets(
+            buf_top_offset_c=-1.00, buf_bot_offset_c=-1.50
+        )
+        # 6 steady CV steps (establishing gamma_cal ~ 1.18) + 6 harvest steps.
+        n = 12
+        base_ts = 1_763_000_000
+        # Raw top = 29.0 -> calibrated 28.0; raw bot = 26.5 -> calibrated 25.0.
+        flags = [const.FLAG_VALID_WK | const.FLAG_VALID_KT] * 6 + [
+            const.FLAG_VALID_WK
+            | const.FLAG_VALID_KT
+            | const.FLAG_Z1_OFF_HARVEST
+        ] * 6
+        cols: dict[str, Sequence[float | int]] = {
+            "ts_utc": [base_ts + k * 300 for k in range(n)],
+            "flags": flags,
+            "u_pump_sec": [1.0] * n,
+            "u_eff_bg": [1.0] * n,
+            "u_eff_slaapkamer": [1.0] * 6 + [0.0] * 6,
+            "v_prim_l_min": [15.0] * 6 + [0.0] * 6,
+            "f_comp_hz": [22.0] * 6 + [0.0] * 6,
+            "p_prim_th_w": [4300.0] * 6 + [0.0] * 6,
+            "t_buf_top_start_c": [29.0] * n,
+            "t_buf_top_end_c": [29.0] * n,
+            "t_buf_bot_start_c": [26.5] * n,
+            "t_buf_bot_end_c": [26.5] * n,
+            "t_air_wk_c": [20.0 + 0.03 * k for k in range(n)],
+            "t_air_kantoor_c": [19.0] * n,
+            "t_air_slaapkamer_c": [18.0] * n,
+            "t_out_dak_c": [4.0] * n,
+            "v_wind_ms": [2.5] * n,
+            "p_pv_w": [0.0] * n,
+        }
+
+        hist = preprocessing.preprocess_history_columns(
+            cols, buffer_offsets=offsets
+        )
+        assert hist.buf_top_offset_c == pytest.approx(-1.00)
+        assert hist.buf_bot_offset_c == pytest.approx(-1.50)
+        assert hist.t_buf_top_c[0] == pytest.approx(28.0)
+        assert hist.t_buf_bot_cal_c[0] == pytest.approx(25.0)
+        assert hist.t_sup_sec_c[0] == pytest.approx(28.0)
+        assert hist.final_gamma_cal > 1.05
+        assert hist.gamma_cal[5] == pytest.approx(hist.final_gamma_cal)
+        assert hist.gamma_cal[11] == pytest.approx(hist.final_gamma_cal)
+        assert hist.final_t_floor_proxy_c["slaapkamer"] > 18.0
+
+        # recompute_history_for_khx must NOT double-apply buf_top_offset_c.
+        hist_recomp = preprocessing.recompute_history_for_khx(
+            hist,
+            cols,
+            k_hx_by_group={"wk": priors.DAY1_K_HX_BY_GROUP_W_K["wk"] + 15.0},
+        )
+        assert hist_recomp.t_buf_top_c[0] == pytest.approx(28.0)
+        assert hist_recomp.t_sup_sec_c[0] == pytest.approx(28.0)
+
+        # Harvest gamma_cal parity between step_q_fh_for_params & kalman_tape.
+        params_wk = priors.DAY1_PRIORS_WK
+        q_harv = preprocessing.step_q_fh_for_params(
+            hist, "wk", 8, t_floor_prev_c=21.5, params=params_wk
+        )
+        assert q_harv == pytest.approx(
+            hist.gamma_cal[8] * params_wk.k_hx_w_k * (28.0 - 21.5),
+            rel=1e-12,
+        )
+
+        states_ref, q_fh_ref, _, _ = evaluation.reconstruct_kalman_states(
+            hist, "wk", params_wk
+        )
+        tape_wk = kalman_tape.get_zone_tape(hist, "wk")
+        states_tape = kalman_tape.reconstruct_states_on_tape(tape_wk, params_wk)
+        for st_r, st_t in zip(states_ref, states_tape, strict=True):
+            assert st_t[0] == pytest.approx(st_r.t_air_c, abs=1e-11)
+            assert st_t[1] == pytest.approx(st_r.t_floor_c, abs=1e-11)
+            assert st_t[2] == pytest.approx(st_r.d_est_w, abs=1e-9)
+
+        ad_std, bd_std, _, _, _ = zoh_kalman.discretize_ab_cached(
+            params_wk, 300.0, 0.0
+        )
+        errs_fast, q_fhs_fast = kalman_tape.rollout_open_loop_window_fast(
+            tape_wk,
+            k0=5,
+            length_steps=6,
+            state_init=(
+                states_ref[5].t_air_c,
+                states_ref[5].t_floor_c,
+                0.0,
+            ),
+            params=params_wk,
+            ad_std=ad_std,
+            bd_std=bd_std,
+            khx_ratio=1.0,
+            khx_scale_act=1.0,
+        )
+        res_eval = kalman_tape.evaluate_windows_on_tape(
+            tape_wk, params_wk, [(5, 6, [3, 6], 1.0)]
+        )
+        assert res_eval[0] == pytest.approx(errs_fast[2], abs=1e-11)
+        assert res_eval[1] == pytest.approx(errs_fast[5], abs=1e-11)
+        assert q_fhs_fast[0] == pytest.approx(
+            hist.gamma_cal[6]
+            * params_wk.k_hx_w_k
+            * (28.0 - states_ref[5].t_floor_c),
+            rel=1e-11,
+        )
+        assert q_fh_ref[8] > 0.0
+
+        # F1 Case C: 80d LTS + 2d raw -> ~65% of raw in train_slice (never 0).
+        n_lts = 80 * const.STEPS_PER_DAY
+        n_raw = 2 * const.STEPS_PER_DAY
+        cols_split: dict[str, Sequence[float | int]] = {
+            "ts_utc": [base_ts + k * 300 for k in range(n_lts + n_raw)],
+            "flags": [const.FLAG_LTS_BACKFILL] * n_lts + [0] * n_raw,
+        }
+        train_end = preprocessing.compute_train_holdout_split(cols_split)
+        raw_in_train = train_end - n_lts
+        raw_in_holdout = (n_lts + n_raw) - train_end
+        assert raw_in_train == n_raw - round(0.35 * n_raw)
+        assert raw_in_holdout >= preprocessing.HORIZON_6H_STEPS + 24

@@ -562,6 +562,9 @@ def evaluate_14d_hindcast(
     *,
     lat_deg: float = priors.LATITUDE_DEG,
     lon_deg: float = priors.LONGITUDE_DEG,
+    buffer_offsets: contracts.BufferSensorOffsets = (
+        priors.DAY1_BUFFER_OFFSETS
+    ),
     _ref_d_act: Sequence[float] | None = None,
     precomputed_hist_eval: preprocessing.PreprocessedHistory | None = None,
     precomputed_hist_prior: preprocessing.PreprocessedHistory | None = None,
@@ -583,6 +586,8 @@ def evaluate_14d_hindcast(
         k_hx_by_group: Optional `K_hx` [W/K] mapping per group.
         lat_deg: Observer latitude in degrees North.
         lon_deg: Observer longitude in degrees East.
+        buffer_offsets: Active or candidate 1-Wire `BufferSensorOffsets` for
+            `params_eval` (`params_prior` always uses `DAY1_BUFFER_OFFSETS`).
         _ref_d_act: Optional shared disturbance series used by the holdout gate
             to guarantee identical window selection between two parameter sets.
         precomputed_hist_eval: Optional precomputed history for `params_eval`.
@@ -659,19 +664,34 @@ def evaluate_14d_hindcast(
     k_hx_prior_map = dict(priors.DAY1_K_HX_BY_GROUP_W_K)
     k_hx_prior_map[zone_khx_key] = params_prior.k_hx_w_k
 
-    def _hist_matches_khx(
+    def _hist_matches_khx_and_offsets(
         cand_h: preprocessing.PreprocessedHistory | None,
         target_khx: float,
+        target_offsets: contracts.BufferSensorOffsets,
     ) -> bool:
         if cand_h is None or cand_h.n_rows != n_slice:
             return False
         h_khx = cand_h.hyd_k_hx_wk if zone == "wk" else cand_h.hyd_k_hx_kt
-        return abs(h_khx - target_khx) <= 1e-9
+        top_h = float(
+            getattr(cand_h, "buf_top_offset_c", priors.BUF_TOP_SENSOR_OFFSET_C)
+        )
+        bot_h = float(
+            getattr(cand_h, "buf_bot_offset_c", priors.BUF_BOT_SENSOR_OFFSET_C)
+        )
+        return (
+            abs(h_khx - target_khx) <= 1e-9
+            and abs(top_h - target_offsets.buf_top_offset_c) <= 1e-9
+            and abs(bot_h - target_offsets.buf_bot_offset_c) <= 1e-9
+        )
 
-    if _hist_matches_khx(precomputed_hist_eval, k_hx_eval_map[zone_khx_key]):
+    if _hist_matches_khx_and_offsets(
+        precomputed_hist_eval, k_hx_eval_map[zone_khx_key], buffer_offsets
+    ):
         assert precomputed_hist_eval is not None
         hist_eval = precomputed_hist_eval
-    elif _hist_matches_khx(precomputed_hist_prior, k_hx_eval_map[zone_khx_key]):
+    elif _hist_matches_khx_and_offsets(
+        precomputed_hist_prior, k_hx_eval_map[zone_khx_key], buffer_offsets
+    ):
         assert precomputed_hist_prior is not None
         hist_eval = precomputed_hist_prior
     elif (
@@ -683,6 +703,7 @@ def evaluate_14d_hindcast(
             _get_sub_cols(),
             flow_rates_l_min=flow_rates_l_min,
             k_hx_by_group=k_hx_eval_map,
+            buffer_offsets=buffer_offsets,
         )
     else:
         hist_eval = preprocessing.preprocess_history_columns(
@@ -692,19 +713,34 @@ def evaluate_14d_hindcast(
             eta_ac_ref=params_eval.eta_ac,
             lat_deg=lat_deg,
             lon_deg=lon_deg,
+            buffer_offsets=buffer_offsets,
         )
 
-    if _hist_matches_khx(precomputed_hist_prior, k_hx_prior_map[zone_khx_key]):
+    day1_offsets = priors.DAY1_BUFFER_OFFSETS
+    if _hist_matches_khx_and_offsets(
+        precomputed_hist_prior, k_hx_prior_map[zone_khx_key], day1_offsets
+    ):
         assert precomputed_hist_prior is not None
         hist_prior = precomputed_hist_prior
-    elif _hist_matches_khx(hist_eval, k_hx_prior_map[zone_khx_key]):
+    elif _hist_matches_khx_and_offsets(
+        hist_eval, k_hx_prior_map[zone_khx_key], day1_offsets
+    ):
         hist_prior = hist_eval
     else:
+        base_for_prior = (
+            precomputed_hist_prior
+            if (
+                precomputed_hist_prior is not None
+                and precomputed_hist_prior.n_rows == n_slice
+            )
+            else hist_eval
+        )
         hist_prior = preprocessing.recompute_history_for_khx(
-            hist_eval,
+            base_for_prior,
             _get_sub_cols(),
             flow_rates_l_min=flow_rates_l_min,
             k_hx_by_group=k_hx_prior_map,
+            buffer_offsets=day1_offsets,
         )
 
     tape_eval = kalman_tape.get_zone_tape(hist_eval, zone)

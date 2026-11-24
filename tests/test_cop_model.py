@@ -528,3 +528,99 @@ class TestP1FlankAndCopCalibration:
         )
         # Splitting a 20-step run at step 10 leaves 6 + 13 steps (1 valid run)
         assert diag_gap["n_cv_runs"] == 1
+
+    def test_predict_live_expected_cop_idle_0hz_dhw_and_buffer_offsets(
+        self,
+    ) -> None:
+        """F2: idle 0 Hz prefers offset `t_buf_top_*` over `t_wp_out`."""
+        day1 = priors.DAY1_COP_PARAMS
+        offsets = contracts.BufferSensorOffsets(
+            buf_top_offset_c=1.2,
+            buf_bot_offset_c=-0.5,
+        )
+
+        # 1. Idle 0 Hz with stagnant warm 36.0 C or cold 17.0 C wp_outlet:
+        #    both must use raw 26.3 + 1.2 = 27.5 C top buffer temperature.
+        expected_idle = cop_model.predict_cop_cv(day1, 5.0, 27.5, 82.0)
+        for wp_stagnant in (36.0, 17.0):
+            cop_idle = cop_model.predict_live_expected_cop_from_row(
+                day1,
+                {
+                    "t_out_dak_c": 5.0,
+                    "rh_out_pct": 82.0,
+                    "f_comp_hz": 0.0,
+                    "t_wp_out_c": wp_stagnant,
+                    "t_buf_top_end_c": 26.3,
+                    "t_buf_top_start_c": 26.0,
+                },
+                buffer_offsets=offsets,
+            )
+            assert cop_idle == pytest.approx(expected_idle, rel=1e-9)
+
+        # 2. Idle 0 Hz with missing/invalid buffer columns falls back to
+        #    t_wp_out_c in (15, 40], else 30.0 C.
+        cop_idle_fb_wp = cop_model.predict_live_expected_cop_from_row(
+            day1,
+            {
+                "t_out_dak_c": 5.0,
+                "f_comp_hz": 0.0,
+                "t_wp_out_c": 26.0,
+                "t_buf_top_end_c": 12.0,
+            },
+            buffer_offsets=offsets,
+        )
+        assert cop_idle_fb_wp == pytest.approx(
+            cop_model.predict_cop_cv(day1, 5.0, 26.0, 80.0), rel=1e-9
+        )
+        cop_idle_fb_30 = cop_model.predict_live_expected_cop_from_row(
+            day1,
+            {
+                "t_out_dak_c": 5.0,
+                "f_comp_hz": 0.0,
+                "t_wp_out_c": 44.0,
+            },
+            buffer_offsets=offsets,
+        )
+        assert cop_idle_fb_30 == pytest.approx(
+            cop_model.predict_cop_cv(day1, 5.0, 30.0, 80.0), rel=1e-9
+        )
+
+        # 3. Minimal row without `f_comp_hz` & active CV run (`20 Hz`) prefer
+        #    un-offset `t_wp_out_c`, falling back to offset-calibrated buffer.
+        cop_minimal = cop_model.predict_live_expected_cop_from_row(
+            day1,
+            {"t_out_dak_c": 5.0, "t_wp_out_c": 29.0, "t_buf_top_end_c": 25.0},
+            buffer_offsets=offsets,
+        )
+        assert cop_minimal == pytest.approx(
+            cop_model.predict_cop_cv(day1, 5.0, 29.0, 80.0), rel=1e-9
+        )
+        cop_active_fb_buf = cop_model.predict_live_expected_cop_from_row(
+            day1,
+            {
+                "t_out_dak_c": 5.0,
+                "f_comp_hz": 20.0,
+                "t_wp_out_c": float("nan"),
+                "t_buf_top_end_c": 26.3,
+            },
+            buffer_offsets=offsets,
+        )
+        assert cop_active_fb_buf == pytest.approx(
+            cop_model.predict_cop_cv(day1, 5.0, 27.5, 80.0), rel=1e-9
+        )
+
+        # 4. Active DHW tank run ignores 58 C boiler water & uses offset buffer.
+        cop_dhw_guard = cop_model.predict_live_expected_cop_from_row(
+            day1,
+            {
+                "flags": const.FLAG_DHW_TANK,
+                "t_out_dak_c": 5.0,
+                "f_comp_hz": 35.0,
+                "t_wp_out_c": 58.0,
+                "t_buf_top_end_c": 26.3,
+            },
+            buffer_offsets=offsets,
+        )
+        assert cop_dhw_guard == pytest.approx(
+            cop_model.predict_cop_cv(day1, 5.0, 27.5, 80.0), rel=1e-9
+        )

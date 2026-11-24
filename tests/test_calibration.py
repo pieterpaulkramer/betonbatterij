@@ -1365,3 +1365,265 @@ def test_f41_freeze_eta_ac_and_a_sol_f43_bound_warnings_and_f33_heat_guard() -> 
     )
     assert out_rej_hc.accepted is False
     assert "degraded" in out_rej_hc.reason.lower()
+
+
+def test_calibrate_k_hx_robust_10_lmin_flow_cap_and_buffer_offsets() -> None:
+    """F3.1 & F3.2: 10 L/min `K_hx` reaches up to 523 W/K & honors offsets."""
+    flows_10 = dict(const.DEFAULT_FLOW_RATES_L_MIN, wk=10.0, gang=2.0)
+    true_khx_wk = 455.0  # Above old 355.25 cap, below 522.975 physical cap
+    true_wk = dataclasses.replace(priors.DAY1_PRIORS_WK, k_hx_w_k=true_khx_wk)
+    cols = _generate_calibration_dataset(
+        n_days=6, params_wk=true_wk, params_kt=priors.DAY1_PRIORS_KT
+    )
+    init_khx_10 = {
+        g: hydraulics.scale_k_hx_eps_ntu(
+            priors.DAY1_K_HX_BY_GROUP_W_K[g],
+            const.DEFAULT_FLOW_RATES_L_MIN[g],
+            flows_10[g],
+        )
+        for g in const.ALL_HYDRAULIC_GROUPS
+    }
+    # Reconstruct `tf_wk` on the 10 L/min hydraulic pass and synthesize exact
+    # BG-solo `p_prim_th_w` matching `true_khx_wk = 455.0` and `gang/wk = 0.2`.
+    st_wk = kalman_tape.reconstruct_states_tuples(
+        preprocessing.preprocess_history_columns(
+            cols,
+            flow_rates_l_min=flows_10,
+            k_hx_by_group=init_khx_10,
+        ),
+        "wk",
+        dataclasses.replace(priors.DAY1_PRIORS_WK, k_hx_w_k=init_khx_10["wk"]),
+    )
+    for k in range(len(cols["ts_utc"])):
+        if (
+            float(cols["f_comp_hz"][k]) >= 18.0
+            and float(cols["u_eff_bg"][k]) > 0.9
+            and float(cols["u_eff_kantoor"][k]) < 0.05
+        ):
+            t_top = float(cols["t_buf_top_end_c"][k])
+            tf_k = st_wk[k][1]
+            q_wk = true_khx_wk * max(0.0, t_top - tf_k)
+            q_gang = (true_khx_wk * 0.2) * max(0.0, t_top - (tf_k - 0.5))
+            cols["p_prim_th_w"][k] = q_wk + q_gang
+            cols["v_prim_l_min"][k] = 16.0
+
+    fit_10 = calibration.calibrate_k_hx_robust(cols, flows_10, init_khx_10)
+    assert fit_10["wk"] > 355.25
+    assert abs(fit_10["wk"] - true_khx_wk) / true_khx_wk < 0.03
+
+    # Inflating primary power reaches `0.75 * 10.0 * 69.73 = 522.975` cap.
+    cols_cap = {k: list(v) for k, v in cols.items()}
+    cols_cap["p_prim_th_w"] = [float(v) * 1.45 for v in cols["p_prim_th_w"]]
+    fit_cap = calibration.calibrate_k_hx_robust(cols_cap, flows_10, init_khx_10)
+    phys_cap_10 = 0.75 * 10.0 * priors.WATER_POWER_FACTOR_W_PER_LMIN_K
+    assert 515.0 < fit_cap["wk"] <= phys_cap_10 + 1e-6
+
+    # Non-zero BufferSensorOffsets: shift raw sensors by (-top_off, -bot_off)
+    # and verify `calibrate_k_hx_robust(..., buffer_offsets=...)` matches.
+    custom_off = contracts.BufferSensorOffsets(
+        buf_top_offset_c=-1.35,
+        buf_bot_offset_c=0.45,
+    )
+    cols_shifted = {k: list(v) for k, v in cols.items()}
+    cols_shifted["t_buf_top_start_c"] = [
+        float(v) - custom_off.buf_top_offset_c
+        for v in cols["t_buf_top_start_c"]
+    ]
+    cols_shifted["t_buf_top_end_c"] = [
+        float(v) - custom_off.buf_top_offset_c for v in cols["t_buf_top_end_c"]
+    ]
+    cols_shifted["t_buf_bot_start_c"] = [
+        float(v) + priors.BUF_BOT_SENSOR_OFFSET_C - custom_off.buf_bot_offset_c
+        for v in cols["t_buf_bot_start_c"]
+    ]
+    cols_shifted["t_buf_bot_end_c"] = [
+        float(v) + priors.BUF_BOT_SENSOR_OFFSET_C - custom_off.buf_bot_offset_c
+        for v in cols["t_buf_bot_end_c"]
+    ]
+    fit_with_off = calibration.calibrate_k_hx_robust(
+        cols_shifted,
+        flows_10,
+        init_khx_10,
+        buffer_offsets=custom_off,
+    )
+    fit_without_off = calibration.calibrate_k_hx_robust(
+        cols_shifted,
+        flows_10,
+        init_khx_10,
+    )
+    assert math.isclose(fit_with_off["wk"], fit_10["wk"], rel_tol=1e-6)
+    assert abs(fit_without_off["wk"] - fit_10["wk"]) > 15.0
+
+
+def test_subregime_min_veto_windows_f33_and_pure_holdout_before(
+    monkeypatch: Any,
+) -> None:
+    """F3.3: `n_windows < 5` cannot veto overall improvement; `>= 5` vetoes."""
+    assert calibration.MIN_REGIME_VETO_WINDOWS == 5
+    true_wk = dataclasses.replace(priors.DAY1_PRIORS_WK, h_loss_w_k=51.0)
+    cols = _generate_calibration_dataset(
+        n_days=8, params_wk=true_wk, params_kt=priors.DAY1_PRIORS_KT
+    )
+
+    def _metrics(
+        reg: str, n_win: int, j_val: float
+    ) -> contracts.RegimeHindcastMetrics:
+        return contracts.RegimeHindcastMetrics(
+            regime=reg,
+            horizon_steps=72,
+            n_windows=n_win,
+            rmse_end_c=j_val,
+            rmse_path_c=j_val,
+            mae_end_c=j_val * 0.8,
+            bias_end_c=0.0,
+            j_eval_c=j_val,
+            prior_rmse_end_c=0.60,
+            skill_score_pct=25.0,
+        )
+
+    seen_khx_calls: list[float] = []
+    sunny_n_windows = 2
+
+    def _fake_eval(
+        columns: Any,
+        zone: contracts.ZoneId,
+        params_eval: contracts.ZoneParameters,
+        params_prior: contracts.ZoneParameters,
+        flow_rates_l_min: Any = None,
+        k_hx_by_group: Any = None,
+        **kwargs: Any,
+    ) -> contracts.ZoneEvaluationReport:
+        del columns, params_prior, flow_rates_l_min, kwargs
+        seen_khx_calls.append(
+            float((k_hx_by_group or {}).get("wk", params_eval.k_hx_w_k))
+        )
+        is_before = math.isclose(
+            params_eval.h_loss_w_k, priors.DAY1_PRIORS_WK.h_loss_w_k
+        )
+        j_ov = 0.52 if is_before else 0.31
+        j_sun = 0.20 if is_before else 0.29  # +0.09 C (> +0.03 C threshold)
+        return contracts.ZoneEvaluationReport(
+            zone=zone,
+            ts_evaluated_utc=1_760_000_000,
+            overall_6h=_metrics("overall_6h", 18, j_ov),
+            by_regime={
+                "heating_and_coast": _metrics(
+                    "heating_and_coast", 8, 0.45 if is_before else 0.28
+                ),
+                "night_cooling": _metrics("night_cooling", 2, j_sun),
+                "sunny_afternoon": _metrics(
+                    "sunny_afternoon", sunny_n_windows, j_sun
+                ),
+            },
+        )
+
+    monkeypatch.setattr(evaluation, "evaluate_14d_hindcast", _fake_eval)
+
+    # 1. With `n_windows = 2` (< 5), noisy sub-regimes do not veto `-40%` J.
+    out_acc, _ = calibration.calibrate_zone_a2(
+        cols,
+        "wk",
+        priors.DAY1_PRIORS_WK,
+        mode="manual",
+        k_hx_by_group={"wk": 310.0},
+        old_k_hx_by_group={"wk": 245.0},
+    )
+    assert out_acc.accepted is True
+    assert seen_khx_calls == [245.0, 310.0]
+
+    # 2. With `n_windows = 5` (>= 5), +0.09 C on sunny_afternoon vetoes!
+    sunny_n_windows = 5
+    out_veto, _ = calibration.calibrate_zone_a2(
+        cols,
+        "wk",
+        priors.DAY1_PRIORS_WK,
+        mode="manual",
+        k_hx_by_group={"wk": 310.0},
+        old_k_hx_by_group={"wk": 245.0},
+    )
+    assert out_veto.accepted is False
+    assert "sunny_afternoon" in out_veto.reason
+
+
+def test_engine_buffer_offsets_calibration_damping_rollback_and_reset() -> None:
+    """F3.2 & F4: 0 Hz sniffing cal, 80/20 damping, rollback, & reset."""
+    true_wk = dataclasses.replace(
+        priors.DAY1_PRIORS_WK,
+        c_floor_wh_k=4750.0,
+        r_fh_k_kw=2.20,
+        h_loss_w_k=52.0,
+        k_hx_w_k=222.0,
+    )
+    cols = _generate_calibration_dataset(
+        n_days=9, params_wk=true_wk, params_kt=priors.DAY1_PRIORS_KT
+    )
+    # Inject 10 consecutive stationary 0 Hz primary sniffing steps on Day 1
+    # night (`01:00..01:50` -> indices `300..309` in training split):
+    # `t_wp_out == t_wp_in == 24.0`, raw top = 23.2 (+0.8), raw bot = 24.6.
+    for k in range(300, 310):
+        cols["flags"][k] = const.FLAG_VALID_WK | const.FLAG_VALID_KT
+        cols["f_comp_hz"][k] = 0.0
+        cols["u_pump_sec"][k] = 0.0
+        cols["v_prim_l_min"][k] = 14.5
+        cols["t_wp_out_c"][k] = 24.0
+        cols["t_wp_in_c"][k] = 24.0
+        cols["t_buf_top_start_c"][k] = 23.2
+        cols["t_buf_top_end_c"][k] = 23.2
+        cols["t_buf_bot_start_c"][k] = 24.6
+        cols["t_buf_bot_end_c"][k] = 24.6
+
+    eng = engine.DigitalTwinEngine()
+    assert eng.buffer_offsets == priors.DAY1_BUFFER_OFFSETS
+
+    # 1. `auto_weekly` blends 80% old + 20% raw on buffer offsets
+    eng.run_calibration(cols, mode="auto_weekly")
+    assert math.isclose(
+        eng.buffer_offsets.buf_top_offset_c, 0.20 * 0.80, abs_tol=1e-6
+    )
+    assert math.isclose(
+        eng.buffer_offsets.buf_bot_offset_c,
+        0.80 * priors.BUF_BOT_SENSOR_OFFSET_C + 0.20 * (-0.60),
+        abs_tol=1e-6,
+    )
+    assert eng.hydraulics.buffer_offsets == eng.buffer_offsets
+    assert eng.prev_buffer_offsets == priors.DAY1_BUFFER_OFFSETS
+
+    # 2. `manual` applies 100% raw offsets (+0.80, -0.60) & persists in state
+    eng.run_calibration(cols, mode="manual")
+    assert math.isclose(
+        eng.buffer_offsets.buf_top_offset_c, 0.80, abs_tol=1e-6
+    )
+    assert math.isclose(
+        eng.buffer_offsets.buf_bot_offset_c, -0.60, abs_tol=1e-6
+    )
+
+    # Engine `predict_live_expected_cop` forwards `self.buffer_offsets` at 0 Hz
+    live_cop = eng.predict_live_expected_cop(
+        {
+            "t_out_dak_c": 5.0,
+            "rh_out_pct": 80.0,
+            "f_comp_hz": 0.0,
+            "t_wp_out_c": 36.0,
+            "t_buf_top_end_c": 26.2,  # 26.2 + 0.80 = 27.0 C
+        }
+    )
+    assert math.isclose(
+        live_cop, eng.predict_cop_cv(5.0, 27.0, 80.0), rel_tol=1e-9
+    )
+
+    saved = json.loads(json.dumps(eng.to_state_dict(), allow_nan=False))
+    eng_reloaded = engine.DigitalTwinEngine()
+    eng_reloaded.load_state_dict(saved)
+    assert eng_reloaded.buffer_offsets == eng.buffer_offsets
+    assert eng_reloaded.hydraulics.buffer_offsets == eng.buffer_offsets
+
+    # 3. `reset_parameters_to_day1()` resets to DAY1; rollback restores
+    manual_offsets = eng.buffer_offsets
+    eng.reset_parameters_to_day1(columns=None)
+    assert eng.buffer_offsets == priors.DAY1_BUFFER_OFFSETS
+    assert eng.hydraulics.buffer_offsets == priors.DAY1_BUFFER_OFFSETS
+    assert eng.prev_buffer_offsets == manual_offsets
+
+    assert eng.rollback_parameters(columns=None) is True
+    assert eng.buffer_offsets == manual_offsets
+    assert eng.hydraulics.buffer_offsets == manual_offsets

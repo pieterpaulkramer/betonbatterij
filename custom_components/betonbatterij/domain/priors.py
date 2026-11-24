@@ -36,7 +36,16 @@ WATER_POWER_FACTOR_W_PER_LMIN_K: float = 69.73  # rho * c_p / 60 [W/(L/min*K)]
 BUFFER_VOLUME_L: float = 200.0
 C_BUF_WH_K: float = 232.44  # 200 L * 1.1622 Wh/(L*K)
 C_BUF_J_K: float = C_BUF_WH_K * 3600.0  # 836,784 J/K
+BUF_TOP_SENSOR_OFFSET_C: float = 0.0  # Day-1 prior before 0 Hz sniffing cal
 BUF_BOT_SENSOR_OFFSET_C: float = -0.33  # Raw bottom reads +0.33 deg C high
+BUF_SENSOR_OFFSET_MIN_C: float = -3.0
+BUF_SENSOR_OFFSET_MAX_C: float = 3.0
+DAY1_BUFFER_OFFSETS: contracts.BufferSensorOffsets = (
+    contracts.BufferSensorOffsets(
+        buf_top_offset_c=BUF_TOP_SENSOR_OFFSET_C,
+        buf_bot_offset_c=BUF_BOT_SENSOR_OFFSET_C,
+    )
+)
 WAX_VALVE_OPEN_TIME_S: float = 228.0
 WAX_VALVE_CLOSE_TIME_S: float = 228.0
 

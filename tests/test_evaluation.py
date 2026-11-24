@@ -987,15 +987,26 @@ def test_compute_train_holdout_split_80d_lts_plus_10d_raw() -> None:
         == n_35d - evaluation.EVAL_14D_STEPS
     )
 
-    # Case C: < 4d raw (7d LTS + 3d raw = 10d) -> 70/30 fallback
+    # Case C1: 1..4d raw (7d LTS + 3d raw = 10d) -> 65/35 raw-tail split
     n_7d = 7 * const.STEPS_PER_DAY
     n_3d = 3 * const.STEPS_PER_DAY
-    cols_c = {
+    cols_c1 = {
         "ts_utc": [t0 + k * const.DT_STEP_S for k in range(n_7d + n_3d)],
         "flags": [const.FLAG_LTS_BACKFILL] * n_7d + [0] * n_3d,
     }
-    assert preprocessing.compute_train_holdout_split(cols_c) == int(
-        0.70 * (n_7d + n_3d)
+    assert preprocessing.compute_train_holdout_split(cols_c1) == (
+        (n_7d + n_3d) - round(0.35 * n_3d)
+    )
+
+    # Case C2: < 1d raw (9.5d LTS + 0.5d raw = 10d) -> 70/30 fallback
+    n_95d = int(9.5 * const.STEPS_PER_DAY)
+    n_05d = int(0.5 * const.STEPS_PER_DAY)
+    cols_c2 = {
+        "ts_utc": [t0 + k * const.DT_STEP_S for k in range(n_95d + n_05d)],
+        "flags": [const.FLAG_LTS_BACKFILL] * n_95d + [0] * n_05d,
+    }
+    assert preprocessing.compute_train_holdout_split(cols_c2) == int(
+        0.70 * (n_95d + n_05d)
     )
 
 
@@ -1051,3 +1062,274 @@ def test_simulate_step_gamma_cal_f5a_without_scaling_solver_gamma_fh() -> None:
     assert rep_wk.zone == "wk" and rep_kt.zone == "kt"
     assert rep_wk.overall_6h.n_windows > 0
     assert eng.eval_report_wk is None  # Pure: does not mutate engine state
+
+
+def test_engine_migration_48h_replay_gamma_cal_and_solver_export() -> None:
+    """F4 & F5: v0.1.0 migration, 48h `gamma_cal` replay, & solver export."""
+    # 1. `load_state_dict` migrates `kt.h_down_w_k` (75.0 -> 40.0) and fixed
+    #    non-fitted constants while preserving learned 2R2C parameters.
+    eng = engine.DigitalTwinEngine()
+    v010_state = eng.to_state_dict()
+    v010_state["params_kt"] = {
+        **priors.DAY1_PRIORS_KT.to_dict(),
+        "h_down_w_k": 75.0,
+        "c_air_wh_k": 260.0,
+        "h_loss_w_k": 19.5,
+        "c_floor_wh_k": 2050.0,
+        "eta_ac": 4.15,
+        "k_hx_w_k": 58.0,
+    }
+    v010_state["params_wk"] = {
+        **priors.DAY1_PRIORS_WK.to_dict(),
+        "h_up_w_k": 145.0,
+        "h_loss_w_k": 53.5,
+    }
+    eng_migrated = engine.DigitalTwinEngine()
+    eng_migrated.load_state_dict(v010_state)
+    kt_p = eng_migrated.get_zone_snapshot("kt").params
+    wk_p = eng_migrated.get_zone_snapshot("wk").params
+    assert kt_p.h_down_w_k == priors.DAY1_PRIORS_KT.h_down_w_k == 40.0
+    assert kt_p.c_air_wh_k == priors.DAY1_PRIORS_KT.c_air_wh_k
+    assert kt_p.h_loss_w_k == 19.5
+    assert kt_p.c_floor_wh_k == 2050.0
+    assert kt_p.eta_ac == 4.15
+    assert kt_p.k_hx_w_k == 58.0
+    assert wk_p.h_up_w_k == priors.DAY1_PRIORS_WK.h_up_w_k == 120.0
+    assert wk_p.h_loss_w_k == 53.5
+
+    # 2. `replay_48h_from_columns` preserves `gamma_cal != 1.0` and proxies
+    cols = _generate_synthetic_columns(
+        n_days=2,
+        params_wk=priors.DAY1_PRIORS_WK,
+        params_kt=priors.DAY1_PRIORS_KT,
+    )
+    # Force steady 20 Hz BG-solo CV run on final 12 steps with ~1.18x power
+    for k in range(len(cols["ts_utc"]) - 12, len(cols["ts_utc"])):
+        cols["flags"][k] = (
+            const.FLAG_VALID_WK
+            | const.FLAG_VALID_KT
+            | const.FLAG_PUMP_SEC_ON
+        )
+        cols["u_pump_sec"][k] = 1.0
+        cols["u_eff_bg"][k] = 1.0
+        cols["u_eff_kantoor"][k] = 0.0
+        cols["f_comp_hz"][k] = 20.0
+        cols["v_prim_l_min"][k] = 15.0
+        cols["t_buf_top_start_c"][k] = 33.0
+        cols["t_buf_top_end_c"][k] = 33.0
+        cols["t_buf_bot_start_c"][k] = 30.0
+        cols["t_buf_bot_end_c"][k] = 30.0
+        cols["p_prim_th_w"][k] = 5600.0
+
+    hist_ref = preprocessing.preprocess_history_columns(cols)
+    assert hist_ref.final_gamma_cal > 1.05
+
+    eng_replay = engine.DigitalTwinEngine()
+    eng_replay.replay_48h_from_columns(cols)
+    assert math.isclose(
+        eng_replay.hydraulics.gamma_cal,
+        hist_ref.final_gamma_cal,
+        rel_tol=1e-9,
+    )
+    assert eng_replay.hydraulics.gamma_cal > 1.05
+    assert (
+        eng_replay.hydraulics.t_floor_proxy_c
+        == hist_ref.final_t_floor_proxy_c
+    )
+
+    # 3. `export_solver_model` exposes `gamma_cal` and `k_hx_eff_w_k`
+    lin_wk = eng_replay.export_solver_model("wk", dt_s=1800.0)
+    assert math.isclose(
+        lin_wk.gamma_cal, eng_replay.hydraulics.gamma_cal, rel_tol=1e-9
+    )
+    assert math.isclose(
+        lin_wk.k_hx_eff_w_k,
+        priors.DAY1_PRIORS_WK.k_hx_w_k * eng_replay.hydraulics.gamma_cal,
+        rel_tol=1e-9,
+    )
+
+
+def test_buffer_offsets_hindcast_export_and_flow_khx_scaling(
+    tmp_path: pathlib.Path,
+) -> None:
+    """Verifies `buffer_offsets` in hindcast & CSV export + `K_hx` scaling."""
+    true_wk = dataclasses.replace(
+        priors.DAY1_PRIORS_WK,
+        h_loss_w_k=48.0,
+        k_hx_w_k=220.0,
+    )
+    cols = _generate_synthetic_columns(
+        n_days=6,
+        params_wk=true_wk,
+        params_kt=priors.DAY1_PRIORS_KT,
+    )
+    # Inject passive buffer harvesting steps (`f_comp_hz=0`, `p_prim_th_w=0`)
+    # during active pump windows so `Q_fh` directly depends on `t_buf_top_c`.
+    for k in range(len(cols["ts_utc"])):
+        if float(cols["u_pump_sec"][k]) > 0.5 and (k % 3) == 0:
+            cols["f_comp_hz"][k] = 0.0
+            cols["p_prim_th_w"][k] = 0.0
+            cols["v_prim_l_min"][k] = 0.0
+            cols["flags"][k] = (
+                int(cols["flags"][k]) | const.FLAG_Z1_OFF_HARVEST
+            )
+
+    cal_offsets = contracts.BufferSensorOffsets(
+        buf_top_offset_c=2.2,
+        buf_bot_offset_c=priors.BUF_BOT_SENSOR_OFFSET_C - 0.9,
+    )
+    cols_shifted: dict[str, list[float | int]] = {
+        k: list(v) for k, v in cols.items()
+    }
+    cols_shifted["t_buf_top_start_c"] = [
+        float(v) - 2.2 for v in cols["t_buf_top_start_c"]
+    ]
+    cols_shifted["t_buf_top_end_c"] = [
+        float(v) - 2.2 for v in cols["t_buf_top_end_c"]
+    ]
+    cols_shifted["t_buf_bot_start_c"] = [
+        float(v) + 0.9 for v in cols["t_buf_bot_start_c"]
+    ]
+    cols_shifted["t_buf_bot_end_c"] = [
+        float(v) + 0.9 for v in cols["t_buf_bot_end_c"]
+    ]
+    cols_shifted.pop("q_fh_wk_w", None)
+
+    # 1. `evaluate_14d_hindcast(..., buffer_offsets=cal_offsets)` recovers exact
+    #    eval RMSE while keeping `hist_prior` strictly on `DAY1_BUFFER_OFFSETS`.
+    rep_ref = evaluation.evaluate_14d_hindcast(
+        cols,
+        "wk",
+        true_wk,
+        priors.DAY1_PRIORS_WK,
+        buffer_offsets=priors.DAY1_BUFFER_OFFSETS,
+    )
+    rep_cal = evaluation.evaluate_14d_hindcast(
+        cols_shifted,
+        "wk",
+        true_wk,
+        priors.DAY1_PRIORS_WK,
+        buffer_offsets=cal_offsets,
+    )
+    rep_uncal = evaluation.evaluate_14d_hindcast(
+        cols_shifted,
+        "wk",
+        true_wk,
+        priors.DAY1_PRIORS_WK,
+        buffer_offsets=priors.DAY1_BUFFER_OFFSETS,
+    )
+    assert rep_ref.overall_6h.rmse_end_c is not None
+    assert rep_cal.overall_6h.rmse_end_c is not None
+    assert rep_uncal.overall_6h.rmse_end_c is not None
+    assert math.isclose(
+        rep_cal.overall_6h.rmse_end_c,
+        rep_ref.overall_6h.rmse_end_c,
+        abs_tol=1e-9,
+    )
+    assert rep_uncal.overall_6h.rmse_end_c > rep_cal.overall_6h.rmse_end_c
+    # `hist_prior` must NOT leak `cal_offsets` (prior RMSE differs vs unshifted)
+    assert rep_cal.overall_6h.prior_rmse_end_c is not None
+    assert rep_ref.overall_6h.prior_rmse_end_c is not None
+    assert not math.isclose(
+        rep_cal.overall_6h.prior_rmse_end_c,
+        rep_ref.overall_6h.prior_rmse_end_c,
+        abs_tol=1e-4,
+    )
+
+    # Mismatched precomputed histories must be rejected and recomputed cleanly
+    stale_day1_hist = preprocessing.preprocess_history_columns(
+        cols_shifted,
+        k_hx_by_group={"wk": true_wk.k_hx_w_k},
+        buffer_offsets=priors.DAY1_BUFFER_OFFSETS,
+    )
+    contaminated_prior_hist = preprocessing.preprocess_history_columns(
+        cols_shifted,
+        k_hx_by_group=priors.DAY1_K_HX_BY_GROUP_W_K,
+        buffer_offsets=cal_offsets,
+    )
+    rep_recomp = evaluation.evaluate_14d_hindcast(
+        cols_shifted,
+        "wk",
+        true_wk,
+        priors.DAY1_PRIORS_WK,
+        buffer_offsets=cal_offsets,
+        precomputed_hist_eval=stale_day1_hist,
+        precomputed_hist_prior=contaminated_prior_hist,
+    )
+    assert math.isclose(
+        rep_recomp.overall_6h.rmse_end_c or 0.0,
+        rep_cal.overall_6h.rmse_end_c,
+        abs_tol=1e-9,
+    )
+    assert math.isclose(
+        rep_recomp.overall_6h.prior_rmse_end_c or 0.0,
+        rep_cal.overall_6h.prior_rmse_end_c,
+        abs_tol=1e-9,
+    )
+
+    # 2. `export_diagnostics` applies calibrated `buffer_offsets` to CSV columns
+    eng_exp = engine.DigitalTwinEngine(
+        params_wk=true_wk, buffer_offsets=cal_offsets
+    )
+    short_ref = {k: v[:48] for k, v in cols.items() if k != "q_fh_wk_w"}
+    short_shf = {k: v[:48] for k, v in cols_shifted.items()}
+    csv_ref, _ = engine.DigitalTwinEngine(params_wk=true_wk).export_diagnostics(
+        tmp_path / "ref", short_ref
+    )
+    csv_cal, _ = eng_exp.export_diagnostics(tmp_path / "cal", short_shf)
+    with open(csv_ref, encoding="utf-8", newline="") as f_r, open(
+        csv_cal, encoding="utf-8", newline=""
+    ) as f_c:
+        rows_r = list(csv.reader(f_r))
+        rows_c = list(csv.reader(f_c))
+    for col_name in ("t_buf_top_c", "t_buf_bot_c", "q_sec_tot_w", "q_fh_wk_w"):
+        col_i = rows_r[0].index(col_name)
+        assert [r[col_i] for r in rows_c[1:]] == [r[col_i] for r in rows_r[1:]]
+
+    # 3. `DigitalTwinEngine(flow_rates_l_min={"wk": 10.0})`, `reset_parameters`,
+    #    and legacy v0.1.0 rollback (`kt.h_down_w_k: 75.0 -> 40.0`)
+    expected_khx_10 = hydraulics.scale_k_hx_eps_ntu(
+        priors.DAY1_K_HX_BY_GROUP_W_K["wk"],
+        const.DEFAULT_FLOW_RATES_L_MIN["wk"],
+        10.0,
+    )
+    assert expected_khx_10 > priors.DAY1_K_HX_BY_GROUP_W_K["wk"]
+    eng_10 = engine.DigitalTwinEngine(flow_rates_l_min={"wk": 10.0})
+    assert math.isclose(
+        eng_10.get_zone_snapshot("wk").params.k_hx_w_k,
+        expected_khx_10,
+        rel_tol=1e-9,
+    )
+    assert math.isclose(
+        eng_10.hydraulics.k_hx_by_group_w_k["wk"],
+        expected_khx_10,
+        rel_tol=1e-9,
+    )
+
+    # Push a legacy v0.1.0 snapshot with `kt.h_down_w_k = 75.0` and custom K_hx
+    legacy_snap = eng_10._capture_snapshot(reason="legacy_v010")
+    legacy_snap["params_wk"]["k_hx_w_k"] = 195.0
+    legacy_snap["params_kt"]["h_down_w_k"] = 75.0
+    legacy_snap["params_kt"]["h_loss_w_k"] = 21.0
+    eng_10.snapshot_stack.append(legacy_snap)
+    assert eng_10.rollback_parameters() is True
+    assert eng_10.get_zone_snapshot("wk").params.k_hx_w_k == 195.0
+    assert (
+        eng_10.get_zone_snapshot("kt").params.h_down_w_k
+        == priors.DAY1_PRIORS_KT.h_down_w_k
+        == 40.0
+    )
+    assert eng_10.get_zone_snapshot("kt").params.h_loss_w_k == 21.0
+
+    # `reset_parameters()` restores eps-NTU flow-scaled Day-1 `K_hx`
+    eng_10.reset_parameters()
+    assert math.isclose(
+        eng_10.get_zone_snapshot("wk").params.k_hx_w_k,
+        expected_khx_10,
+        rel_tol=1e-9,
+    )
+    assert math.isclose(
+        eng_10.hydraulics.k_hx_by_group_w_k["wk"],
+        expected_khx_10,
+        rel_tol=1e-9,
+    )

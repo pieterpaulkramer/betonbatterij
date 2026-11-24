@@ -148,6 +148,15 @@ def export_csv_and_report(
     k_hx_map.setdefault("wk", params_wk.k_hx_w_k)
     k_hx_map.setdefault("kantoor", params_kt.k_hx_w_k)
 
+    raw_buf = (
+        fit_report.get("buffer_offsets")
+        if isinstance(fit_report, Mapping)
+        else None
+    )
+    buf_offsets = contracts.BufferSensorOffsets.from_dict(
+        raw_buf, priors.DAY1_BUFFER_OFFSETS
+    )
+
     hist = preprocessing.preprocess_history_columns(
         columns,
         flow_rates_l_min=flow_map,
@@ -155,6 +164,7 @@ def export_csv_and_report(
         eta_ac_ref=params_kt.eta_ac,
         lat_deg=lat_deg,
         lon_deg=lon_deg,
+        buffer_offsets=buf_offsets,
     )
 
     n = hist.n_rows

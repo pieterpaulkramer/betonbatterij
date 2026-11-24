@@ -22,10 +22,18 @@ from ..const import (
     MAX_RESTART_BRIDGE_GAP_S,
     RINGBUFFER_ROWS,
 )
-from ..domain.contracts import ZoneEvaluationReport, ZoneParameters
+from ..domain.contracts import (
+    BufferSensorOffsets,
+    ZoneEvaluationReport,
+    ZoneParameters,
+)
 from ..domain.engine import DigitalTwinEngine
 from ..domain.evaluation import SPINUP_48H_STEPS, evaluate_14d_hindcast
-from ..domain.priors import DAY1_PRIORS_KT, DAY1_PRIORS_WK
+from ..domain.priors import (
+    DAY1_BUFFER_OFFSETS,
+    DAY1_PRIORS_KT,
+    DAY1_PRIORS_WK,
+)
 from ..house_config import (
     HOUSE_ENTITIES,
     LOCAL_CONFIG_FILENAME,
@@ -78,6 +86,7 @@ def _compute_14d_eval_reports_sync(
     lat_deg: float,
     lon_deg: float,
     k_hx_by_group: Mapping[str, float] | None = None,
+    buffer_offsets: BufferSensorOffsets = DAY1_BUFFER_OFFSETS,
 ) -> tuple[ZoneEvaluationReport, ZoneEvaluationReport]:
     """Compute 14-day hindcast evaluation reports without mutating `engine`."""
     k_hx_map = dict(k_hx_by_group) if k_hx_by_group else {}
@@ -92,6 +101,7 @@ def _compute_14d_eval_reports_sync(
         k_hx_by_group=k_hx_map,
         lat_deg=lat_deg,
         lon_deg=lon_deg,
+        buffer_offsets=buffer_offsets,
     )
     rep_kt = evaluate_14d_hindcast(
         cols,
@@ -102,6 +112,7 @@ def _compute_14d_eval_reports_sync(
         k_hx_by_group=k_hx_map,
         lat_deg=lat_deg,
         lon_deg=lon_deg,
+        buffer_offsets=buffer_offsets,
     )
     return rep_wk, rep_kt
 
@@ -390,6 +401,16 @@ class BetonBatterijCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         lat_deg = 0.0
         lon_deg = 0.0
 
+        raw_buf = getattr(self.engine, "buffer_offsets", DAY1_BUFFER_OFFSETS)
+        buf_offsets = (
+            raw_buf
+            if isinstance(raw_buf, BufferSensorOffsets)
+            else BufferSensorOffsets.from_dict(
+                raw_buf if isinstance(raw_buf, Mapping) else None,
+                defaults=DAY1_BUFFER_OFFSETS,
+            )
+        )
+
         if has_pure_eval and hasattr(
             self.engine, "capture_calibration_context"
         ):
@@ -413,6 +434,7 @@ class BetonBatterijCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             "k_hx_map": k_hx_map,
             "lat_deg": lat_deg,
             "lon_deg": lon_deg,
+            "buffer_offsets": buf_offsets,
         }
 
     async def _async_compute_eval_reports_in_executor(
@@ -447,6 +469,7 @@ class BetonBatterijCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 snap["lat_deg"],
                 snap["lon_deg"],
                 snap["k_hx_map"],
+                snap.get("buffer_offsets", DAY1_BUFFER_OFFSETS),
             )
 
         await self.hass.async_add_executor_job(

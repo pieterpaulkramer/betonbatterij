@@ -52,6 +52,68 @@ def _clone_memory(
     )
 
 
+def _sync_fixed_zone_params(
+    zone: contracts.ZoneId,
+    params: contracts.ZoneParameters,
+) -> contracts.ZoneParameters:
+    """Clamps non-fitted structural constants to current Day-1 priors."""
+    if priors.FIT_INTERFLOOR_CONDUCTANCE:
+        return params
+    day1 = priors.DAY1_PRIORS_WK if zone == "wk" else priors.DAY1_PRIORS_KT
+    return dataclasses.replace(
+        params,
+        c_air_wh_k=day1.c_air_wh_k,
+        h_up_w_k=day1.h_up_w_k,
+        h_down_w_k=day1.h_down_w_k,
+        alpha_sol=day1.alpha_sol,
+        tau_d_h=day1.tau_d_h,
+        c_wind=day1.c_wind,
+    )
+
+
+def _scaled_day1_k_hx_by_group(
+    flow_rates_l_min: Mapping[str, float],
+) -> dict[str, float]:
+    """Returns Day-1 `K_hx` [W/K] scaled to `flow_rates_l_min` via eps-NTU."""
+    return {
+        g: max(
+            1.0,
+            hydraulics.scale_k_hx_eps_ntu(
+                priors.DAY1_K_HX_BY_GROUP_W_K[g],
+                const.DEFAULT_FLOW_RATES_L_MIN[g],
+                max(
+                    0.05,
+                    float(
+                        flow_rates_l_min.get(
+                            g, const.DEFAULT_FLOW_RATES_L_MIN[g]
+                        )
+                    ),
+                ),
+            ),
+        )
+        for g in const.ALL_HYDRAULIC_GROUPS
+    }
+
+
+def _hist_matches_buffer_offsets(
+    hist: preprocessing.PreprocessedHistory | None,
+    buffer_offsets: contracts.BufferSensorOffsets,
+) -> bool:
+    """Returns True if `hist` matches `buffer_offsets` within `1e-9 °C`."""
+    if hist is None:
+        return False
+    top_h = float(
+        getattr(hist, "buf_top_offset_c", priors.BUF_TOP_SENSOR_OFFSET_C)
+    )
+    bot_h = float(
+        getattr(hist, "buf_bot_offset_c", priors.BUF_BOT_SENSOR_OFFSET_C)
+    )
+    return (
+        abs(top_h - buffer_offsets.buf_top_offset_c) <= 1e-9
+        and abs(bot_h - buffer_offsets.buf_bot_offset_c) <= 1e-9
+    )
+
+
 def _evaluate_both_zones_14d(
     columns: Mapping[str, Sequence[float | int]],
     params_wk: contracts.ZoneParameters,
@@ -61,6 +123,7 @@ def _evaluate_both_zones_14d(
     lat_deg: float,
     lon_deg: float,
     *,
+    buffer_offsets: contracts.BufferSensorOffsets = priors.DAY1_BUFFER_OFFSETS,
     precomputed_hist_eval: preprocessing.PreprocessedHistory | None = None,
     precomputed_hist_prior: preprocessing.PreprocessedHistory | None = None,
 ) -> tuple[contracts.ZoneEvaluationReport, contracts.ZoneEvaluationReport]:
@@ -82,6 +145,9 @@ def _evaluate_both_zones_14d(
         if (
             precomputed_hist_eval is not None
             and precomputed_hist_eval.n_rows == n_eval
+            and _hist_matches_buffer_offsets(
+                precomputed_hist_eval, buffer_offsets
+            )
             and abs(precomputed_hist_eval.hyd_k_hx_wk - khx_eval["wk"]) <= 1e-9
             and abs(precomputed_hist_eval.hyd_k_hx_kt - khx_eval["kantoor"])
             <= 1e-9
@@ -90,6 +156,9 @@ def _evaluate_both_zones_14d(
         elif (
             precomputed_hist_eval is not None
             and precomputed_hist_eval.n_rows == n_eval
+            and _hist_matches_buffer_offsets(
+                precomputed_hist_eval, buffer_offsets
+            )
         ):
             sub_cols = preprocessing.slice_columns(
                 columns, start_slice, n_total
@@ -111,14 +180,20 @@ def _evaluate_both_zones_14d(
                 eta_ac_ref=params_kt.eta_ac,
                 lat_deg=lat_deg,
                 lon_deg=lon_deg,
+                buffer_offsets=buffer_offsets,
             )
 
         if (
             precomputed_hist_prior is not None
             and precomputed_hist_prior.n_rows == n_eval
+            and _hist_matches_buffer_offsets(
+                precomputed_hist_prior, priors.DAY1_BUFFER_OFFSETS
+            )
         ):
             hist_prior_shared = precomputed_hist_prior
-        else:
+        elif _hist_matches_buffer_offsets(
+            hist_eval_shared, priors.DAY1_BUFFER_OFFSETS
+        ):
             if sub_cols is None:
                 sub_cols = preprocessing.slice_columns(
                     columns, start_slice, n_total
@@ -128,6 +203,20 @@ def _evaluate_both_zones_14d(
                 sub_cols,
                 flow_rates_l_min=flow_rates_l_min,
                 k_hx_by_group=priors.DAY1_K_HX_BY_GROUP_W_K,
+            )
+        else:
+            if sub_cols is None:
+                sub_cols = preprocessing.slice_columns(
+                    columns, start_slice, n_total
+                )
+            hist_prior_shared = preprocessing.preprocess_history_columns(
+                sub_cols,
+                flow_rates_l_min=flow_rates_l_min,
+                k_hx_by_group=priors.DAY1_K_HX_BY_GROUP_W_K,
+                eta_ac_ref=priors.DAY1_PRIORS_KT.eta_ac,
+                lat_deg=lat_deg,
+                lon_deg=lon_deg,
+                buffer_offsets=priors.DAY1_BUFFER_OFFSETS,
             )
 
     eval_wk = evaluation.evaluate_14d_hindcast(
@@ -139,6 +228,7 @@ def _evaluate_both_zones_14d(
         k_hx_by_group=k_hx_by_group,
         lat_deg=lat_deg,
         lon_deg=lon_deg,
+        buffer_offsets=buffer_offsets,
         precomputed_hist_eval=hist_eval_shared,
         precomputed_hist_prior=hist_prior_shared,
     )
@@ -151,6 +241,7 @@ def _evaluate_both_zones_14d(
         k_hx_by_group=k_hx_by_group,
         lat_deg=lat_deg,
         lon_deg=lon_deg,
+        buffer_offsets=buffer_offsets,
         precomputed_hist_eval=hist_eval_shared,
         precomputed_hist_prior=hist_prior_shared,
     )
@@ -265,6 +356,7 @@ class DigitalTwinEngine:
         cop_params: contracts.CopParameters | None = None,
         latitude_deg: float | None = None,
         longitude_deg: float | None = None,
+        buffer_offsets: contracts.BufferSensorOffsets | None = None,
     ) -> None:
         """Initializes `DigitalTwinEngine` with Day-1 priors or custom overrides.
 
@@ -278,6 +370,7 @@ class DigitalTwinEngine:
                 `priors.LATITUDE_DEG`).
             longitude_deg: Optional site longitude [deg E] (non-zero overrides
                 `priors.LONGITUDE_DEG`).
+            buffer_offsets: Optional 1-Wire `BufferSensorOffsets` override.
         """
         self.latitude_deg: float = (
             float(latitude_deg)
@@ -297,12 +390,13 @@ class DigitalTwinEngine:
             const.DEFAULT_FLOW_RATES_L_MIN
         )
         if flow_rates_l_min:
-            self._flow_rates_l_min.update(
-                {k: float(v) for k, v in flow_rates_l_min.items()}
-            )
+            for k, v in flow_rates_l_min.items():
+                self._flow_rates_l_min[
+                    preprocessing.zone_to_hydraulic_group(str(k))
+                ] = float(v)
 
-        self._k_hx_by_group_w_k: dict[str, float] = dict(
-            priors.DAY1_K_HX_BY_GROUP_W_K
+        self._k_hx_by_group_w_k: dict[str, float] = _scaled_day1_k_hx_by_group(
+            self._flow_rates_l_min
         )
         if k_hx_by_group_w_k:
             for g, v in k_hx_by_group_w_k.items():
@@ -310,19 +404,33 @@ class DigitalTwinEngine:
                     preprocessing.zone_to_hydraulic_group(g)
                 ] = float(v)
 
-        p_wk = params_wk or dataclasses.replace(
-            priors.DAY1_PRIORS_WK,
-            k_hx_w_k=self._k_hx_by_group_w_k["wk"],
+        p_wk = (
+            params_wk
+            if params_wk is not None
+            else dataclasses.replace(
+                priors.DAY1_PRIORS_WK,
+                k_hx_w_k=self._k_hx_by_group_w_k["wk"],
+            )
         )
-        p_kt = params_kt or dataclasses.replace(
-            priors.DAY1_PRIORS_KT,
-            k_hx_w_k=self._k_hx_by_group_w_k["kantoor"],
+        p_kt = (
+            params_kt
+            if params_kt is not None
+            else dataclasses.replace(
+                priors.DAY1_PRIORS_KT,
+                k_hx_w_k=self._k_hx_by_group_w_k["kantoor"],
+            )
         )
         self._k_hx_by_group_w_k["wk"] = p_wk.k_hx_w_k
         self._k_hx_by_group_w_k["kantoor"] = p_kt.k_hx_w_k
 
         self._params_wk: contracts.ZoneParameters = p_wk
         self._params_kt: contracts.ZoneParameters = p_kt
+        self._buffer_offsets: contracts.BufferSensorOffsets = (
+            buffer_offsets
+            if buffer_offsets is not None
+            else priors.DAY1_BUFFER_OFFSETS
+        )
+        self._prev_buffer_offsets: contracts.BufferSensorOffsets | None = None
 
         self.estimator_wk: zoh_kalman.ZoneKalmanEstimator = (
             zoh_kalman.ZoneKalmanEstimator("wk", p_wk)
@@ -333,6 +441,7 @@ class DigitalTwinEngine:
         self.hydraulics: hydraulics.HydraulicModel = hydraulics.HydraulicModel(
             flow_rates_l_min=self._flow_rates_l_min,
             k_hx_by_group_w_k=self._k_hx_by_group_w_k,
+            buffer_offsets=self._buffer_offsets,
         )
         self.cop_params: contracts.CopParameters = (
             cop_params or priors.DAY1_COP_PARAMS
@@ -388,6 +497,16 @@ class DigitalTwinEngine:
     def param_epoch(self) -> int:
         """Monotonic counter incremented on every parameter mutation."""
         return self._param_epoch
+
+    @property
+    def buffer_offsets(self) -> contracts.BufferSensorOffsets:
+        """Active calibrated 1-Wire buffer tank sensor offsets [°C]."""
+        return self._buffer_offsets
+
+    @property
+    def prev_buffer_offsets(self) -> contracts.BufferSensorOffsets | None:
+        """Previous 1-Wire buffer tank sensor offsets prior to last update."""
+        return self._prev_buffer_offsets
 
     def _build_snapshot(
         self,
@@ -557,6 +676,7 @@ class DigitalTwinEngine:
         t_dn_wk = priors.T_GROUND_MEAN_C
 
         # Initialize estimators on very first tick or >3h outage
+        t_top_cal = t_top_e + self._buffer_offsets.buf_top_offset_c
         if not self.estimator_wk.initialized or dt_s > max_gap:
             ex_init_wk = contracts.ExogenousStepInput(
                 t_out_c=t_out_c,
@@ -572,7 +692,7 @@ class DigitalTwinEngine:
                 q_fh_w=0.0,
                 q_ac_w=0.0,
                 u_pump=u_pump,
-                t_buf_top_c=t_top_e,
+                t_buf_top_c=t_top_cal,
             )
             if dt_s > max_gap:
                 self.hindcast_wk.clear()
@@ -592,7 +712,7 @@ class DigitalTwinEngine:
                 q_fh_w=0.0,
                 q_ac_w=q_ac_kt,
                 u_pump=u_pump,
-                t_buf_top_c=t_top_e,
+                t_buf_top_c=t_top_cal,
             )
             if dt_s > max_gap:
                 self.hindcast_kt.clear()
@@ -754,6 +874,7 @@ class DigitalTwinEngine:
         self.hydraulics = hydraulics.HydraulicModel(
             flow_rates_l_min=self._flow_rates_l_min,
             k_hx_by_group_w_k=self._k_hx_by_group_w_k,
+            buffer_offsets=self._buffer_offsets,
         )
 
         hist = preprocessing.preprocess_history_columns(
@@ -763,7 +884,18 @@ class DigitalTwinEngine:
             eta_ac_ref=self._params_kt.eta_ac,
             lat_deg=self.latitude_deg,
             lon_deg=self.longitude_deg,
+            buffer_offsets=self._buffer_offsets,
         )
+        self.hydraulics.gamma_cal = float(getattr(hist, "final_gamma_cal", 1.0))
+        final_proxies = getattr(hist, "final_t_floor_proxy_c", None)
+        if isinstance(final_proxies, Mapping):
+            for g_name, val in final_proxies.items():
+                if (
+                    g_name in self.hydraulics.t_floor_proxy_c
+                    and preprocessing.is_finite_number(val)
+                ):
+                    self.hydraulics.t_floor_proxy_c[str(g_name)] = float(val)
+                    self.hydraulics._proxy_initialized.add(str(g_name))
         exog_wk = preprocessing.build_zone_exog_list(hist, "wk")
         exog_kt = preprocessing.build_zone_exog_list(hist, "kt")
 
@@ -837,6 +969,7 @@ class DigitalTwinEngine:
             "params_wk": self._params_wk.to_dict(),
             "params_kt": self._params_kt.to_dict(),
             "k_hx_by_group_w_k": dict(self._k_hx_by_group_w_k),
+            "buffer_offsets": self._buffer_offsets.to_dict(),
             "cop_params": self.cop_params.to_dict(),
             "memory_wk": calibration.posterior_memory_to_dict(self.memory_wk),
             "memory_kt": calibration.posterior_memory_to_dict(self.memory_kt),
@@ -849,15 +982,23 @@ class DigitalTwinEngine:
 
     def _apply_snapshot_dict(self, snap: Mapping[str, Any]) -> None:
         """Restores active parameters and seasonal memory from `snap`."""
-        self._params_wk = contracts.ZoneParameters.from_dict(
-            snap.get("params_wk"), defaults=priors.DAY1_PRIORS_WK
+        self._params_wk = _sync_fixed_zone_params(
+            "wk",
+            contracts.ZoneParameters.from_dict(
+                snap.get("params_wk"), defaults=priors.DAY1_PRIORS_WK
+            ),
         )
-        self._params_kt = contracts.ZoneParameters.from_dict(
-            snap.get("params_kt"), defaults=priors.DAY1_PRIORS_KT
+        self._params_kt = _sync_fixed_zone_params(
+            "kt",
+            contracts.ZoneParameters.from_dict(
+                snap.get("params_kt"), defaults=priors.DAY1_PRIORS_KT
+            ),
         )
 
         khx_raw = snap.get("k_hx_by_group_w_k")
-        self._k_hx_by_group_w_k = dict(priors.DAY1_K_HX_BY_GROUP_W_K)
+        self._k_hx_by_group_w_k = _scaled_day1_k_hx_by_group(
+            self._flow_rates_l_min
+        )
         if isinstance(khx_raw, Mapping):
             self._k_hx_by_group_w_k.update(
                 {
@@ -869,6 +1010,9 @@ class DigitalTwinEngine:
         self._k_hx_by_group_w_k["wk"] = self._params_wk.k_hx_w_k
         self._k_hx_by_group_w_k["kantoor"] = self._params_kt.k_hx_w_k
 
+        self._buffer_offsets = contracts.BufferSensorOffsets.from_dict(
+            snap.get("buffer_offsets"), defaults=priors.DAY1_BUFFER_OFFSETS
+        )
         self.cop_params = contracts.CopParameters.from_dict(
             snap.get("cop_params"), defaults=priors.DAY1_COP_PARAMS
         )
@@ -897,6 +1041,7 @@ class DigitalTwinEngine:
         self.estimator_wk.params = self._params_wk
         self.estimator_kt.params = self._params_kt
         self.hydraulics.update_k_hx(self._k_hx_by_group_w_k)
+        self.hydraulics.update_buffer_offsets(self._buffer_offsets)
 
     def capture_calibration_context(self) -> dict[str, Any]:
         """Captures an isolated `< 1 ms` calibration context under lock."""
@@ -906,6 +1051,7 @@ class DigitalTwinEngine:
             "params_kt": self._params_kt,
             "flow_rates_l_min": dict(self._flow_rates_l_min),
             "k_hx_by_group_w_k": dict(self._k_hx_by_group_w_k),
+            "buffer_offsets": self._buffer_offsets,
             "cop_params": self.cop_params,
             "memory_wk": _clone_memory(self.memory_wk),
             "memory_kt": _clone_memory(self.memory_kt),
@@ -944,6 +1090,15 @@ class DigitalTwinEngine:
         params_kt: contracts.ZoneParameters = context["params_kt"]
         flow_rates: dict[str, float] = dict(context["flow_rates_l_min"])
         k_hx_by_group: dict[str, float] = dict(context["k_hx_by_group_w_k"])
+        raw_buf_ctx = context.get("buffer_offsets")
+        buf_offsets_in = (
+            raw_buf_ctx
+            if isinstance(raw_buf_ctx, contracts.BufferSensorOffsets)
+            else contracts.BufferSensorOffsets.from_dict(
+                raw_buf_ctx if isinstance(raw_buf_ctx, Mapping) else None,
+                defaults=priors.DAY1_BUFFER_OFFSETS,
+            )
+        )
         cop_params: contracts.CopParameters = context["cop_params"]
         mem_wk_in = _clone_memory(context.get("memory_wk"))
         mem_kt_in = _clone_memory(context.get("memory_kt"))
@@ -964,6 +1119,7 @@ class DigitalTwinEngine:
                 "accepted_kt": False,
                 "reason": "Empty telemetry history.",
                 "cop_params": cop_params,
+                "buffer_offsets": buf_offsets_in,
                 "snapshot_depth": snapshot_depth,
             }
 
@@ -984,6 +1140,7 @@ class DigitalTwinEngine:
                     k_hx_by_group,
                     lat_deg,
                     lon_deg,
+                    buffer_offsets=buf_offsets_in,
                 )
                 return {
                     "param_epoch": param_epoch,
@@ -1003,6 +1160,7 @@ class DigitalTwinEngine:
             "params_wk": params_wk.to_dict(),
             "params_kt": params_kt.to_dict(),
             "k_hx_by_group_w_k": dict(k_hx_by_group),
+            "buffer_offsets": buf_offsets_in.to_dict(),
             "cop_params": cop_params.to_dict(),
             "memory_wk": calibration.posterior_memory_to_dict(mem_wk_in),
             "memory_kt": calibration.posterior_memory_to_dict(mem_kt_in),
@@ -1027,12 +1185,47 @@ class DigitalTwinEngine:
             columns, is_lts_row=is_lts_all
         )
 
-        # Curate EpisodeBank strictly from training split (no holdout leakage)
-        hist_train_init: preprocessing.PreprocessedHistory | None = None
-        if n_total >= 4 * const.STEPS_PER_DAY and train_end < n_total:
+        has_split = n_total >= 4 * const.STEPS_PER_DAY and train_end < n_total
+        if has_split:
             train_slice: Mapping[str, Sequence[float | int]] = (
                 preprocessing.slice_columns(columns, 0, train_end)
             )
+            is_lts_train: Sequence[bool] = is_lts_all[:train_end]
+        else:
+            train_slice = dict(columns)
+            is_lts_train = is_lts_all
+
+        # 0. Calibrate 0 Hz primary sniffing buffer offsets on train split
+        raw_buf_offsets = hydraulics.calibrate_buffer_sensor_offsets(
+            train_slice,
+            current_offsets=buf_offsets_in,
+            is_lts_row=is_lts_train,
+        )
+        if mode == "auto_weekly" and raw_buf_offsets != buf_offsets_in:
+            cand_buf_offsets = contracts.BufferSensorOffsets(
+                buf_top_offset_c=min(
+                    priors.BUF_SENSOR_OFFSET_MAX_C,
+                    max(
+                        priors.BUF_SENSOR_OFFSET_MIN_C,
+                        0.80 * buf_offsets_in.buf_top_offset_c
+                        + 0.20 * raw_buf_offsets.buf_top_offset_c,
+                    ),
+                ),
+                buf_bot_offset_c=min(
+                    priors.BUF_SENSOR_OFFSET_MAX_C,
+                    max(
+                        priors.BUF_SENSOR_OFFSET_MIN_C,
+                        0.80 * buf_offsets_in.buf_bot_offset_c
+                        + 0.20 * raw_buf_offsets.buf_bot_offset_c,
+                    ),
+                ),
+            )
+        else:
+            cand_buf_offsets = raw_buf_offsets
+
+        # Curate EpisodeBank strictly from training split (no holdout leakage)
+        hist_train_init: preprocessing.PreprocessedHistory | None = None
+        if has_split:
             hist_train_init = preprocessing.preprocess_history_columns(
                 train_slice,
                 flow_rates_l_min=flow_rates,
@@ -1040,6 +1233,7 @@ class DigitalTwinEngine:
                 eta_ac_ref=params_kt.eta_ac,
                 lat_deg=lat_deg,
                 lon_deg=lon_deg,
+                buffer_offsets=cand_buf_offsets,
             )
             local_bank.update_from_columns(
                 train_slice,
@@ -1048,11 +1242,10 @@ class DigitalTwinEngine:
                 lat_deg=lat_deg,
                 lon_deg=lon_deg,
                 precomputed_hist=hist_train_init,
+                buffer_offsets=cand_buf_offsets,
             )
-        else:
-            train_slice = dict(columns)
 
-        # 1. Calibrate steady-state K_hx on training split (damped once in auto_weekly)
+        # 1. Calibrate steady-state K_hx on training split
         raw_khx = calibration.calibrate_k_hx_robust(
             train_slice,
             flow_rates,
@@ -1060,6 +1253,7 @@ class DigitalTwinEngine:
             lat_deg=lat_deg,
             lon_deg=lon_deg,
             precomputed_hist=hist_train_init,
+            buffer_offsets=cand_buf_offsets,
         )
         khx_damped_here = mode == "auto_weekly"
         if khx_damped_here:
@@ -1075,12 +1269,10 @@ class DigitalTwinEngine:
         # Share precomputed train/holdout history across `wk` and `kt`
         hist_train_cand: preprocessing.PreprocessedHistory | None = None
         hist_hold_cand: preprocessing.PreprocessedHistory | None = None
+        hist_hold_before: preprocessing.PreprocessedHistory | None = None
         hist_hold_prior: preprocessing.PreprocessedHistory | None = None
-        if n_total >= 4 * const.STEPS_PER_DAY and train_end < n_total:
-            if (
-                hist_train_init is not None
-                and cand_khx == k_hx_by_group
-            ):
+        if has_split:
+            if hist_train_init is not None and cand_khx == k_hx_by_group:
                 hist_train_cand = hist_train_init
             elif hist_train_init is not None:
                 hist_train_cand = preprocessing.recompute_history_for_khx(
@@ -1097,6 +1289,7 @@ class DigitalTwinEngine:
                     eta_ac_ref=params_kt.eta_ac,
                     lat_deg=lat_deg,
                     lon_deg=lon_deg,
+                    buffer_offsets=cand_buf_offsets,
                 )
             holdout_slice_start = max(
                 0, train_end - evaluation.SPINUP_48H_STEPS
@@ -1111,15 +1304,60 @@ class DigitalTwinEngine:
                 eta_ac_ref=params_kt.eta_ac,
                 lat_deg=lat_deg,
                 lon_deg=lon_deg,
+                buffer_offsets=cand_buf_offsets,
             )
             kalman_tape.get_zone_tape(hist_hold_cand, "wk")
             kalman_tape.get_zone_tape(hist_hold_cand, "kt")
-            hist_hold_prior = preprocessing.recompute_history_for_khx(
-                hist_hold_cand,
-                holdout_cols,
-                flow_rates_l_min=flow_rates,
-                k_hx_by_group=priors.DAY1_K_HX_BY_GROUP_W_K,
-            )
+
+            if cand_buf_offsets == buf_offsets_in:
+                if cand_khx == k_hx_by_group:
+                    hist_hold_before = hist_hold_cand
+                else:
+                    hist_hold_before = preprocessing.recompute_history_for_khx(
+                        hist_hold_cand,
+                        holdout_cols,
+                        flow_rates_l_min=flow_rates,
+                        k_hx_by_group=k_hx_by_group,
+                    )
+                    kalman_tape.get_zone_tape(hist_hold_before, "wk")
+                    kalman_tape.get_zone_tape(hist_hold_before, "kt")
+            else:
+                hist_hold_before = preprocessing.preprocess_history_columns(
+                    holdout_cols,
+                    flow_rates_l_min=flow_rates,
+                    k_hx_by_group=k_hx_by_group,
+                    eta_ac_ref=params_kt.eta_ac,
+                    lat_deg=lat_deg,
+                    lon_deg=lon_deg,
+                    buffer_offsets=buf_offsets_in,
+                )
+                kalman_tape.get_zone_tape(hist_hold_before, "wk")
+                kalman_tape.get_zone_tape(hist_hold_before, "kt")
+
+            if cand_buf_offsets == priors.DAY1_BUFFER_OFFSETS:
+                hist_hold_prior = preprocessing.recompute_history_for_khx(
+                    hist_hold_cand,
+                    holdout_cols,
+                    flow_rates_l_min=flow_rates,
+                    k_hx_by_group=priors.DAY1_K_HX_BY_GROUP_W_K,
+                )
+            elif buf_offsets_in == priors.DAY1_BUFFER_OFFSETS:
+                hist_hold_prior = preprocessing.recompute_history_for_khx(
+                    hist_hold_before,
+                    holdout_cols,
+                    flow_rates_l_min=flow_rates,
+                    k_hx_by_group=priors.DAY1_K_HX_BY_GROUP_W_K,
+                )
+            else:
+                hist_hold_prior = preprocessing.preprocess_history_columns(
+                    holdout_cols,
+                    flow_rates_l_min=flow_rates,
+                    k_hx_by_group=priors.DAY1_K_HX_BY_GROUP_W_K,
+                    eta_ac_ref=priors.DAY1_PRIORS_KT.eta_ac,
+                    lat_deg=lat_deg,
+                    lon_deg=lon_deg,
+                    buffer_offsets=priors.DAY1_BUFFER_OFFSETS,
+                )
 
         # 2. Calibrate `wk` and `kt` (Joint Trajectory MAP + Holdout Gate)
         out_wk, mem_wk = calibration.calibrate_zone_a2(
@@ -1133,8 +1371,12 @@ class DigitalTwinEngine:
             k_hx_by_group=cand_khx,
             lat_deg=lat_deg,
             lon_deg=lon_deg,
+            old_k_hx_by_group=k_hx_by_group,
+            buffer_offsets=cand_buf_offsets,
+            old_buffer_offsets=buf_offsets_in,
             precomputed_train_hist=hist_train_cand,
             precomputed_holdout_hist=hist_hold_cand,
+            precomputed_holdout_before_hist=hist_hold_before,
             precomputed_holdout_prior_hist=hist_hold_prior,
             is_lts_row=is_lts_all,
             khx_already_damped=khx_damped_here,
@@ -1150,20 +1392,28 @@ class DigitalTwinEngine:
             k_hx_by_group=cand_khx,
             lat_deg=lat_deg,
             lon_deg=lon_deg,
+            old_k_hx_by_group=k_hx_by_group,
+            buffer_offsets=cand_buf_offsets,
+            old_buffer_offsets=buf_offsets_in,
             precomputed_train_hist=hist_train_cand,
             precomputed_holdout_hist=hist_hold_cand,
+            precomputed_holdout_before_hist=hist_hold_before,
             precomputed_holdout_prior_hist=hist_hold_prior,
             is_lts_row=is_lts_all,
             khx_already_damped=khx_damped_here,
         )
 
-        # 3. Calibrate heat pump COP model on `train_slice` once raw rows exist
+        # 3. Calibrate heat pump COP model on `train_slice` once >=4d raw exist
         n_non_lts_train = sum(
             1
             for idx in range(min(train_end, len(is_lts_all)))
             if not is_lts_all[idx]
         )
-        cop_cols = train_slice if n_non_lts_train > 0 else columns
+        cop_cols = (
+            train_slice
+            if n_non_lts_train >= 4 * const.STEPS_PER_DAY
+            else columns
+        )
         new_cop, mem_cop, cop_diag = _fit_cop_with_mode(
             cop_cols,
             cop_params,
@@ -1174,7 +1424,13 @@ class DigitalTwinEngine:
             eval_columns=columns,
         )
         cop_changed = new_cop != cop_params
-        accepted_any = out_wk.accepted or out_kt.accepted or cop_changed
+        buf_offsets_changed = cand_buf_offsets != buf_offsets_in
+        accepted_any = (
+            out_wk.accepted
+            or out_kt.accepted
+            or cop_changed
+            or buf_offsets_changed
+        )
 
         next_params_wk = out_wk.params_applied if out_wk.accepted else params_wk
         next_params_kt = out_kt.params_applied if out_kt.accepted else params_kt
@@ -1184,11 +1440,15 @@ class DigitalTwinEngine:
             next_khx["gang"] = cand_khx.get("gang", next_khx["gang"])
         if out_kt.accepted:
             next_khx["kantoor"] = next_params_kt.k_hx_w_k
+        next_buf_offsets = (
+            cand_buf_offsets if accepted_any else buf_offsets_in
+        )
 
         can_reuse_14d = (
             n_total >= evaluation.SPINUP_48H_STEPS
             and (n_total - train_end) == evaluation.EVAL_14D_STEPS
             and next_khx == cand_khx
+            and next_buf_offsets == cand_buf_offsets
         )
         reuse_wk = (
             can_reuse_14d
@@ -1214,6 +1474,7 @@ class DigitalTwinEngine:
                 k_hx_by_group=next_khx,
                 lat_deg=lat_deg,
                 lon_deg=lon_deg,
+                buffer_offsets=next_buf_offsets,
                 precomputed_hist_eval=hist_hold_cand,
                 precomputed_hist_prior=hist_hold_prior,
             )
@@ -1227,6 +1488,7 @@ class DigitalTwinEngine:
                 k_hx_by_group=next_khx,
                 lat_deg=lat_deg,
                 lon_deg=lon_deg,
+                buffer_offsets=next_buf_offsets,
                 precomputed_hist_eval=hist_hold_cand,
                 precomputed_hist_prior=hist_hold_prior,
             )
@@ -1240,6 +1502,7 @@ class DigitalTwinEngine:
                 next_khx,
                 lat_deg,
                 lon_deg,
+                buffer_offsets=next_buf_offsets,
                 precomputed_hist_eval=hist_hold_cand,
                 precomputed_hist_prior=hist_hold_prior,
             )
@@ -1257,6 +1520,8 @@ class DigitalTwinEngine:
             "holdout_j_kt_before": out_kt.holdout_before.overall_6h.j_eval_c,
             "holdout_j_kt_after": out_kt.holdout_after.overall_6h.j_eval_c,
             "cop_updated": cop_changed,
+            "buffer_offsets_updated": buf_offsets_changed,
+            "buffer_offsets": next_buf_offsets.to_dict(),
         }
 
         return {
@@ -1267,6 +1532,7 @@ class DigitalTwinEngine:
             "accepted_wk": out_wk.accepted,
             "accepted_kt": out_kt.accepted,
             "cop_changed": cop_changed,
+            "buffer_offsets_changed": buf_offsets_changed,
             "pre_snap": pre_snap,
             "episode_bank": local_bank,
             "outcome_wk": out_wk,
@@ -1277,6 +1543,7 @@ class DigitalTwinEngine:
             "memory_cop": mem_cop,
             "cop_diagnostics": cop_diag,
             "next_k_hx": next_khx,
+            "next_buffer_offsets": next_buf_offsets,
             "eval_wk": eval_wk,
             "eval_kt": eval_kt,
             "history_entry": hist_entry,
@@ -1296,6 +1563,7 @@ class DigitalTwinEngine:
                 "accepted_kt": False,
                 "reason": str(plan.get("reason", "Empty telemetry history.")),
                 "cop_params": self.cop_params,
+                "buffer_offsets": self._buffer_offsets,
                 "snapshot_depth": len(self.snapshot_stack),
             }
 
@@ -1346,6 +1614,7 @@ class DigitalTwinEngine:
 
         if accepted_any:
             self.snapshot_stack.append(dict(plan["pre_snap"]))
+            self._prev_buffer_offsets = self._buffer_offsets
             if out_wk.accepted:
                 self._params_wk = out_wk.params_applied
                 self.memory_wk = _clone_memory(plan["memory_wk"])
@@ -1362,10 +1631,18 @@ class DigitalTwinEngine:
             if cop_changed:
                 self.cop_params = plan["new_cop"]
                 self.memory_cop = _clone_memory(plan["memory_cop"])
+            next_buf = plan.get("next_buffer_offsets")
+            if isinstance(next_buf, contracts.BufferSensorOffsets):
+                self._buffer_offsets = next_buf
+            elif isinstance(next_buf, Mapping):
+                self._buffer_offsets = contracts.BufferSensorOffsets.from_dict(
+                    next_buf, defaults=self._buffer_offsets
+                )
 
             self.estimator_wk.params = self._params_wk
             self.estimator_kt.params = self._params_kt
             self.hydraulics.update_k_hx(self._k_hx_by_group_w_k)
+            self.hydraulics.update_buffer_offsets(self._buffer_offsets)
             self._param_epoch += 1
 
         self._last_posterior_std_wk = dict(out_wk.posterior_std)
@@ -1399,6 +1676,7 @@ class DigitalTwinEngine:
             "outcome_wk": out_wk,
             "outcome_kt": out_kt,
             "cop_params": self.cop_params,
+            "buffer_offsets": self._buffer_offsets,
             "snapshot_depth": len(self.snapshot_stack),
         }
 
@@ -1438,6 +1716,7 @@ class DigitalTwinEngine:
             return False
 
         snap = self.snapshot_stack.pop()
+        self._prev_buffer_offsets = self._buffer_offsets
         self._apply_snapshot_dict(snap)
         self._param_epoch += 1
 
@@ -1467,10 +1746,20 @@ class DigitalTwinEngine:
             columns: Optional RingBuffer columns for 48h state replay.
         """
         self.snapshot_stack.append(self._capture_snapshot(reason="pre_reset"))
+        self._prev_buffer_offsets = self._buffer_offsets
 
-        self._params_wk = priors.DAY1_PRIORS_WK
-        self._params_kt = priors.DAY1_PRIORS_KT
-        self._k_hx_by_group_w_k = dict(priors.DAY1_K_HX_BY_GROUP_W_K)
+        self._k_hx_by_group_w_k = _scaled_day1_k_hx_by_group(
+            self._flow_rates_l_min
+        )
+        self._params_wk = dataclasses.replace(
+            priors.DAY1_PRIORS_WK,
+            k_hx_w_k=self._k_hx_by_group_w_k["wk"],
+        )
+        self._params_kt = dataclasses.replace(
+            priors.DAY1_PRIORS_KT,
+            k_hx_w_k=self._k_hx_by_group_w_k["kantoor"],
+        )
+        self._buffer_offsets = priors.DAY1_BUFFER_OFFSETS
         self.cop_params = priors.DAY1_COP_PARAMS
         self.memory_wk = None
         self.memory_kt = None
@@ -1487,6 +1776,7 @@ class DigitalTwinEngine:
         self.estimator_wk.params = self._params_wk
         self.estimator_kt.params = self._params_kt
         self.hydraulics.update_k_hx(self._k_hx_by_group_w_k)
+        self.hydraulics.update_buffer_offsets(self._buffer_offsets)
         self._param_epoch += 1
 
         if columns is not None and len(columns.get("ts_utc", ())) > 0:
@@ -1502,6 +1792,13 @@ class DigitalTwinEngine:
                 "snapshot_depth": len(self.snapshot_stack),
             }
         )
+
+    def reset_parameters_to_day1(
+        self,
+        columns: Mapping[str, Sequence[float | int]] | None = None,
+    ) -> None:
+        """Alias for `reset_parameters` restoring all Day-1 priors & offsets."""
+        self.reset_parameters(columns)
 
     def compute_14d_evaluation_reports(
         self,
@@ -1524,6 +1821,15 @@ class DigitalTwinEngine:
             p_kt: contracts.ZoneParameters = context["params_kt"]
             flows: Mapping[str, float] = context["flow_rates_l_min"]
             k_hx_map: Mapping[str, float] = context["k_hx_by_group_w_k"]
+            raw_buf = context.get("buffer_offsets")
+            buf_offs = (
+                raw_buf
+                if isinstance(raw_buf, contracts.BufferSensorOffsets)
+                else contracts.BufferSensorOffsets.from_dict(
+                    raw_buf if isinstance(raw_buf, Mapping) else None,
+                    defaults=self._buffer_offsets,
+                )
+            )
             lat = float(context.get("latitude_deg", self.latitude_deg))
             lon = float(context.get("longitude_deg", self.longitude_deg))
         else:
@@ -1531,6 +1837,7 @@ class DigitalTwinEngine:
             p_kt = self._params_kt
             flows = self._flow_rates_l_min
             k_hx_map = self._k_hx_by_group_w_k
+            buf_offs = self._buffer_offsets
             lat = self.latitude_deg
             lon = self.longitude_deg
 
@@ -1542,6 +1849,7 @@ class DigitalTwinEngine:
             k_hx_map,
             lat,
             lon,
+            buffer_offsets=buf_offs,
         )
 
     def apply_14d_evaluation_reports(
@@ -1610,6 +1918,7 @@ class DigitalTwinEngine:
             },
             "flow_weights_l_min": dict(self._flow_rates_l_min),
             "k_hx_by_group_w_k": dict(self._k_hx_by_group_w_k),
+            "buffer_offsets": self._buffer_offsets.to_dict(),
             "zones": {
                 "wk": {
                     "parameters_active": self._params_wk.to_dict(),
@@ -1674,7 +1983,10 @@ class DigitalTwinEngine:
             Expected space-heating COP (`>= 1.0`) with DHW/restwarmte guard.
         """
         return cop_model.predict_live_expected_cop_from_row(
-            self.cop_params, raw_row, self.cop_diagnostics
+            self.cop_params,
+            raw_row,
+            self.cop_diagnostics,
+            buffer_offsets=self._buffer_offsets,
         )
 
     def get_zone_fit_diagnostics(
@@ -2170,16 +2482,26 @@ class DigitalTwinEngine:
             dt_s: Solver time step in seconds (default `1800.0` = 30 min).
 
         Returns:
-            `LinearizedDiscreteModel` with exact ZOH matrices and `tau_coast`.
+            `LinearizedDiscreteModel` with exact ZOH matrices, `tau_coast`,
+            active `gamma_cal`, and `k_hx_eff_w_k`.
         """
         params = self._params_wk if zone == "wk" else self._params_kt
-        return zoh_kalman.export_2r2c_solver_model(zone, params, dt_s=dt_s)
+        base_model = zoh_kalman.export_2r2c_solver_model(
+            zone, params, dt_s=dt_s
+        )
+        gamma_cal = float(self.hydraulics.gamma_cal)
+        return dataclasses.replace(
+            base_model,
+            gamma_cal=gamma_cal,
+            k_hx_eff_w_k=float(params.k_hx_w_k) * gamma_cal,
+        )
 
     def update_flow_rates(self, flow_rates_l_min: Mapping[str, float]) -> None:
         """Updates manifold rotameter flow rates [L/min] from HA OptionsFlow."""
-        self._flow_rates_l_min.update(
-            {str(k): float(v) for k, v in flow_rates_l_min.items()}
-        )
+        for k, v in flow_rates_l_min.items():
+            self._flow_rates_l_min[
+                preprocessing.zone_to_hydraulic_group(str(k))
+            ] = float(v)
         self.hydraulics.update_flow_rates(self._flow_rates_l_min)
         self._k_hx_by_group_w_k = dict(self.hydraulics.k_hx_by_group_w_k)
         self._params_wk = dataclasses.replace(
@@ -2208,6 +2530,12 @@ class DigitalTwinEngine:
             "desk_state_kt": dict(self._desk_state_kt),
             "flow_rates_l_min": dict(self._flow_rates_l_min),
             "k_hx_by_group_w_k": dict(self._k_hx_by_group_w_k),
+            "buffer_offsets": self._buffer_offsets.to_dict(),
+            "prev_buffer_offsets": (
+                self._prev_buffer_offsets.to_dict()
+                if self._prev_buffer_offsets is not None
+                else None
+            ),
             "params_wk": self._params_wk.to_dict(),
             "params_kt": self._params_kt.to_dict(),
             "estimator_wk": self.estimator_wk.to_dict(),
@@ -2295,31 +2623,66 @@ class DigitalTwinEngine:
                 }
             )
 
+        if "buffer_offsets" in data:
+            self._buffer_offsets = contracts.BufferSensorOffsets.from_dict(
+                data.get("buffer_offsets"), defaults=priors.DAY1_BUFFER_OFFSETS
+            )
+        elif isinstance(data.get("hydraulics"), Mapping) and isinstance(
+            data["hydraulics"].get("buffer_offsets"), Mapping
+        ):
+            self._buffer_offsets = contracts.BufferSensorOffsets.from_dict(
+                data["hydraulics"].get("buffer_offsets"),
+                defaults=priors.DAY1_BUFFER_OFFSETS,
+            )
+        else:
+            self._buffer_offsets = priors.DAY1_BUFFER_OFFSETS
+
+        if isinstance(data.get("prev_buffer_offsets"), Mapping):
+            self._prev_buffer_offsets = contracts.BufferSensorOffsets.from_dict(
+                data["prev_buffer_offsets"],
+                defaults=priors.DAY1_BUFFER_OFFSETS,
+            )
+        else:
+            self._prev_buffer_offsets = None
+
         if isinstance(data.get("params_wk"), Mapping):
-            self._params_wk = contracts.ZoneParameters.from_dict(
-                data["params_wk"], defaults=priors.DAY1_PRIORS_WK
+            self._params_wk = _sync_fixed_zone_params(
+                "wk",
+                contracts.ZoneParameters.from_dict(
+                    data["params_wk"], defaults=priors.DAY1_PRIORS_WK
+                ),
             )
+            self._k_hx_by_group_w_k["wk"] = self._params_wk.k_hx_w_k
         if isinstance(data.get("params_kt"), Mapping):
-            self._params_kt = contracts.ZoneParameters.from_dict(
-                data["params_kt"], defaults=priors.DAY1_PRIORS_KT
+            self._params_kt = _sync_fixed_zone_params(
+                "kt",
+                contracts.ZoneParameters.from_dict(
+                    data["params_kt"], defaults=priors.DAY1_PRIORS_KT
+                ),
             )
+            self._k_hx_by_group_w_k["kantoor"] = self._params_kt.k_hx_w_k
 
         if isinstance(data.get("estimator_wk"), Mapping):
             self.estimator_wk = zoh_kalman.ZoneKalmanEstimator.from_dict(
                 data["estimator_wk"]
             )
-            self.estimator_wk.params = self._params_wk
+        self.estimator_wk.params = self._params_wk
         if isinstance(data.get("estimator_kt"), Mapping):
             self.estimator_kt = zoh_kalman.ZoneKalmanEstimator.from_dict(
                 data["estimator_kt"]
             )
-            self.estimator_kt.params = self._params_kt
+        self.estimator_kt.params = self._params_kt
         if isinstance(data.get("hydraulics"), Mapping):
             self.hydraulics = hydraulics.HydraulicModel.from_dict(
                 data["hydraulics"],
                 flow_rates_l_min=self._flow_rates_l_min,
                 k_hx_by_group_w_k=self._k_hx_by_group_w_k,
             )
+        else:
+            self.hydraulics.update_k_hx(self._k_hx_by_group_w_k)
+        restored_gamma = self.hydraulics.gamma_cal
+        self.hydraulics.update_buffer_offsets(self._buffer_offsets)
+        self.hydraulics.gamma_cal = restored_gamma
 
         if "cop_params" in data:
             self.cop_params = contracts.CopParameters.from_dict(

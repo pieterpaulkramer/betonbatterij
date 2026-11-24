@@ -186,6 +186,44 @@ class CopParameters:
 
 
 @dataclass(frozen=True, slots=True)
+class BufferSensorOffsets:
+    """Additive temperature corrections applied to raw 1-Wire buffer sensors.
+
+    Calibrated sensor temperature equals `t_raw_c + offset_c` [°C], anchored to
+    stationary `0 Hz` primary sniffing equilibrium (`wp_outlet == wp_inlet`).
+
+    Attributes:
+        buf_top_offset_c: Additive correction on raw top 1-Wire sensor [°C].
+        buf_bot_offset_c: Additive correction on raw bottom 1-Wire sensor [°C].
+    """
+
+    buf_top_offset_c: float = 0.0
+    buf_bot_offset_c: float = -0.33
+
+    def to_dict(self) -> dict[str, float]:
+        """Serializes buffer sensor offsets to a plain `dict[str, float]`."""
+        return {f.name: float(getattr(self, f.name)) for f in fields(self)}
+
+    @classmethod
+    def from_dict(
+        cls,
+        raw: Mapping[str, Any] | None,
+        defaults: BufferSensorOffsets | None = None,
+    ) -> BufferSensorOffsets:
+        """Deserializes `BufferSensorOffsets` with finite-float checks."""
+        base = defaults if defaults is not None else cls()
+        if not isinstance(raw, Mapping):
+            return base
+        kwargs: dict[str, float] = {}
+        for f in fields(cls):
+            parsed = _parse_finite_float(raw.get(f.name))
+            kwargs[f.name] = (
+                parsed if parsed is not None else float(getattr(base, f.name))
+            )
+        return cls(**kwargs)
+
+
+@dataclass(frozen=True, slots=True)
 class ZoneSnapshot:
     """Real-time O(1) readout of a modeled zone for HA sensors and Layer 2.
 
@@ -288,6 +326,8 @@ class LinearizedDiscreteModel:
     gamma_ac_el_ref: tuple[float, float]
     steady_loss_total_w_k: float
     effective_tau_coast_h: float
+    gamma_cal: float = 1.0
+    k_hx_eff_w_k: float = 0.0
 
 
 @dataclass(frozen=True, slots=True)

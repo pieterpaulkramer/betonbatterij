@@ -15,17 +15,28 @@ in L/min, time in s.
 from __future__ import annotations
 
 import collections
-from collections.abc import Iterable, Mapping
+from collections.abc import Iterable, Mapping, Sequence
 import dataclasses
 import math
 from typing import Any, TypeGuard
 
 from custom_components.betonbatterij import const
+from custom_components.betonbatterij.domain import contracts
 from custom_components.betonbatterij.domain import priors
 
 GAMMA_CAL_MIN: float = 0.75
 GAMMA_CAL_MAX: float = 1.25
 TELESCOPE_STEPS: int = 6  # 6 * 5 min = 30 min telescoped energy window.
+_SNIFFING_CONSEC_STEPS: int = 4  # 4 * 5 min = 20 min mixed 0 Hz equilibration.
+_SNIFFING_MIN_SAMPLES: int = 6
+
+_SNIFFING_EXCLUDE_FLAGS: int = (
+    const.FLAG_LTS_BACKFILL
+    | const.FLAG_GAP_BRIDGED
+    | const.FLAG_DHW_TANK
+    | const.FLAG_DEFROST_WP
+    | const.FLAG_Z1_OFF_HARVEST
+)
 
 _LEAKING_1E_GROUPS: tuple[str, ...] = (
     "slaapkamer",
@@ -103,8 +114,196 @@ def scale_k_hx_eps_ntu(
 
 
 def _is_valid_num(val: float | int | None) -> TypeGuard[float | int]:
-    """Checks whether `val` is a finite `float` or `int`."""
-    return val is not None and math.isfinite(val)
+    """Checks whether `val` is a finite non-boolean `float` or `int`."""
+    return (
+        isinstance(val, (int, float))
+        and not isinstance(val, bool)
+        and math.isfinite(val)
+    )
+
+
+def _trimmed_mean(
+    samples: Sequence[float],
+    trim_fraction: float = 0.20,
+) -> float:
+    """Computes a symmetric two-sided trimmed mean over `samples`."""
+    ordered = sorted(float(v) for v in samples)
+    n_vals = len(ordered)
+    k_trim = min((n_vals - 1) // 2, int(n_vals * trim_fraction))
+    core = ordered[k_trim : n_vals - k_trim]
+    return sum(core) / float(len(core))
+
+
+def calibrate_buffer_sensor_offsets(
+    columns: Mapping[str, Sequence[float | int]],
+    current_offsets: contracts.BufferSensorOffsets = priors.DAY1_BUFFER_OFFSETS,
+    is_lts_row: Sequence[bool] | None = None,
+) -> contracts.BufferSensorOffsets:
+    """Calibrates 1-Wire buffer sensor offsets on stationary `0 Hz` sniffing.
+
+    Identifies steps `k` preceded by at least 20 minutes (`4` consecutive 5-min
+    windows) of stationary `0 Hz` primary-pump sniffing (`v_prim >= 12 L/min`,
+    secondary floor pump off, `|t_wp_out - t_wp_in| <= 0.50 °C`) where the 200 L
+    buffer tank is thoroughly mixed to `0.5 * (t_wp_out + t_wp_in)`.
+
+    Args:
+        columns: RingBuffer column sequences.
+        current_offsets: Fallback `BufferSensorOffsets` returned when fewer than
+            6 clean stationary sniffing steps are available.
+        is_lts_row: Optional boolean mask identifying LTS backfill rows.
+
+    Returns:
+        Calibrated `BufferSensorOffsets` clamped to
+        `[BUF_SENSOR_OFFSET_MIN_C, BUF_SENSOR_OFFSET_MAX_C]`.
+    """
+    f_comp_seq = columns.get("f_comp_hz")
+    u_pump_seq = columns.get("u_pump_sec")
+    v_prim_seq = columns.get("v_prim_l_min")
+    wp_out_seq = columns.get("t_wp_out_c")
+    wp_in_seq = columns.get("t_wp_in_c")
+    top_e_seq = (
+        columns["t_buf_top_end_c"]
+        if "t_buf_top_end_c" in columns
+        else columns.get("t_buf_top_c")
+    )
+    top_s_seq = columns.get("t_buf_top_start_c", top_e_seq)
+    bot_e_seq = (
+        columns["t_buf_bot_end_c"]
+        if "t_buf_bot_end_c" in columns
+        else columns.get("t_buf_bot_c")
+    )
+    bot_s_seq = columns.get("t_buf_bot_start_c", bot_e_seq)
+
+    if (
+        f_comp_seq is None
+        or u_pump_seq is None
+        or v_prim_seq is None
+        or wp_out_seq is None
+        or wp_in_seq is None
+        or top_e_seq is None
+        or top_s_seq is None
+        or bot_e_seq is None
+        or bot_s_seq is None
+    ):
+        return current_offsets
+
+    flags_seq = columns.get("flags")
+    lengths = [
+        len(f_comp_seq),
+        len(u_pump_seq),
+        len(v_prim_seq),
+        len(wp_out_seq),
+        len(wp_in_seq),
+        len(top_e_seq),
+        len(top_s_seq),
+        len(bot_e_seq),
+        len(bot_s_seq),
+    ]
+    if flags_seq is not None:
+        lengths.append(len(flags_seq))
+    if "ts_utc" in columns:
+        lengths.append(len(columns["ts_utc"]))
+    n = min(lengths)
+    if n < _SNIFFING_CONSEC_STEPS:
+        return current_offsets
+
+    top_samples: list[float] = []
+    bot_samples: list[float] = []
+    consec_ok = 0
+
+    for k in range(n):
+        if is_lts_row is not None and k < len(is_lts_row) and is_lts_row[k]:
+            consec_ok = 0
+            continue
+        if flags_seq is not None:
+            raw_fl = flags_seq[k]
+            if (
+                not _is_valid_num(raw_fl)
+                or (int(raw_fl) & _SNIFFING_EXCLUDE_FLAGS) != 0
+            ):
+                consec_ok = 0
+                continue
+
+        raw_hz = f_comp_seq[k]
+        raw_up = u_pump_seq[k]
+        raw_vp = v_prim_seq[k]
+        raw_wpo = wp_out_seq[k]
+        raw_wpi = wp_in_seq[k]
+        if not (
+            _is_valid_num(raw_hz)
+            and _is_valid_num(raw_up)
+            and _is_valid_num(raw_vp)
+            and _is_valid_num(raw_wpo)
+            and _is_valid_num(raw_wpi)
+        ):
+            consec_ok = 0
+            continue
+
+        f_hz = float(raw_hz)
+        u_pump = float(raw_up)
+        v_prim = float(raw_vp)
+        t_wpo = float(raw_wpo)
+        t_wpi = float(raw_wpi)
+        if not (
+            0.0 <= f_hz <= 0.5
+            and 0.0 <= u_pump <= 0.02
+            and v_prim >= 12.0
+            and 15.0 <= t_wpo <= 40.0
+            and 15.0 <= t_wpi <= 40.0
+            and abs(t_wpo - t_wpi) <= 0.50
+        ):
+            consec_ok = 0
+            continue
+
+        consec_ok += 1
+        if consec_ok < _SNIFFING_CONSEC_STEPS:
+            continue
+
+        raw_ts = top_s_seq[k]
+        raw_te = top_e_seq[k]
+        raw_bs = bot_s_seq[k]
+        raw_be = bot_e_seq[k]
+        if not (
+            _is_valid_num(raw_ts)
+            and _is_valid_num(raw_te)
+            and _is_valid_num(raw_bs)
+            and _is_valid_num(raw_be)
+        ):
+            continue
+
+        top_start = float(raw_ts)
+        top_end = float(raw_te)
+        bot_start = float(raw_bs)
+        bot_end = float(raw_be)
+        if not (
+            12.0 <= top_start <= 45.0
+            and 12.0 <= top_end <= 45.0
+            and 12.0 <= bot_start <= 45.0
+            and 12.0 <= bot_end <= 45.0
+            and abs(top_end - top_start) <= 0.25
+            and abs(bot_end - bot_start) <= 0.25
+        ):
+            continue
+
+        t_ref = 0.5 * (t_wpo + t_wpi)
+        top_samples.append(t_ref - 0.5 * (top_start + top_end))
+        bot_samples.append(t_ref - 0.5 * (bot_start + bot_end))
+
+    if len(top_samples) < _SNIFFING_MIN_SAMPLES:
+        return current_offsets
+
+    top_off = max(
+        priors.BUF_SENSOR_OFFSET_MIN_C,
+        min(priors.BUF_SENSOR_OFFSET_MAX_C, _trimmed_mean(top_samples)),
+    )
+    bot_off = max(
+        priors.BUF_SENSOR_OFFSET_MIN_C,
+        min(priors.BUF_SENSOR_OFFSET_MAX_C, _trimmed_mean(bot_samples)),
+    )
+    return contracts.BufferSensorOffsets(
+        buf_top_offset_c=top_off,
+        buf_bot_offset_c=bot_off,
+    )
 
 
 @dataclasses.dataclass(frozen=True, slots=True)
@@ -170,13 +369,18 @@ class HydraulicModel:
         self,
         flow_rates_l_min: Mapping[str, float] | None = None,
         k_hx_by_group_w_k: Mapping[str, float] | None = None,
+        buffer_offsets: contracts.BufferSensorOffsets = (
+            priors.DAY1_BUFFER_OFFSETS
+        ),
     ) -> None:
         """Initializes the hydraulic model from rotameter flows and `K_hx` priors.
 
         Args:
             flow_rates_l_min: Optional mapping of group rotameter flows [L/min].
             k_hx_by_group_w_k: Optional mapping of group `K_hx` values [W/K].
+            buffer_offsets: Additive 1-Wire buffer sensor corrections [°C].
         """
+        self.buffer_offsets: contracts.BufferSensorOffsets = buffer_offsets
         self.flow_rates_l_min: dict[str, float] = {
             g: max(
                 0.05,
@@ -258,6 +462,18 @@ class HydraulicModel:
                 self.k_hx_by_group_w_k[g] = max(1.0, val)
         self._cal_window.clear()
 
+    def update_buffer_offsets(
+        self,
+        buffer_offsets: contracts.BufferSensorOffsets,
+    ) -> None:
+        """Applies calibrated 1-Wire buffer sensor offsets [°C].
+
+        Args:
+            buffer_offsets: Calibrated `BufferSensorOffsets` instance.
+        """
+        self.buffer_offsets = buffer_offsets
+        self._cal_window.clear()
+
     def compute_effective_supply_temp(
         self,
         threeway_room: bool,
@@ -268,22 +484,27 @@ class HydraulicModel:
     ) -> float:
         """Computes secondary manifold supply temperature across hydraulic regimes.
 
-        Applies `BUF_BOT_SENSOR_OFFSET_C` (`-0.33 °C`) to the raw bottom sensor.
+        Applies `self.buffer_offsets` once to raw top and bottom 1-Wire sensors.
         Accounts for bottom return-water bypass mixing when `threeway_room` is
-        True and `v_sec_total_l_min > v_prim_l_min > 1.0`, and uses
+        True and `v_sec_total_l_min > v_prim_l_min > 1.0`, and uses calibrated
         `t_buf_top_c` directly during passive buffer harvesting.
 
         Args:
             threeway_room: True when the primary 3-way valve is set to `Room`.
             v_prim_l_min: Primary heat-pump water flow rate [L/min].
             v_sec_total_l_min: Total active secondary manifold flow [L/min].
-            t_buf_top_c: 200 L buffer tank top sensor temperature [°C].
-            t_buf_bot_raw_c: Uncalibrated 200 L buffer bottom temperature [°C].
+            t_buf_top_c: Raw 200 L buffer tank top sensor temperature [°C].
+            t_buf_bot_raw_c: Raw 200 L buffer bottom sensor temperature [°C].
 
         Returns:
             Effective secondary supply water temperature [°C].
         """
-        t_bot_cal_c = float(t_buf_bot_raw_c) + priors.BUF_BOT_SENSOR_OFFSET_C
+        t_top_cal_c = (
+            float(t_buf_top_c) + self.buffer_offsets.buf_top_offset_c
+        )
+        t_bot_cal_c = (
+            float(t_buf_bot_raw_c) + self.buffer_offsets.buf_bot_offset_c
+        )
         v_prim = (
             0.0
             if not _is_valid_num(v_prim_l_min)
@@ -297,11 +518,8 @@ class HydraulicModel:
 
         if threeway_room and v_prim > 1.0:
             alpha_mix = min(1.0, v_prim / max(v_sec, 0.1))
-            return (
-                alpha_mix * float(t_buf_top_c)
-                + (1.0 - alpha_mix) * t_bot_cal_c
-            )
-        return float(t_buf_top_c)
+            return alpha_mix * t_top_cal_c + (1.0 - alpha_mix) * t_bot_cal_c
+        return t_top_cal_c
 
     @staticmethod
     def _resolve_valve_openings(
@@ -415,8 +633,10 @@ class HydraulicModel:
                 q_fh_wk_w=0.0,
                 q_fh_kt_w=0.0,
                 q_leak_1e_to_wk_w=0.0,
-                t_sup_sec_c=0.5
-                * (float(t_buf_top_start_c) + float(t_buf_top_end_c)),
+                t_sup_sec_c=(
+                    0.5 * (float(t_buf_top_start_c) + float(t_buf_top_end_c))
+                    + self.buffer_offsets.buf_top_offset_c
+                ),
                 q_sec_calorimetric_w=0.0,
                 gamma_cal=self.gamma_cal,
                 f_flow_wk=0.0,
@@ -467,12 +687,15 @@ class HydraulicModel:
         )
 
         # 200 L buffer tank calorimetric balance from window boundary values.
-        bot_off = priors.BUF_BOT_SENSOR_OFFSET_C
+        top_off = self.buffer_offsets.buf_top_offset_c
+        bot_off = self.buffer_offsets.buf_bot_offset_c
         t_buf_mean_start = 0.5 * (
-            float(t_buf_top_start_c) + float(t_buf_bot_start_c) + bot_off
+            (float(t_buf_top_start_c) + top_off)
+            + (float(t_buf_bot_start_c) + bot_off)
         )
         t_buf_mean_end = 0.5 * (
-            float(t_buf_top_end_c) + float(t_buf_bot_end_c) + bot_off
+            (float(t_buf_top_end_c) + top_off)
+            + (float(t_buf_bot_end_c) + bot_off)
         )
         d_e_buf_w = (
             priors.C_BUF_J_K * (t_buf_mean_end - t_buf_mean_start) / step_s
@@ -674,6 +897,7 @@ class HydraulicModel:
         return {
             "flow_rates_l_min": dict(self.flow_rates_l_min),
             "k_hx_by_group_w_k": dict(self.k_hx_by_group_w_k),
+            "buffer_offsets": self.buffer_offsets.to_dict(),
             "t_floor_proxy_c": dict(self.t_floor_proxy_c),
             "gamma_cal": float(self.gamma_cal),
             "proxy_initialized": sorted(self._proxy_initialized),
@@ -685,6 +909,7 @@ class HydraulicModel:
         data: Mapping[str, Any],
         flow_rates_l_min: Mapping[str, float] | None = None,
         k_hx_by_group_w_k: Mapping[str, float] | None = None,
+        buffer_offsets: contracts.BufferSensorOffsets | None = None,
     ) -> HydraulicModel:
         """Restores a `HydraulicModel` from a persisted dictionary.
 
@@ -692,6 +917,7 @@ class HydraulicModel:
             data: Persisted dictionary produced by `to_dict()`.
             flow_rates_l_min: Optional override for rotameter flows [L/min].
             k_hx_by_group_w_k: Optional override for `K_hx` conductances [W/K].
+            buffer_offsets: Optional override for 1-Wire buffer offsets [°C].
 
         Returns:
             Restored `HydraulicModel` instance.
@@ -704,8 +930,20 @@ class HydraulicModel:
         eff_khx = (
             k_hx_by_group_w_k if k_hx_by_group_w_k is not None else saved_khx
         )
+        eff_offsets = (
+            buffer_offsets
+            if buffer_offsets is not None
+            else contracts.BufferSensorOffsets.from_dict(
+                data.get("buffer_offsets"),
+                defaults=priors.DAY1_BUFFER_OFFSETS,
+            )
+        )
 
-        model = cls(flow_rates_l_min=eff_flows, k_hx_by_group_w_k=eff_khx)
+        model = cls(
+            flow_rates_l_min=eff_flows,
+            k_hx_by_group_w_k=eff_khx,
+            buffer_offsets=eff_offsets,
+        )
 
         saved_proxies = data.get("t_floor_proxy_c")
         if isinstance(saved_proxies, Mapping):

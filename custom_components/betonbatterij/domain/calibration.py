@@ -31,6 +31,7 @@ from typing import Any, Literal
 from custom_components.betonbatterij import const
 from custom_components.betonbatterij.domain import contracts
 from custom_components.betonbatterij.domain import evaluation
+from custom_components.betonbatterij.domain import hydraulics
 from custom_components.betonbatterij.domain import kalman_tape
 from custom_components.betonbatterij.domain import preprocessing
 from custom_components.betonbatterij.domain import priors
@@ -45,6 +46,26 @@ EPISODE_MAX_PER_REGIME: int = 8
 EPISODE_RETENTION_S: int = 365 * 86400
 DEFROST_PAD_STEPS: int = 3  # ±15 min around defrost cycles
 RESIDUAL_SIGMA_C: float = 0.08  # Trajectory measurement noise scale [K]
+MIN_REGIME_VETO_WINDOWS: int = 5  # Min windows before sub-regime can veto
+
+
+def _hist_matches_buffer_offsets(
+    hist: preprocessing.PreprocessedHistory | None,
+    buffer_offsets: contracts.BufferSensorOffsets,
+) -> bool:
+    """Returns True if `hist` matches `buffer_offsets` within `1e-9 °C`."""
+    if hist is None:
+        return False
+    top_h = float(
+        getattr(hist, "buf_top_offset_c", priors.BUF_TOP_SENSOR_OFFSET_C)
+    )
+    bot_h = float(
+        getattr(hist, "buf_bot_offset_c", priors.BUF_BOT_SENSOR_OFFSET_C)
+    )
+    return (
+        abs(top_h - buffer_offsets.buf_top_offset_c) <= 1e-9
+        and abs(bot_h - buffer_offsets.buf_bot_offset_c) <= 1e-9
+    )
 
 
 # ============================================================================
@@ -1027,6 +1048,9 @@ class SeasonalEpisodeBank:
         lon_deg: float = priors.LONGITUDE_DEG,
         *,
         precomputed_hist: preprocessing.PreprocessedHistory | None = None,
+        buffer_offsets: contracts.BufferSensorOffsets = (
+            priors.DAY1_BUFFER_OFFSETS
+        ),
     ) -> int:
         """Scans `columns` and retains top-K cleanest episodes over 365 days.
 
@@ -1037,6 +1061,7 @@ class SeasonalEpisodeBank:
             lat_deg: Observer latitude in degrees North.
             lon_deg: Observer longitude in degrees East.
             precomputed_hist: Optional precomputed `PreprocessedHistory`.
+            buffer_offsets: Active 1-Wire buffer tank sensor offsets.
 
         Returns:
             Number of candidate episodes merged into the reservoir buckets.
@@ -1049,7 +1074,11 @@ class SeasonalEpisodeBank:
         latest_ts = int(ts_seq[-1])
         cutoff_ts = latest_ts - EPISODE_RETENTION_S
 
-        if precomputed_hist is not None and precomputed_hist.n_rows == n:
+        if (
+            precomputed_hist is not None
+            and precomputed_hist.n_rows == n
+            and _hist_matches_buffer_offsets(precomputed_hist, buffer_offsets)
+        ):
             hist = precomputed_hist
         else:
             hist = preprocessing.preprocess_history_columns(
@@ -1058,6 +1087,7 @@ class SeasonalEpisodeBank:
                 k_hx_by_group=k_hx_by_group,
                 lat_deg=lat_deg,
                 lon_deg=lon_deg,
+                buffer_offsets=buffer_offsets,
             )
         min_spinup = (
             EPISODE_SPINUP_STEPS
@@ -1432,6 +1462,7 @@ def calibrate_k_hx_robust(
     lon_deg: float = priors.LONGITUDE_DEG,
     *,
     precomputed_hist: preprocessing.PreprocessedHistory | None = None,
+    buffer_offsets: contracts.BufferSensorOffsets = priors.DAY1_BUFFER_OFFSETS,
 ) -> dict[str, float]:
     """Calibrates `K_hx` [W/K] on steady `18..25 Hz` runs (`>= 40 min`, `dT >= 2 K`).
 
@@ -1442,11 +1473,22 @@ def calibrate_k_hx_robust(
         lat_deg: Observer latitude in degrees North.
         lon_deg: Observer longitude in degrees East.
         precomputed_hist: Optional precomputed `PreprocessedHistory`.
+        buffer_offsets: Active 1-Wire buffer tank sensor offsets.
 
     Returns:
         Updated dictionary mapping all 10 hydraulic groups to `K_hx` [W/K].
     """
-    out_khx: dict[str, float] = dict(priors.DAY1_K_HX_BY_GROUP_W_K)
+    flows = dict(const.DEFAULT_FLOW_RATES_L_MIN)
+    flows.update({k: float(v) for k, v in flow_rates_l_min.items()})
+
+    out_khx: dict[str, float] = {
+        g: hydraulics.scale_k_hx_eps_ntu(
+            priors.DAY1_K_HX_BY_GROUP_W_K[g],
+            const.DEFAULT_FLOW_RATES_L_MIN[g],
+            flows[g],
+        )
+        for g in const.ALL_HYDRAULIC_GROUPS
+    }
     for g, v in current_k_hx.items():
         out_khx[preprocessing.zone_to_hydraulic_group(g)] = float(v)
 
@@ -1455,14 +1497,12 @@ def calibrate_k_hx_robust(
     if n < 16:
         return out_khx
 
-    flows = dict(const.DEFAULT_FLOW_RATES_L_MIN)
-    flows.update({k: float(v) for k, v in flow_rates_l_min.items()})
-
     if (
         precomputed_hist is not None
         and precomputed_hist.n_rows == n
         and abs(precomputed_hist.hyd_k_hx_wk - out_khx["wk"]) <= 1e-9
         and abs(precomputed_hist.hyd_k_hx_kt - out_khx["kantoor"]) <= 1e-9
+        and _hist_matches_buffer_offsets(precomputed_hist, buffer_offsets)
     ):
         hist = precomputed_hist
     else:
@@ -1472,6 +1512,7 @@ def calibrate_k_hx_robust(
             k_hx_by_group=out_khx,
             lat_deg=lat_deg,
             lon_deg=lon_deg,
+            buffer_offsets=buffer_offsets,
         )
 
     st_wk = kalman_tape.reconstruct_states_tuples(
@@ -1499,6 +1540,8 @@ def calibrate_k_hx_robust(
     missing_prim = (
         hist.missing_prim_th if len(hist.missing_prim_th) == n else [False] * n
     )
+    top_off = float(buffer_offsets.buf_top_offset_c)
+    bot_off = float(buffer_offsets.buf_bot_offset_c)
 
     for k in range(n):
         if is_lts[k] or missing_prim[k]:
@@ -1525,11 +1568,17 @@ def calibrate_k_hx_robust(
         if hist.u_pump_sec[k] < 0.99:
             continue
 
-        top_s = _finite_col_val(
-            columns, "t_buf_top_start_c", k, hist.t_buf_top_c[k]
+        top_s_raw = _opt_col_temp(columns, "t_buf_top_start_c", k)
+        top_e_raw = _opt_col_temp(columns, "t_buf_top_end_c", k)
+        top_s = (
+            top_s_raw + top_off
+            if top_s_raw is not None
+            else hist.t_buf_top_c[k]
         )
-        top_e = _finite_col_val(
-            columns, "t_buf_top_end_c", k, hist.t_buf_top_c[k]
+        top_e = (
+            top_e_raw + top_off
+            if top_e_raw is not None
+            else hist.t_buf_top_c[k]
         )
         if abs(top_e - top_s) > 0.25:
             continue
@@ -1537,12 +1586,12 @@ def calibrate_k_hx_robust(
         bot_s_raw = _opt_col_temp(columns, "t_buf_bot_start_c", k)
         bot_e_raw = _opt_col_temp(columns, "t_buf_bot_end_c", k)
         bot_s = (
-            bot_s_raw + priors.BUF_BOT_SENSOR_OFFSET_C
+            bot_s_raw + bot_off
             if bot_s_raw is not None
             else hist.t_buf_bot_cal_c[k]
         )
         bot_e = (
-            bot_e_raw + priors.BUF_BOT_SENSOR_OFFSET_C
+            bot_e_raw + bot_off
             if bot_e_raw is not None
             else hist.t_buf_bot_cal_c[k]
         )
@@ -1560,8 +1609,15 @@ def calibrate_k_hx_robust(
     if len(steady_indices) < 6:
         return out_khx
 
+    def _scaled_day1_khx(group_name: str) -> float:
+        return hydraulics.scale_k_hx_eps_ntu(
+            priors.DAY1_K_HX_BY_GROUP_W_K[group_name],
+            const.DEFAULT_FLOW_RATES_L_MIN[group_name],
+            flows[group_name],
+        )
+
     gang_to_wk_ratio = flows["gang"] / max(0.2, flows["wk"])
-    day1_wk = priors.DAY1_K_HX_BY_GROUP_W_K["wk"]
+    scaled_day1_wk = _scaled_day1_khx("wk")
 
     # Pass 1: Calibrate `wk` (+ `gang`) preferring BG-solo steady 20 Hz steps
     wk_solo_vals: list[float] = []
@@ -1594,7 +1650,7 @@ def calibrate_k_hx_robust(
                 * (dt_wk + gang_to_wk_ratio * dt_gang)
             )
             cand = q_cal / max(0.1, denom)
-            if 0.35 * day1_wk <= cand <= 2.3 * day1_wk:
+            if 0.35 * scaled_day1_wk <= cand <= 2.3 * scaled_day1_wk:
                 wk_solo_vals.append(cand)
                 wk_solo_wts.append(dt_wk * dt_wk)
         elif other_u <= 1.5:
@@ -1611,17 +1667,17 @@ def calibrate_k_hx_robust(
             )
             if q_mod_tot > 200.0:
                 cand = out_khx["wk"] * (q_cal / q_mod_tot)
-                if 0.35 * day1_wk <= cand <= 2.3 * day1_wk:
+                if 0.35 * scaled_day1_wk <= cand <= 2.3 * scaled_day1_wk:
                     wk_mix_vals.append(cand)
                     wk_mix_wts.append(dt_wk * dt_wk)
 
     def _clamp_khx(group_name: str, raw_val: float) -> float:
-        day1_g = priors.DAY1_K_HX_BY_GROUP_W_K[group_name]
+        scaled_day1_g = _scaled_day1_khx(group_name)
         cap_g = min(
-            1.45 * day1_g,
+            1.65 * scaled_day1_g,
             0.75 * flows[group_name] * priors.WATER_POWER_FACTOR_W_PER_LMIN_K,
         )
-        return max(1.0, min(cap_g, max(0.4 * day1_g, raw_val)))
+        return max(1.0, min(cap_g, max(0.4 * scaled_day1_g, raw_val)))
 
     if len(wk_solo_vals) >= 6:
         est_wk = _weighted_median_and_trimmed_mean(wk_solo_vals, wk_solo_wts)
@@ -1637,7 +1693,7 @@ def calibrate_k_hx_robust(
     # Pass 2: Calibrate `kantoor` (`kt`) using updated BG `K_hx`
     kt_vals: list[float] = []
     kt_wts: list[float] = []
-    day1_kt = priors.DAY1_K_HX_BY_GROUP_W_K["kantoor"]
+    scaled_day1_kt = _scaled_day1_khx("kantoor")
 
     for k in steady_indices:
         if hist.u_eff_kt[k] < 0.98:
@@ -1663,14 +1719,14 @@ def calibrate_k_hx_robust(
         denom_kt = hist.u_pump_sec[k] * hist.u_eff_kt[k] * dt_kt
         cand_sub = q_rem / max(0.1, denom_kt)
 
-        if 0.35 * day1_kt <= cand_sub <= 2.3 * day1_kt:
+        if 0.35 * scaled_day1_kt <= cand_sub <= 2.3 * scaled_day1_kt:
             kt_vals.append(cand_sub)
             kt_wts.append(dt_kt * dt_kt)
         else:
             q_mod_tot = q_others + denom_kt * out_khx["kantoor"]
             if q_mod_tot > 200.0:
                 cand_rat = out_khx["kantoor"] * (q_cal / q_mod_tot)
-                if 0.35 * day1_kt <= cand_rat <= 2.3 * day1_kt:
+                if 0.35 * scaled_day1_kt <= cand_rat <= 2.3 * scaled_day1_kt:
                     kt_vals.append(cand_rat)
                     kt_wts.append(dt_kt * dt_kt)
 
@@ -1881,8 +1937,14 @@ def calibrate_zone_a2(
     lat_deg: float = priors.LATITUDE_DEG,
     lon_deg: float = priors.LONGITUDE_DEG,
     *,
+    old_k_hx_by_group: Mapping[str, float] | None = None,
+    buffer_offsets: contracts.BufferSensorOffsets = priors.DAY1_BUFFER_OFFSETS,
+    old_buffer_offsets: contracts.BufferSensorOffsets | None = None,
     precomputed_train_hist: preprocessing.PreprocessedHistory | None = None,
     precomputed_holdout_hist: preprocessing.PreprocessedHistory | None = None,
+    precomputed_holdout_before_hist: (
+        preprocessing.PreprocessedHistory | None
+    ) = None,
     precomputed_holdout_prior_hist: (
         preprocessing.PreprocessedHistory | None
     ) = None,
@@ -1903,8 +1965,15 @@ def calibrate_zone_a2(
         k_hx_by_group: Optional candidate `K_hx` [W/K] per hydraulic group.
         lat_deg: Observer latitude in degrees North.
         lon_deg: Observer longitude in degrees East.
+        old_k_hx_by_group: Optional pre-calibration `K_hx` [W/K] per group for
+            evaluating `holdout_before`.
+        buffer_offsets: Candidate 1-Wire buffer tank sensor offsets.
+        old_buffer_offsets: Pre-calibration 1-Wire buffer tank sensor offsets
+            for evaluating `holdout_before`.
         precomputed_train_hist: Optional precomputed training history.
-        precomputed_holdout_hist: Optional precomputed holdout history.
+        precomputed_holdout_hist: Optional precomputed candidate holdout hist.
+        precomputed_holdout_before_hist: Optional precomputed baseline holdout
+            history for `holdout_before`.
         precomputed_holdout_prior_hist: Optional precomputed Day-1 holdout hist.
         is_lts_row: Optional precomputed LTS backfill mask.
         khx_already_damped: True when `k_hx_by_group` was already damped by
@@ -1921,6 +1990,14 @@ def calibrate_zone_a2(
         if zone == "wk"
         else priors.DAY1_PRIORS_KT
     )
+    eff_old_khx = (
+        old_k_hx_by_group if old_k_hx_by_group is not None else k_hx_by_group
+    )
+    eff_old_buf_offsets = (
+        old_buffer_offsets
+        if old_buffer_offsets is not None
+        else buffer_offsets
+    )
     active_bounds = _active_bounds_for_zone(zone)
     param_names = list(active_bounds.keys())
     prior_mean_init, prior_prec_init = compute_aged_prior(memory, active_bounds)
@@ -1932,17 +2009,28 @@ def calibrate_zone_a2(
         )
     )
 
-    if n_total < 4 * const.STEPS_PER_DAY:
-        rep = evaluation.evaluate_14d_hindcast(
+    def _eval_fallback(
+        eval_steps_arg: int = evaluation.EVAL_14D_STEPS,
+        pre_eval: preprocessing.PreprocessedHistory | None = None,
+        pre_prior: preprocessing.PreprocessedHistory | None = None,
+    ) -> contracts.ZoneEvaluationReport:
+        return evaluation.evaluate_14d_hindcast(
             columns,
             zone,
             current_params,
             day1_prior,
             flow_rates_l_min,
-            k_hx_by_group,
+            eff_old_khx,
             lat_deg=lat_deg,
             lon_deg=lon_deg,
+            buffer_offsets=eff_old_buf_offsets,
+            precomputed_hist_eval=pre_eval,
+            precomputed_hist_prior=pre_prior,
+            eval_steps=eval_steps_arg,
         )
+
+    if n_total < 4 * const.STEPS_PER_DAY:
+        rep = _eval_fallback()
         return (
             contracts.CalibrationZoneOutcome(
                 zone=zone,
@@ -1977,16 +2065,7 @@ def calibrate_zone_a2(
             columns, lat_deg=lat_deg, lon_deg=lon_deg
         )
         if not gate_ok:
-            rep = evaluation.evaluate_14d_hindcast(
-                columns,
-                zone,
-                current_params,
-                day1_prior,
-                flow_rates_l_min,
-                k_hx_by_group,
-                lat_deg=lat_deg,
-                lon_deg=lon_deg,
-            )
+            rep = _eval_fallback()
             return (
                 contracts.CalibrationZoneOutcome(
                     zone=zone,
@@ -2045,6 +2124,7 @@ def calibrate_zone_a2(
     if (
         precomputed_train_hist is not None
         and precomputed_train_hist.n_rows == train_end
+        and _hist_matches_buffer_offsets(precomputed_train_hist, buffer_offsets)
     ):
         hist_train = precomputed_train_hist
     else:
@@ -2056,6 +2136,7 @@ def calibrate_zone_a2(
             eta_ac_ref=current_params.eta_ac,
             lat_deg=lat_deg,
             lon_deg=lon_deg,
+            buffer_offsets=buffer_offsets,
         )
     states_init = kalman_tape.reconstruct_states_tuples(
         hist_train, zone, current_params
@@ -2076,11 +2157,11 @@ def calibrate_zone_a2(
     ] = []
     if episode_bank is not None:
         for ep in episode_bank.get_episodes(zone):
-            if ep.end_ts_utc > holdout_start_ts:
+            if ep.end_ts_utc >= holdout_start_ts:
                 continue
             overlaps_train = (
-                ep.start_ts_utc >= train_start_ts
-                and ep.end_ts_utc <= holdout_start_ts
+                ep.end_ts_utc >= train_start_ts
+                and ep.start_ts_utc < holdout_start_ts
             )
             if overlaps_train:
                 continue
@@ -2091,6 +2172,7 @@ def calibrate_zone_a2(
                 eta_ac_ref=current_params.eta_ac,
                 lat_deg=lat_deg,
                 lon_deg=lon_deg,
+                buffer_offsets=buffer_offsets,
             )
             if ep_hist.n_rows > ep.spinup_steps + 12:
                 ext_episodes.append(
@@ -2098,18 +2180,14 @@ def calibrate_zone_a2(
                 )
 
     if not train_windows and not ext_episodes:
-        rep = evaluation.evaluate_14d_hindcast(
-            columns,
-            zone,
-            current_params,
-            day1_prior,
-            flow_rates_l_min,
-            k_hx_by_group,
-            lat_deg=lat_deg,
-            lon_deg=lon_deg,
-            precomputed_hist_eval=precomputed_holdout_hist,
-            precomputed_hist_prior=precomputed_holdout_prior_hist,
-            eval_steps=holdout_steps,
+        rep = _eval_fallback(
+            eval_steps_arg=holdout_steps,
+            pre_eval=(
+                precomputed_holdout_before_hist
+                if precomputed_holdout_before_hist is not None
+                else precomputed_holdout_hist
+            ),
+            pre_prior=precomputed_holdout_prior_hist,
         )
         return (
             contracts.CalibrationZoneOutcome(
@@ -2270,6 +2348,9 @@ def calibrate_zone_a2(
     if (
         precomputed_holdout_hist is not None
         and precomputed_holdout_hist.n_rows == n_hold
+        and _hist_matches_buffer_offsets(
+            precomputed_holdout_hist, buffer_offsets
+        )
     ):
         hist_hold = precomputed_holdout_hist
     else:
@@ -2280,27 +2361,93 @@ def calibrate_zone_a2(
             eta_ac_ref=current_params.eta_ac,
             lat_deg=lat_deg,
             lon_deg=lon_deg,
+            buffer_offsets=buffer_offsets,
         )
     states_hold_ref = kalman_tape.reconstruct_states_tuples(
         hist_hold, zone, params_map_raw
     )
     ref_d_hold = [s[2] for s in states_hold_ref]
 
+    zone_hyd_group = preprocessing.zone_to_hydraulic_group(zone)
+    old_khx_eval_map = dict(priors.DAY1_K_HX_BY_GROUP_W_K)
+    if eff_old_khx is not None:
+        for g_name, val in eff_old_khx.items():
+            old_khx_eval_map[preprocessing.zone_to_hydraulic_group(g_name)] = (
+                float(val)
+            )
+    old_khx_eval_map[zone_hyd_group] = current_params.k_hx_w_k
+
+    cand_khx_eval_map = dict(priors.DAY1_K_HX_BY_GROUP_W_K)
+    if k_hx_by_group is not None:
+        for g_name, val in k_hx_by_group.items():
+            cand_khx_eval_map[
+                preprocessing.zone_to_hydraulic_group(g_name)
+            ] = float(val)
+
+    if (
+        precomputed_holdout_before_hist is not None
+        and precomputed_holdout_before_hist.n_rows == n_hold
+        and _hist_matches_buffer_offsets(
+            precomputed_holdout_before_hist, eff_old_buf_offsets
+        )
+    ):
+        hist_hold_before = precomputed_holdout_before_hist
+    elif _hist_matches_buffer_offsets(hist_hold, eff_old_buf_offsets):
+        if old_khx_eval_map == cand_khx_eval_map:
+            hist_hold_before = hist_hold
+        else:
+            hist_hold_before = preprocessing.recompute_history_for_khx(
+                hist_hold,
+                _get_holdout_cols(),
+                flow_rates_l_min=flow_rates_l_min,
+                k_hx_by_group=old_khx_eval_map,
+            )
+    else:
+        hist_hold_before = preprocessing.preprocess_history_columns(
+            _get_holdout_cols(),
+            flow_rates_l_min=flow_rates_l_min,
+            k_hx_by_group=old_khx_eval_map,
+            eta_ac_ref=current_params.eta_ac,
+            lat_deg=lat_deg,
+            lon_deg=lon_deg,
+            buffer_offsets=eff_old_buf_offsets,
+        )
+
     k_hx_prior_hold = dict(priors.DAY1_K_HX_BY_GROUP_W_K)
-    k_hx_prior_hold[preprocessing.zone_to_hydraulic_group(zone)] = (
-        day1_prior.k_hx_w_k
-    )
+    k_hx_prior_hold[zone_hyd_group] = day1_prior.k_hx_w_k
     if (
         precomputed_holdout_prior_hist is not None
         and precomputed_holdout_prior_hist.n_rows == n_hold
+        and _hist_matches_buffer_offsets(
+            precomputed_holdout_prior_hist, priors.DAY1_BUFFER_OFFSETS
+        )
     ):
         hist_hold_prior = precomputed_holdout_prior_hist
-    else:
+    elif _hist_matches_buffer_offsets(hist_hold, priors.DAY1_BUFFER_OFFSETS):
         hist_hold_prior = preprocessing.recompute_history_for_khx(
             hist_hold,
             _get_holdout_cols(),
             flow_rates_l_min=flow_rates_l_min,
             k_hx_by_group=k_hx_prior_hold,
+        )
+    elif _hist_matches_buffer_offsets(
+        hist_hold_before, priors.DAY1_BUFFER_OFFSETS
+    ):
+        hist_hold_prior = preprocessing.recompute_history_for_khx(
+            hist_hold_before,
+            _get_holdout_cols(),
+            flow_rates_l_min=flow_rates_l_min,
+            k_hx_by_group=k_hx_prior_hold,
+        )
+    else:
+        hist_hold_prior = preprocessing.preprocess_history_columns(
+            _get_holdout_cols(),
+            flow_rates_l_min=flow_rates_l_min,
+            k_hx_by_group=k_hx_prior_hold,
+            eta_ac_ref=day1_prior.eta_ac,
+            lat_deg=lat_deg,
+            lon_deg=lon_deg,
+            buffer_offsets=priors.DAY1_BUFFER_OFFSETS,
         )
 
     eval_cols_arg = (
@@ -2312,11 +2459,12 @@ def calibrate_zone_a2(
         current_params,
         day1_prior,
         flow_rates_l_min=flow_rates_l_min,
-        k_hx_by_group=k_hx_by_group,
+        k_hx_by_group=eff_old_khx,
         lat_deg=lat_deg,
         lon_deg=lon_deg,
+        buffer_offsets=eff_old_buf_offsets,
         _ref_d_act=ref_d_hold,
-        precomputed_hist_eval=hist_hold,
+        precomputed_hist_eval=hist_hold_before,
         precomputed_hist_prior=hist_hold_prior,
         eval_steps=holdout_steps,
     )
@@ -2329,6 +2477,7 @@ def calibrate_zone_a2(
         k_hx_by_group=k_hx_by_group,
         lat_deg=lat_deg,
         lon_deg=lon_deg,
+        buffer_offsets=buffer_offsets,
         _ref_d_act=ref_d_hold,
         precomputed_hist_eval=hist_hold,
         precomputed_hist_prior=hist_hold_prior,
@@ -2350,13 +2499,13 @@ def calibrate_zone_a2(
 
     for reg_key, m_before in holdout_before.by_regime.items():
         m_after = holdout_after.by_regime.get(reg_key)
-        if m_after is None or m_before.n_windows == 0 or m_after.n_windows == 0:
-            continue
         if (
-            reg_key == "heating_and_coast"
-            and m_before.n_windows >= 5
-            and m_after.n_windows >= 5
+            m_after is None
+            or m_before.n_windows < MIN_REGIME_VETO_WINDOWS
+            or m_after.n_windows < MIN_REGIME_VETO_WINDOWS
         ):
+            continue
+        if reg_key == "heating_and_coast":
             if (
                 m_before.j_eval_c is not None
                 and m_after.j_eval_c is not None
@@ -2466,7 +2615,7 @@ def calibrate_zone_a2(
     ]
 
     bound_warns: list[str] = []
-    for name in fit_param_names:
+    for name in param_names:
         b = active_bounds[name]
         val_applied = float(getattr(params_applied, name))
         tol_b = 1e-3 * (b.upper - b.lower)

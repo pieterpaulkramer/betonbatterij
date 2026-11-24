@@ -536,6 +536,11 @@ class PreprocessedHistory:
         p_wp_raw_el_w: Raw heat-pump electrical power [W].
         is_lts_row: Per-step mask for `v0.1.1+` or legacy `v0.1.0` LTS rows.
         missing_prim_th: Per-step mask where primary thermal power is missing.
+        gamma_cal: Per-step 30-min telescoped calorimetric scale factor [-].
+        buf_top_offset_c: Applied additive top 1-Wire buffer offset [°C].
+        buf_bot_offset_c: Applied additive bottom 1-Wire buffer offset [°C].
+        final_gamma_cal: End-of-slice `HydraulicModel.gamma_cal` [-].
+        final_t_floor_proxy_c: End-of-slice unmodeled slab proxies [°C].
     """
 
     n_rows: int
@@ -587,6 +592,13 @@ class PreprocessedHistory:
     )
     tape_kt: kalman_tape.PrecomputedZoneTape | None = dataclasses.field(
         default=None, repr=False, compare=False
+    )
+    gamma_cal: list[float] = dataclasses.field(default_factory=list)
+    buf_top_offset_c: float = 0.0
+    buf_bot_offset_c: float = priors.BUF_BOT_SENSOR_OFFSET_C
+    final_gamma_cal: float = 1.0
+    final_t_floor_proxy_c: dict[str, float] = dataclasses.field(
+        default_factory=dict
     )
 
 
@@ -787,7 +799,8 @@ def compute_train_holdout_split(
 
     Ensures both the training slice `[0, train_end)` and the out-of-sample
     holdout slice `[train_end, n_total)` contain genuine non-LTS Recorder rows
-    whenever `>= 4` days of non-LTS telemetry are available.
+    whenever `>= 1` day of non-LTS telemetry (within `>= 4` total days) is
+    available.
 
     Args:
         columns: Full RingBuffer column sequences.
@@ -829,13 +842,22 @@ def compute_train_holdout_split(
         holdout_raw = min(holdout_raw, holdout_cap)
         return max(first_raw_idx + 1, n_total - holdout_raw)
 
-    # Case C: < 4 days of raw data -> total-length fallback.
+    # Case C1: 1..4 days of raw data (with >= 4d total) -> 65/35 raw-tail split
+    # so non-LTS rows are never buried 100% inside holdout.
+    min_holdout = HORIZON_6H_STEPS + 24
+    if n_raw >= const.STEPS_PER_DAY and n_total >= 4 * const.STEPS_PER_DAY:
+        holdout_raw = max(min_holdout, round(0.35 * n_raw))
+        holdout_cap = max(min_holdout, n_raw - min_holdout)
+        holdout_raw = min(holdout_raw, holdout_cap)
+        return max(first_raw_idx + 1, n_total - holdout_raw)
+
+    # Case C2: < 1 day of raw data -> total-length fallback.
     if n_total >= 28 * const.STEPS_PER_DAY:
         return n_total - EVAL_14D_STEPS
     if n_total >= 4 * const.STEPS_PER_DAY:
         train_end = max(2 * const.STEPS_PER_DAY, int(0.70 * n_total))
-        if n_total - train_end < HORIZON_6H_STEPS + 24:
-            train_end = n_total - (HORIZON_6H_STEPS + 24)
+        if n_total - train_end < min_holdout:
+            train_end = n_total - min_holdout
         return train_end
     return n_total
 
@@ -915,6 +937,7 @@ def preprocess_history_columns(
     eta_ac_ref: float | None = None,
     lat_deg: float = priors.LATITUDE_DEG,
     lon_deg: float = priors.LONGITUDE_DEG,
+    buffer_offsets: contracts.BufferSensorOffsets = priors.DAY1_BUFFER_OFFSETS,
 ) -> PreprocessedHistory:
     """Preprocesses raw RingBuffer columns into step-aligned physical series.
 
@@ -929,6 +952,7 @@ def preprocess_history_columns(
         eta_ac_ref: Optional reference split-AC efficiency for `kt`.
         lat_deg: Observer latitude in degrees North.
         lon_deg: Observer longitude in degrees East.
+        buffer_offsets: Calibrated 1-Wire buffer sensor offsets [°C].
 
     Returns:
         Populated `PreprocessedHistory` over all rows in `columns`.
@@ -945,7 +969,9 @@ def preprocess_history_columns(
             k_hx_map[zone_to_hydraulic_group(group_name)] = float(val)
 
     hyd = hydraulics.HydraulicModel(
-        flow_rates_l_min=flows, k_hx_by_group_w_k=k_hx_map
+        flow_rates_l_min=flows,
+        k_hx_by_group_w_k=k_hx_map,
+        buffer_offsets=buffer_offsets,
     )
     eta_ref = (
         priors.DAY1_PRIORS_KT.eta_ac if eta_ac_ref is None else eta_ac_ref
@@ -984,6 +1010,7 @@ def preprocess_history_columns(
     q_sec_tot_w: list[float] = [0.0] * n
     f_flow_wk: list[float] = [0.0] * n
     f_flow_kt: list[float] = [0.0] * n
+    gamma_cal: list[float] = [1.0] * n
     t_surf_meas_wk_c: list[float | None] = [None] * n
     cooling_raw: list[bool] = [False] * n
 
@@ -1095,7 +1122,8 @@ def preprocess_history_columns(
     h_fh_wk = 1000.0 / priors.DAY1_PRIORS_WK.r_fh_k_kw
     c_kt_j = 3600.0 * priors.DAY1_PRIORS_KT.c_floor_wh_k
     h_fh_kt = 1000.0 / priors.DAY1_PRIORS_KT.r_fh_k_kw
-    buf_bot_off = priors.BUF_BOT_SENSOR_OFFSET_C
+    buf_top_off = buffer_offsets.buf_top_offset_c
+    buf_bot_off = buffer_offsets.buf_bot_offset_c
     baseload_wk = priors.BASELOAD_WK_W
     ac_cool_modes = (int(const.AC_MODE_COOL), int(const.AC_MODE_DRY))
     cool_flags_mask = const.FLAG_FLOOR_COOL | const.FLAG_AC_COOL_KT
@@ -1245,7 +1273,7 @@ def preprocess_history_columns(
         t_top_s = t_top_s_col[k]
         t_bot_e = t_bot_e_col[k]
         t_bot_s = t_bot_s_col[k]
-        t_buf_top_c[k] = t_top_e
+        t_buf_top_c[k] = t_top_e + buf_top_off
         t_buf_bot_cal_c[k] = t_bot_e + buf_bot_off
 
         tf_wk_in = t_floor_wk_running
@@ -1283,6 +1311,7 @@ def preprocess_history_columns(
             bg_ret_offset_c=0.0,
         )
         t_sup_sec_c[k] = hyd_res.t_sup_sec_c
+        gamma_cal[k] = hyd_res.gamma_cal
         q_wk = hyd_res.q_fh_wk_w
         q_kt = hyd_res.q_fh_kt_w
         q_tot = sum(hyd_res.q_fh_by_group_w.values())
@@ -1418,6 +1447,11 @@ def preprocess_history_columns(
         p_wp_raw_el_w=p_wp_raw_el_w,
         is_lts_row=is_lts_row,
         missing_prim_th=missing_prim_th,
+        gamma_cal=gamma_cal,
+        buf_top_offset_c=buf_top_off,
+        buf_bot_offset_c=buf_bot_off,
+        final_gamma_cal=hyd.gamma_cal,
+        final_t_floor_proxy_c=dict(hyd.t_floor_proxy_c),
     )
 
 
@@ -1426,6 +1460,7 @@ def recompute_history_for_khx(
     columns: Mapping[str, Sequence[float | int]],
     flow_rates_l_min: Mapping[str, float] | None = None,
     k_hx_by_group: Mapping[str, float] | None = None,
+    buffer_offsets: contracts.BufferSensorOffsets | None = None,
 ) -> PreprocessedHistory:
     """Recomputes only hydraulic fields on `base_hist` for updated `k_hx`."""
     n = base_hist.n_rows
@@ -1438,14 +1473,29 @@ def recompute_history_for_khx(
         for group_name, val in k_hx_by_group.items():
             k_hx_map[zone_to_hydraulic_group(group_name)] = float(val)
 
+    eff_offsets = (
+        buffer_offsets
+        if buffer_offsets is not None
+        else contracts.BufferSensorOffsets(
+            buf_top_offset_c=base_hist.buf_top_offset_c,
+            buf_bot_offset_c=base_hist.buf_bot_offset_c,
+        )
+    )
+
     if (
         abs(base_hist.hyd_k_hx_wk - float(k_hx_map["wk"])) <= 1e-9
         and abs(base_hist.hyd_k_hx_kt - float(k_hx_map["kantoor"])) <= 1e-9
+        and abs(base_hist.buf_top_offset_c - eff_offsets.buf_top_offset_c)
+        <= 1e-9
+        and abs(base_hist.buf_bot_offset_c - eff_offsets.buf_bot_offset_c)
+        <= 1e-9
     ):
         return base_hist
 
     hyd = hydraulics.HydraulicModel(
-        flow_rates_l_min=flows, k_hx_by_group_w_k=k_hx_map
+        flow_rates_l_min=flows,
+        k_hx_by_group_w_k=k_hx_map,
+        buffer_offsets=eff_offsets,
     )
 
     t_slaap_col = _prep_float_col(columns, n, "t_air_slaapkamer_c", 18.0)
@@ -1474,7 +1524,14 @@ def recompute_history_for_khx(
         _prep_float_col(columns, n, "q_fh_kt_w", 0.0) if has_q_fh_kt_col else []
     )
 
-    t_top_e_col = list(base_hist.t_buf_top_c)
+    if "t_buf_top_end_c" in columns or "t_buf_top_c" in columns:
+        t_top_e_col = _prep_float_col(
+            columns, n, "t_buf_top_end_c", 22.0, "t_buf_top_c"
+        )
+    else:
+        t_top_e_col = [
+            v - base_hist.buf_top_offset_c for v in base_hist.t_buf_top_c
+        ]
     t_top_s_col = _prep_float_col_fallback(
         columns, n, "t_buf_top_start_c", t_top_e_col
     )
@@ -1484,6 +1541,10 @@ def recompute_history_for_khx(
     t_bot_s_col = _prep_float_col_fallback(
         columns, n, "t_buf_bot_start_c", t_bot_e_col
     )
+    buf_top_off = eff_offsets.buf_top_offset_c
+    buf_bot_off = eff_offsets.buf_bot_offset_c
+    t_buf_top_c = [v + buf_top_off for v in t_top_e_col]
+    t_buf_bot_cal_c = [v + buf_bot_off for v in t_bot_e_col]
     bg_sup_seq = columns.get("t_bg_sup_c")
     bg_ret_seq = columns.get("t_bg_ret_c")
 
@@ -1493,6 +1554,7 @@ def recompute_history_for_khx(
     q_sec_tot_w: list[float] = [0.0] * n
     f_flow_wk: list[float] = [0.0] * n
     f_flow_kt: list[float] = [0.0] * n
+    gamma_cal: list[float] = [1.0] * n
     q_int_wk_w: list[float] = [priors.BASELOAD_WK_W] * n
 
     t_air_wk_c = base_hist.t_air_wk_c
@@ -1598,6 +1660,7 @@ def recompute_history_for_khx(
             bg_ret_offset_c=0.0,
         )
         t_sup_sec_c[k] = hyd_res.t_sup_sec_c
+        gamma_cal[k] = hyd_res.gamma_cal
         q_wk = hyd_res.q_fh_wk_w
         q_kt = hyd_res.q_fh_kt_w
         if (
@@ -1636,8 +1699,10 @@ def recompute_history_for_khx(
             base_hist.tape_wk,
             hyd_k_hx=float(k_hx_map["wk"]),
             t_sup_sec=t_sup_sec_c,
+            t_buf_top=t_buf_top_c,
             q_fh_hyd=q_fh_wk_hyd_w,
             q_int=q_int_wk_w,
+            gamma_cal=gamma_cal,
         )
         if base_hist.tape_wk is not None
         else None
@@ -1647,7 +1712,9 @@ def recompute_history_for_khx(
             base_hist.tape_kt,
             hyd_k_hx=float(k_hx_map["kantoor"]),
             t_sup_sec=t_sup_sec_c,
+            t_buf_top=t_buf_top_c,
             q_fh_hyd=q_fh_kt_hyd_w,
+            gamma_cal=gamma_cal,
         )
         if base_hist.tape_kt is not None
         else None
@@ -1677,8 +1744,8 @@ def recompute_history_for_khx(
         u_pump_sec=base_hist.u_pump_sec,
         u_eff_wk=base_hist.u_eff_wk,
         u_eff_kt=base_hist.u_eff_kt,
-        t_buf_top_c=base_hist.t_buf_top_c,
-        t_buf_bot_cal_c=base_hist.t_buf_bot_cal_c,
+        t_buf_top_c=t_buf_top_c,
+        t_buf_bot_cal_c=t_buf_bot_cal_c,
         t_sup_sec_c=t_sup_sec_c,
         f_comp_hz=base_hist.f_comp_hz,
         p_prim_th_w=base_hist.p_prim_th_w,
@@ -1700,6 +1767,11 @@ def recompute_history_for_khx(
         missing_prim_th=base_hist.missing_prim_th,
         tape_wk=cloned_tape_wk,
         tape_kt=cloned_tape_kt,
+        gamma_cal=gamma_cal,
+        buf_top_offset_c=buf_top_off,
+        buf_bot_offset_c=buf_bot_off,
+        final_gamma_cal=hyd.gamma_cal,
+        final_t_floor_proxy_c=dict(hyd.t_floor_proxy_c),
     )
 
 
@@ -1758,10 +1830,10 @@ def step_q_fh_for_params(
         fl_k & (const.FLAG_DHW_TANK | const.FLAG_Z1_OFF_HARVEST)
     ) or (hist.f_comp_hz[k] <= 0.5 and hist.p_prim_th_w[k] <= 50.0)
     if is_harvest:
+        gamma_k = hist.gamma_cal[k] if k < len(hist.gamma_cal) else 1.0
         return max(
             0.0,
-            u_pump
-            * u_eff
+            (gamma_k * (u_pump * u_eff))
             * params.k_hx_w_k
             * (hist.t_buf_top_c[k] - t_floor_prev_c),
         )

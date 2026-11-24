@@ -17,8 +17,13 @@ from typing import TYPE_CHECKING, Any
 from . import BetonBatterijConfigEntry, build_device_info
 from .const import DOMAIN
 from .domain import cop_model
-from .domain.contracts import CopParameters, ZoneId, ZoneSnapshot
-from .domain.priors import DAY1_COP_PARAMS
+from .domain.contracts import (
+    BufferSensorOffsets,
+    CopParameters,
+    ZoneId,
+    ZoneSnapshot,
+)
+from .domain.priors import DAY1_BUFFER_OFFSETS, DAY1_COP_PARAMS
 from .ha_bridge._ha_compat import (
     AddConfigEntryEntitiesCallback,
     CoordinatorEntity,
@@ -442,6 +447,7 @@ class BetonBatterijCopFitSensor(
             "delta_p_wp_bias_w",
             "live_expected_cop",
             "cop_diagnostics",
+            "buffer_offsets",
         }
     )
 
@@ -460,6 +466,7 @@ class BetonBatterijCopFitSensor(
         self._last_fit_gen: int | None = None
         self._cached_cop_params: dict[str, Any] = {}
         self._cached_cop_diag: dict[str, Any] = {}
+        self._cached_buf_offsets: dict[str, Any] = {}
         self._last_published_cop: float | None = None
         self._last_write_mono: float | None = None
 
@@ -494,9 +501,21 @@ class BetonBatterijCopFitSensor(
         else:
             cop_params = DAY1_COP_PARAMS
 
+        raw_buf = getattr(engine, "buffer_offsets", None)
+        buf_offsets = (
+            raw_buf
+            if isinstance(raw_buf, BufferSensorOffsets)
+            else BufferSensorOffsets.from_dict(
+                self._cached_buf_offsets, DAY1_BUFFER_OFFSETS
+            )
+        )
+
         return float(
             cop_model.predict_live_expected_cop_from_row(
-                cop_params, row, cop_diagnostics=diag_dict
+                cop_params,
+                row,
+                cop_diagnostics=diag_dict,
+                buffer_offsets=buf_offsets,
             )
         )
 
@@ -510,6 +529,9 @@ class BetonBatterijCopFitSensor(
             )
             self._cached_cop_diag = to_plain_dict(
                 getattr(engine, "cop_diagnostics", None)
+            )
+            self._cached_buf_offsets = to_plain_dict(
+                getattr(engine, "buffer_offsets", DAY1_BUFFER_OFFSETS)
             )
             self._last_fit_gen = gen
 
@@ -567,6 +589,7 @@ class BetonBatterijCopFitSensor(
             "delta_p_wp_bias_w": p_bias,
             "live_expected_cop": live_cop,
             "cop_diagnostics": self._cached_cop_diag,
+            "buffer_offsets": self._cached_buf_offsets,
         }
         self.async_write_ha_state()
 

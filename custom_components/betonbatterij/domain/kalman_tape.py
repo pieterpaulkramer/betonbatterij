@@ -88,6 +88,7 @@ class PrecomputedZoneTape:
     has_surf_meas: bool
     fast_300_nowind: list[bool] = dataclasses.field(default_factory=list)
     fast_300_anywind: list[bool] = dataclasses.field(default_factory=list)
+    gamma_cal: list[float] = dataclasses.field(default_factory=list)
 
 
 def _cooling_rate_from_history(
@@ -135,6 +136,9 @@ def build_zone_tape(
     t_sup_sec = list(hist.t_sup_sec_c)
     t_buf_top = list(hist.t_buf_top_c)
     q_fh_hyd = list(hist.q_fh_wk_hyd_w if is_wk else hist.q_fh_kt_hyd_w)
+    gamma_cal = (
+        list(hist.gamma_cal) if len(hist.gamma_cal) == n else [1.0] * n
+    )
     p_el_ac = list(hist.p_el_ac_kt_w)
     q_ac_base = list(hist.q_ac_base_kt_w)
     t_out = list(hist.t_out_c)
@@ -385,6 +389,7 @@ def build_zone_tape(
         has_surf_meas=has_surf_meas,
         fast_300_nowind=fast_300_nowind,
         fast_300_anywind=fast_300_anywind,
+        gamma_cal=gamma_cal,
     )
 
 
@@ -545,6 +550,11 @@ def run_kalman_on_tape(
     t_buf_top_arr = tape.t_buf_top
     q_fh_hyd_arr = tape.q_fh_hyd
     is_harvest_arr = tape.is_harvest
+    gamma_cal_arr = (
+        tape.gamma_cal
+        if len(tape.gamma_cal) == tape.n_rows
+        else [1.0] * tape.n_rows
+    )
     ac_eff_arr = tape.ac_eff_el
     q_ac_fixed_arr = tape.q_ac_fixed
     t_out_arr = tape.t_out
@@ -733,7 +743,9 @@ def run_kalman_on_tape(
             qh = q_fh_hyd_arr[k]
             q_fh_k = (qh * khx_ratio) if qh > 0.0 else 0.0
         elif is_harvest_arr[k]:
-            q_fh_k = up_uz * khx * (t_buf_top_arr[k] - x1)
+            q_fh_k = (
+                (gamma_cal_arr[k] * up_uz) * khx * (t_buf_top_arr[k] - x1)
+            )
             if q_fh_k < 0.0:
                 q_fh_k = 0.0
         else:
@@ -1074,6 +1086,11 @@ def evaluate_windows_on_tape(
     t_buf_top_arr = tape.t_buf_top
     q_fh_hyd_arr = tape.q_fh_hyd
     is_harvest_arr = tape.is_harvest
+    gamma_cal_arr = (
+        tape.gamma_cal
+        if len(tape.gamma_cal) == tape.n_rows
+        else [1.0] * tape.n_rows
+    )
     ac_eff_arr = tape.ac_eff_el
     q_ac_fixed_arr = tape.q_ac_fixed
     t_out_arr = tape.t_out
@@ -1097,7 +1114,11 @@ def evaluate_windows_on_tape(
                 qh = q_fh_hyd_arr[idx]
                 q_fh_s = (qh * khx_ratio) if qh > 0.0 else 0.0
             elif is_harvest_arr[idx]:
-                q_fh_s = up_uz * khx * (t_buf_top_arr[idx] - ox1)
+                q_fh_s = (
+                    (gamma_cal_arr[idx] * up_uz)
+                    * khx
+                    * (t_buf_top_arr[idx] - ox1)
+                )
                 if q_fh_s < 0.0:
                     q_fh_s = 0.0
             else:
@@ -1232,6 +1253,11 @@ def rollout_open_loop_window_fast(
     t_buf_top_arr = tape.t_buf_top
     q_fh_hyd_arr = tape.q_fh_hyd
     is_harvest_arr = tape.is_harvest
+    gamma_cal_arr = (
+        tape.gamma_cal
+        if len(tape.gamma_cal) == tape.n_rows
+        else [1.0] * tape.n_rows
+    )
     ac_eff_arr = tape.ac_eff_el
     q_ac_fixed_arr = tape.q_ac_fixed
     t_out_arr = tape.t_out
@@ -1251,7 +1277,11 @@ def rollout_open_loop_window_fast(
             qh = q_fh_hyd_arr[idx]
             q_fh_s = (qh * khx_ratio) if qh > 0.0 else 0.0
         elif is_harvest_arr[idx]:
-            q_fh_s = up_uz * khx * (t_buf_top_arr[idx] - ox1)
+            q_fh_s = (
+                (gamma_cal_arr[idx] * up_uz)
+                * khx
+                * (t_buf_top_arr[idx] - ox1)
+            )
             if q_fh_s < 0.0:
                 q_fh_s = 0.0
         else:

@@ -105,20 +105,25 @@ def predict_live_expected_cop_from_row(
     cop_params: contracts.CopParameters,
     raw_row: Mapping[str, Any],
     cop_diagnostics: Mapping[str, Any] | None = None,
+    buffer_offsets: contracts.BufferSensorOffsets = priors.DAY1_BUFFER_OFFSETS,
 ) -> float:
     """Computes authoritative live expected CV-COP from a raw telemetry row.
 
-    Applies the unified DHW / residual boiler-water guard: whenever
-    `FLAG_DHW_TANK` is active or `t_wp_out_c > 40.0 °C`, the supply temperature
-    is read strictly from `t_buf_top_end_c` / `t_buf_top_start_c` in
-    `(15.0, 40.0] °C` (defaulting to `30.0 °C`), and COP is always computed via
-    `predict_cop_cv`.
+    Applies the unified DHW, residual boiler-water, and idle `0 Hz` guard:
+    whenever `FLAG_DHW_TANK` is active, `t_wp_out_c > 40.0 °C`, or the
+    compressor is idle (`f_comp_hz <= 0.5 Hz`), the supply temperature is read
+    first from offset-calibrated `t_buf_top_end_c` / `t_buf_top_start_c` in
+    `(15.0, 40.0] °C`, falling back to `t_wp_out_c` in `(15.0, 40.0] °C` if
+    buffer columns are missing/invalid, else `30.0 °C`. During active CV
+    compressor runs, `t_wp_out_c` in `(15.0, 40.0] °C` is preferred over
+    offset-calibrated buffer columns.
 
     Args:
         cop_params: Active calibrated `CopParameters`.
         raw_row: Latest raw 5-minute telemetry row mapping.
         cop_diagnostics: Optional diagnostic mapping (retained for signature
             uniformity; `predict_cop_cv` is always authoritative).
+        buffer_offsets: Active 1-Wire buffer tank sensor offsets.
 
     Returns:
         Expected live space-heating COP (`>= 1.0`).
@@ -139,19 +144,38 @@ def predict_live_expected_cop_from_row(
     wp_out_raw = raw_row.get("t_wp_out_c")
     wp_out_hot_dhw = _is_finite(wp_out_raw) and float(wp_out_raw) > 40.0
 
+    f_comp_raw = raw_row.get("f_comp_hz")
+    comp_idle = _is_finite(f_comp_raw) and float(f_comp_raw) <= 0.5
+
+    top_offset = float(buffer_offsets.buf_top_offset_c)
     t_sup = 30.0
-    if is_dhw_tank or wp_out_hot_dhw:
+    if is_dhw_tank or wp_out_hot_dhw or comp_idle:
+        found_buf = False
         for col in ("t_buf_top_end_c", "t_buf_top_start_c"):
             cand = raw_row.get(col)
-            if _is_finite(cand) and 15.0 < float(cand) <= 40.0:
-                t_sup = float(cand)
-                break
+            if _is_finite(cand):
+                cand_cal = float(cand) + top_offset
+                if 15.0 < cand_cal <= 40.0:
+                    t_sup = cand_cal
+                    found_buf = True
+                    break
+        if (
+            not found_buf
+            and _is_finite(wp_out_raw)
+            and 15.0 < float(wp_out_raw) <= 40.0
+        ):
+            t_sup = float(wp_out_raw)
     else:
-        for col in ("t_wp_out_c", "t_buf_top_end_c", "t_buf_top_start_c"):
-            cand = raw_row.get(col)
-            if _is_finite(cand) and 15.0 < float(cand) <= 40.0:
-                t_sup = float(cand)
-                break
+        if _is_finite(wp_out_raw) and 15.0 < float(wp_out_raw) <= 40.0:
+            t_sup = float(wp_out_raw)
+        else:
+            for col in ("t_buf_top_end_c", "t_buf_top_start_c"):
+                cand = raw_row.get(col)
+                if _is_finite(cand):
+                    cand_cal = float(cand) + top_offset
+                    if 15.0 < cand_cal <= 40.0:
+                        t_sup = cand_cal
+                        break
 
     rh_out = 80.0
     cand_rh = raw_row.get("rh_out_pct")

@@ -11,6 +11,7 @@ from custom_components.betonbatterij.domain import contracts
 from custom_components.betonbatterij.domain import engine
 
 ActuatorStepInput = contracts.ActuatorStepInput
+BufferSensorOffsets = contracts.BufferSensorOffsets
 CoastEstimate = contracts.CoastEstimate
 CopParameters = contracts.CopParameters
 DigitalTwinEngine = engine.DigitalTwinEngine
@@ -27,6 +28,7 @@ ZoneSnapshot = contracts.ZoneSnapshot
 
 __all__ = [
     "ActuatorStepInput",
+    "BufferSensorOffsets",
     "CoastEstimate",
     "CopParameters",
     "DigitalTwinEngine",

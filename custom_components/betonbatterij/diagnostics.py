@@ -51,6 +51,13 @@ async def async_get_config_entry_diagnostics(
             "wk": sanitize_json_value(engine.get_zone_snapshot("wk")),
             "kt": sanitize_json_value(engine.get_zone_snapshot("kt")),
         },
+        "zone_fit_diagnostics": {
+            "wk": sanitize_json_value(engine.get_zone_fit_diagnostics("wk")),
+            "kt": sanitize_json_value(engine.get_zone_fit_diagnostics("kt")),
+        },
+        "buffer_offsets": sanitize_json_value(
+            getattr(engine, "buffer_offsets", None)
+        ),
         "cop_params": sanitize_json_value(engine.cop_params),
         "cop_diagnostics": sanitize_json_value(engine.cop_diagnostics),
         "evaluation_14d": {
