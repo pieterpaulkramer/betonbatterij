@@ -92,7 +92,26 @@ ______________________________________________________________________
 | :--------------------------------------------------------------------- | :-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | [`custom_components/betonbatterij/`](custom_components/betonbatterij/) | Home Assistant Custom Integration: pure-Python `domain/` Digital Twin (`zoh_kalman`, `hydraulics`, `solar_weather`, `cop_model`, `evaluation`, `calibration`, `engine`) en async `ha_bridge/` (`accumulator`, `storage_ring`, `backfill`, `coordinator`). |
 | [`betonbatterij_local.example.json`](betonbatterij_local.example.json) | Voorbeeldsjabloon voor `/config/betonbatterij_local.json` met generieke placeholder `entity_id`'s voor warmtepomp, kleppen en kamersensoren.                                                                                                              |
-| [`tests/`](tests/)                                                     | Volledige offline `pytest`-suite voor ZOH-discretisatie, Kalman-filters, hydrauliek, COP-model, MAP-kalibratie, 90-dagen ringbuffer en lokale configuratie.                                                                                               |
+| [`tests/`](tests/)                                                     | Volledige offline `pytest`-suite voor ZOH-discretisatie, Kalman-filters, hydrauliek, COP-model, MAP-kalibratie, 90-dagen ringbuffer en lokale configuratie, plus Docker E2E-tests (`tests/e2e/`).                                                         |
+| [`local_ha_test/`](local_ha_test/)                                     | Lokale Docker Home Assistant Core testopstelling (`docker-compose.yml`, virtueel huis met 9 scenario's en E2E smoke-test).                                                                                                                                |
+| [`.github/workflows/ci.yml`](.github/workflows/ci.yml)                 | GitHub Actions CI: offline unit tests (Python 3.12 & 3.13), Ruff lint, Home Assistant Hassfest, HACS-validatie en Docker HA E2E smoke-test.                                                                                                               |
+
+### Lokaal Testen
+
+```bash
+# Offline unit tests (standaard, zonder Docker of Home Assistant, ~20s)
+python -m pytest
+
+# Snelle E2E smoke-test tegen lokale Docker Home Assistant (~15s)
+docker compose -f local_ha_test/docker-compose.yml up -d homeassistant
+python -m pytest -m e2e -v
+
+# Uitgebreide E2E (incl. local JSON override, echte 5-min tick, CSV & restart)
+python -m pytest -m "e2e or e2e_full" -v
+```
+
+Zie [`local_ha_test/README.md`](local_ha_test/README.md) voor alle details,
+scenario's en PowerShell-commando's.
 
 ______________________________________________________________________
 

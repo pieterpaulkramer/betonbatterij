@@ -14,7 +14,6 @@ from __future__ import annotations
 import ast
 import asyncio
 from collections.abc import Callable, Mapping, Sequence
-import dataclasses
 import math
 from pathlib import Path
 import sys

@@ -1,0 +1,66 @@
+# Local Docker Home Assistant test environment for BetonBatterij.
+#
+# Quick start (from workspace root or local_ha_test/):
+#   docker compose -f local_ha_test/docker-compose.yml up -d
+#
+# Optional RPi 4 resource-constrained emulation profile:
+#   docker compose -f local_ha_test/docker-compose.yml --profile rpi4 up -d
+#
+# Optional Mosquitto MQTT broker for future Layer 2 virtual actuator tests:
+#   docker compose -f local_ha_test/docker-compose.yml --profile laag2 up -d
+
+services:
+  homeassistant:
+    container_name: betonbatterij-ha-test
+    image: ${HA_IMAGE:-ghcr.io/home-assistant/home-assistant:stable}
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:${HA_PORT:-8123}:8123"
+    environment:
+      TZ: ${HA_TZ:-Europe/Amsterdam}
+      # Prevent the Linux container from writing Linux .pyc files into the
+      # Windows workspace's custom_components/ directory.
+      PYTHONDONTWRITEBYTECODE: "1"
+    volumes:
+      - ./config:/config
+      - ./share:/share
+      - ../custom_components/betonbatterij:/config/custom_components/betonbatterij:ro
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:8123/manifest.json >/dev/null || exit 1"]
+      interval: 5s
+      timeout: 3s
+      retries: 24
+      start_period: 10s
+
+  homeassistant-rpi4:
+    container_name: betonbatterij-ha-rpi4
+    image: ${HA_IMAGE:-ghcr.io/home-assistant/home-assistant:stable}
+    profiles: ["rpi4"]
+    restart: unless-stopped
+    cpus: "2.0"
+    mem_limit: "2g"
+    ports:
+      - "127.0.0.1:${HA_PORT_RPI4:-8124}:8123"
+    environment:
+      TZ: ${HA_TZ:-Europe/Amsterdam}
+      PYTHONDONTWRITEBYTECODE: "1"
+    volumes:
+      - ./config:/config
+      - ./share:/share
+      - ../custom_components/betonbatterij:/config/custom_components/betonbatterij:ro
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:8123/manifest.json >/dev/null || exit 1"]
+      interval: 5s
+      timeout: 3s
+      retries: 24
+      start_period: 15s
+
+  mosquitto:
+    container_name: betonbatterij-mqtt-test
+    image: eclipse-mosquitto:2
+    profiles: ["laag2"]
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:${MQTT_PORT:-1883}:1883"
+    volumes:
+      - ./mosquitto/mosquitto.conf:/mosquitto/config/mosquitto.conf:ro

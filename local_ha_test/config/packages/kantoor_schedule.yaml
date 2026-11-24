@@ -1,0 +1,22 @@
+# Example HA schedule helper matching the planned Layer 2 attic-office schedule.
+# Extra mock packages for Layer 2 actuators (e.g. template switches/climates)
+# can be dropped into this `config/packages/` directory at any time.
+
+schedule:
+  kantoor_werktijden:
+    name: Kantoor werktijden (Test)
+    monday:
+      - from: "08:30:00"
+        to: "17:30:00"
+    tuesday:
+      - from: "08:30:00"
+        to: "17:30:00"
+    wednesday:
+      - from: "08:30:00"
+        to: "17:30:00"
+    thursday:
+      - from: "08:30:00"
+        to: "17:30:00"
+    friday:
+      - from: "08:30:00"
+        to: "17:00:00"

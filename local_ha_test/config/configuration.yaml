@@ -1,0 +1,37 @@
+# Minimal Home Assistant configuration for local BetonBatterij Docker testing.
+# Uses neutral rounded fallback coordinates (51.4, 5.5) and keeps logging loud
+# for custom_components.betonbatterij so warnings, blocking calls, and errors
+# are immediately visible in `docker logs` and `/config/home-assistant.log`.
+
+homeassistant:
+  name: BetonBatterij Test
+  latitude: 51.4
+  longitude: 5.5
+  elevation: 20
+  unit_system: metric
+  currency: EUR
+  country: NL
+  time_zone: Europe/Amsterdam
+  packages: !include_dir_named packages
+
+# Load standard HA components (config, recorder, frontend, api, diagnostics, etc.)
+default_config:
+
+# Explicit Recorder settings: keep 14 days so backfill & LTS queries behave
+# identically to production.
+recorder:
+  purge_keep_days: 14
+  commit_interval: 1
+
+logger:
+  default: warning
+  logs:
+    custom_components.betonbatterij: debug
+    homeassistant.helpers.frame: warning
+    homeassistant.util.loop: warning
+
+# Native helper matching HOUSE_ENTITIES.presence_boolean
+input_boolean:
+  aanwezig:
+    name: Aanwezig (Test)
+    initial: true

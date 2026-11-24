@@ -31,3 +31,15 @@ GEMINI.md
 *.tmp
 telemetry_5m.csv
 fit_report.json
+
+# Local Docker Home Assistant runtime state (keep generic templates & scripts tracked)
+local_ha_test/.env
+local_ha_test/.ha_auth.json
+local_ha_test/.ha_token
+local_ha_test/config/*
+!local_ha_test/config/configuration.yaml
+!local_ha_test/config/packages/
+local_ha_test/config/packages/*
+!local_ha_test/config/packages/kantoor_schedule.yaml
+local_ha_test/share/*
+!local_ha_test/share/.gitkeep
