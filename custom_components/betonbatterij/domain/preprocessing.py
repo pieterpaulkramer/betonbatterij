@@ -871,6 +871,54 @@ def slice_columns(
     return {key: list(seq[start:end]) for key, seq in columns.items()}
 
 
+def sanitize_stuck_pir_occupancy(
+    pir_occ: Sequence[float],
+    ts_utc: Sequence[int],
+    max_consec_s: float = solar_weather.PIR_STUCK_MAX_S,
+) -> list[float]:
+    """Zeros out contiguous `pir_occ` runs stuck active for `>= max_consec_s`.
+
+    Protects historical RingBuffer slices and night-cooling window selection
+    from occupancy sensors that remain permanently `"on"` for 20+ hours while
+    preserving normal daytime occupancy or heating schedules.
+
+    Args:
+        pir_occ: Raw occupancy fraction sequence `[0..1]`.
+        ts_utc: Corresponding Unix UTC timestamps [s].
+        max_consec_s: Continuous active duration threshold [s] above which a
+            run is classified as a stuck sensor.
+
+    Returns:
+        Sanitized occupancy fraction list of identical length.
+    """
+    n = len(pir_occ)
+    out = [float(v) for v in pir_occ]
+    if n == 0 or max_consec_s <= 0.0:
+        return out
+
+    threshold = solar_weather.PIR_OCC_THRESHOLD
+    default_dt = float(const.DT_STEP_S)
+    idx = 0
+    while idx < n:
+        if out[idx] <= threshold:
+            idx += 1
+            continue
+        start = idx
+        run_s = default_dt
+        idx += 1
+        while idx < n and out[idx] > threshold:
+            if idx < len(ts_utc) and (idx - 1) < len(ts_utc):
+                diff = float(int(ts_utc[idx]) - int(ts_utc[idx - 1]))
+                run_s += diff if 1.0 <= diff <= 86400.0 else default_dt
+            else:
+                run_s += default_dt
+            idx += 1
+        if run_s >= max_consec_s:
+            for j in range(start, idx):
+                out[j] = 0.0
+    return out
+
+
 def _prep_float_col(
     columns: Mapping[str, Sequence[float | int]],
     n: int,
@@ -1107,7 +1155,10 @@ def preprocess_history_columns(
 
     p_ac_raw = _prep_float_col(columns, n, "p_el_ac_kt_w", 0.0)
     ac_mode_code = _prep_float_col(columns, n, "ac_mode_code", 0.0)
-    pir_occ_kt = _prep_float_col(columns, n, "pir_occ_kt", 0.0)
+    pir_occ_kt = sanitize_stuck_pir_occupancy(
+        _prep_float_col(columns, n, "pir_occ_kt", 0.0),
+        ts_seq,
+    )
     p_grow_raw = _prep_float_col(columns, n, "p_growlights_kt_w", 0.0)
     d_est_col_wk_w = _prep_float_col(columns, n, "d_est_wk_w", 0.0)
     d_est_col_kt_w = _prep_float_col(columns, n, "d_est_kt_w", 0.0)

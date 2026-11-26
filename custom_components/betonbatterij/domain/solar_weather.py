@@ -31,6 +31,7 @@ DESK_HOLD_S: float = 600.0  # 10 min coffee-break hold.
 DESK_METABOLIC_GAIN_W: float = 85.0
 PIR_OCC_THRESHOLD: float = 0.05
 PIR_HOLD_S: float = 900.0  # 15 min occupancy hold.
+PIR_STUCK_MAX_S: float = 72_000.0  # 20 h continuous ON => stuck sensor guard.
 PIR_WORKPLACE_GAIN_W: float = 140.0
 
 _SOUTH_1E_GROUP: tuple[str, ...] = (
@@ -621,9 +622,16 @@ def compute_internal_and_ac_loads_kt(
     else:
         pir_val = 0.0 if not _is_valid_number(pir_occ) else float(pir_occ)
         if pir_val > PIR_OCC_THRESHOLD:
-            pir_present = True
-            new_pir_hold_s = PIR_HOLD_S
+            consec_on_s = float(state.get("pir_consec_on_s", 0.0)) + step_s
+            state["pir_consec_on_s"] = consec_on_s
+            if consec_on_s >= PIR_STUCK_MAX_S:
+                pir_present = False
+                new_pir_hold_s = 0.0
+            else:
+                pir_present = True
+                new_pir_hold_s = PIR_HOLD_S
         else:
+            state["pir_consec_on_s"] = 0.0
             prev_pir_hold_s = float(state.get("pir_hold_s", 0.0))
             if prev_pir_hold_s > 0.0:
                 pir_present = True

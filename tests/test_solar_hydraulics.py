@@ -361,6 +361,58 @@ class TestOutdoorInterfloorAndInternalLoads:
         )
         assert q_dry == pytest.approx(-2.5 * 200.0)
 
+    def test_stuck_pir_occupancy_guard_realtime_and_history(self) -> None:
+        """Stuck 20+ hour `pir_occ` is muted; normal 8h schedule passes."""
+        from custom_components.betonbatterij.domain import preprocessing
+
+        state: dict[str, object] = {}
+        # 8h active schedule (96 steps) stays active.
+        for _ in range(96):
+            q_day, _ = solar_weather.compute_internal_and_ac_loads_kt(
+                None, 1.0, 0.0, 0.0, const.AC_MODE_OFF, False, 5.0, 3.6, state
+            )
+            assert q_day == pytest.approx(solar_weather.PIR_WORKPLACE_GAIN_W)
+
+        # Evening OFF resets the consecutive counter.
+        solar_weather.compute_internal_and_ac_loads_kt(
+            None, 0.0, 0.0, 0.0, const.AC_MODE_OFF, False, 5.0, 3.6, state
+        )
+        assert state["pir_consec_on_s"] == pytest.approx(0.0)
+
+        # Stuck ON for 20h (240 * 300 s = 72000 s) mutes phantom +140 W heat.
+        q_last = 0.0
+        for _ in range(240):
+            q_last, _ = solar_weather.compute_internal_and_ac_loads_kt(
+                None, 1.0, 0.0, 0.0, const.AC_MODE_OFF, False, 5.0, 3.6, state
+            )
+        assert q_last == pytest.approx(0.0)
+
+        # Batch history sanitizer zeroes 24h stuck run, keeps 8h schedule.
+        n_stuck = 288  # 24 h stuck ON
+        n_off = 48  # 4 h OFF
+        n_sched = 96  # 8 h normal schedule ON
+        pir_raw = [1.0] * n_stuck + [0.0] * n_off + [1.0] * n_sched
+        ts_seq = [1_763_670_000 + k * 300 for k in range(len(pir_raw))]
+        cleaned = preprocessing.sanitize_stuck_pir_occupancy(pir_raw, ts_seq)
+        assert all(v == 0.0 for v in cleaned[:n_stuck])
+        assert all(v == 0.0 for v in cleaned[n_stuck : n_stuck + n_off])
+        assert all(v == 1.0 for v in cleaned[n_stuck + n_off :])
+
+        # Full preprocess_history_columns integration verifies q_int_kt_w == 0
+        # on stuck segment and 140 W on normal 8h schedule segment.
+        hist = preprocessing.preprocess_history_columns(
+            {
+                "ts_utc": ts_seq,
+                "pir_occ_kt": pir_raw,
+                "p_growlights_kt_w": [0.0] * len(pir_raw),
+            }
+        )
+        assert all(v == 0.0 for v in hist.pir_occ_kt[:n_stuck])
+        assert all(v == 0.0 for v in hist.q_int_kt_w[:n_stuck])
+        assert hist.q_int_kt_w[-1] == pytest.approx(
+            solar_weather.PIR_WORKPLACE_GAIN_W
+        )
+
     def test_surface_temperature_voltage_divider(self) -> None:
         t_surf_wk = zoh_kalman.estimate_surface_temp(
             20.0,

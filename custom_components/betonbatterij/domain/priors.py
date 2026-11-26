@@ -51,7 +51,7 @@ WAX_VALVE_CLOSE_TIME_S: float = 228.0
 
 DAY1_PRIORS_WK: contracts.ZoneParameters = contracts.ZoneParameters(
     c_air_wh_k=450.0,
-    c_floor_wh_k=5500.0,
+    c_floor_wh_k=8000.0,
     r_fh_k_kw=2.60,
     h_loss_w_k=65.0,
     h_up_w_k=120.0,
@@ -79,7 +79,7 @@ DAY1_PRIORS_KT: contracts.ZoneParameters = contracts.ZoneParameters(
 
 PARAM_BOUNDS_WK: dict[str, contracts.ParameterBounds] = {
     "c_floor_wh_k": contracts.ParameterBounds(
-        lower=3500.0, upper=8000.0, prior_mean=5500.0, prior_std=1100.0
+        lower=3500.0, upper=12000.0, prior_mean=8000.0, prior_std=2000.0
     ),
     "r_fh_k_kw": contracts.ParameterBounds(
         lower=1.80, upper=3.60, prior_mean=2.60, prior_std=0.50
@@ -154,7 +154,7 @@ COP_PARAM_BOUNDS: dict[str, contracts.ParameterBounds] = {
         lower=0.34, upper=0.62, prior_mean=0.48, prior_std=0.06
     ),
     "beta_defrost": contracts.ParameterBounds(
-        lower=0.05, upper=0.35, prior_mean=0.18, prior_std=0.07
+        lower=0.05, upper=0.55, prior_mean=0.18, prior_std=0.12
     ),
     "eta_carnot_dhw": contracts.ParameterBounds(
         lower=0.22, upper=0.48, prior_mean=0.34, prior_std=0.06

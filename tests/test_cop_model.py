@@ -37,18 +37,23 @@ class TestCopPhysicsAndMonotonicity:
     """Verifies Carnot curves, frost bell, and `51.0 °C` DHW heater kink."""
 
     def test_frost_penalty_factor_bounds_and_peak(self) -> None:
-        assert cop_model.frost_penalty_factor(1.0, 96.0) == pytest.approx(1.0)
-        assert cop_model.frost_penalty_factor(-5.5, 98.0) == 0.0
-        assert cop_model.frost_penalty_factor(6.0, 98.0) == 0.0
-        assert cop_model.frost_penalty_factor(1.0, 75.0) == 0.0
-        assert 0.3 < cop_model.frost_penalty_factor(0.0, 88.0) < 0.7
+        assert cop_model.frost_penalty_factor(0.0, 96.0) == pytest.approx(1.0)
+        assert cop_model.frost_penalty_factor(-10.5, 98.0) == 0.0
+        assert cop_model.frost_penalty_factor(5.0, 98.0) == 0.0
+        assert cop_model.frost_penalty_factor(0.0, 68.0) == 0.0
+        # Sub-zero humid air retains strong frost penalty; above +3 C decays.
+        assert cop_model.frost_penalty_factor(-2.0, 92.0) > 0.85
+        assert 0.0 < cop_model.frost_penalty_factor(3.5, 95.0) < 0.25
+        assert cop_model.frost_penalty_factor(-2.0, 90.0) > (
+            cop_model.frost_penalty_factor(2.0, 90.0)
+        )
 
     def test_predict_cop_cv_monotonicity_and_frost_dip(self) -> None:
         day1 = priors.DAY1_COP_PARAMS
         sups = [20.0, 24.0, 28.0, 32.0, 38.0, 45.0]
         cops_sup = [
             cop_model.predict_cop_cv(
-                day1, t_out_c=7.0, t_sup_c=s, rh_out_pct=75.0
+                day1, t_out_c=7.0, t_sup_c=s, rh_out_pct=70.0
             )
             for s in sups
         ]
@@ -66,10 +71,10 @@ class TestCopPhysicsAndMonotonicity:
             assert c_cold < c_warm
 
         cop_dry = cop_model.predict_cop_cv(
-            day1, t_out_c=1.0, t_sup_c=29.0, rh_out_pct=70.0
+            day1, t_out_c=0.0, t_sup_c=29.0, rh_out_pct=68.0
         )
         cop_fog = cop_model.predict_cop_cv(
-            day1, t_out_c=1.0, t_sup_c=29.0, rh_out_pct=96.0
+            day1, t_out_c=0.0, t_sup_c=29.0, rh_out_pct=96.0
         )
         assert cop_fog == pytest.approx(
             cop_dry * (1.0 - day1.beta_defrost), rel=1e-6
@@ -624,3 +629,79 @@ class TestP1FlankAndCopCalibration:
         assert cop_dhw_guard == pytest.approx(
             cop_model.predict_cop_cv(day1, 5.0, 27.5, 80.0), rel=1e-9
         )
+
+    def test_beta_defrost_upper_bound_recovers_heavy_frost_runs(self) -> None:
+        """Widened `beta_defrost` bound (`0.55`) fits heavy sub-zero frost."""
+        assert priors.COP_PARAM_BOUNDS["beta_defrost"].upper == pytest.approx(
+            0.55
+        )
+        assert priors.PARAM_BOUNDS_WK["c_floor_wh_k"].upper == pytest.approx(
+            12000.0
+        )
+        true_params = contracts.CopParameters(
+            eta_carnot_cv=0.46,
+            beta_defrost=0.45,
+            eta_carnot_dhw=0.32,
+            delta_p_wp_bias_w=130.0,
+        )
+        ts_utc: list[int] = []
+        flags: list[int] = []
+        f_comp: list[float] = []
+        p_raw: list[float] = []
+        p_prim: list[float] = []
+        t_out: list[float] = []
+        rh_out: list[float] = []
+        t_sup: list[float] = []
+        p_p1: list[float] = []
+
+        t_cur = _utc_ts(2026, 11, 20, 1, 0)
+        for t_o, t_s, rh in [
+            (8.5, 27.0, 80.0),
+            (-1.5, 29.0, 92.0),
+            (7.0, 27.5, 78.0),
+            (-0.5, 28.5, 91.0),
+            (9.0, 27.0, 75.0),
+            (-1.0, 29.0, 93.0),
+        ]:
+            for _ in range(4):
+                ts_utc.append(t_cur)
+                flags.append(0)
+                f_comp.append(0.0)
+                p_raw.append(0.0)
+                p_prim.append(0.0)
+                t_out.append(t_o)
+                rh_out.append(rh)
+                t_sup.append(25.0)
+                p_p1.append(150.0)
+                t_cur += const.DT_STEP_S
+            cop_t = cop_model.predict_cop_cv(true_params, t_o, t_s, rh)
+            p_el = 1400.0 + true_params.delta_p_wp_bias_w
+            for _ in range(12):
+                ts_utc.append(t_cur)
+                flags.append(0)
+                f_comp.append(38.0)
+                p_raw.append(1400.0)
+                p_prim.append(cop_t * p_el)
+                t_out.append(t_o)
+                rh_out.append(rh)
+                t_sup.append(t_s)
+                p_p1.append(150.0 + p_el)
+                t_cur += const.DT_STEP_S
+
+        fitted, _, diag = cop_model.fit_cop_parameters(
+            {
+                "ts_utc": ts_utc,
+                "flags": flags,
+                "f_comp_hz": f_comp,
+                "p_wp_raw_el_w": p_raw,
+                "p_prim_th_w": p_prim,
+                "t_out_dak_c": t_out,
+                "rh_out_pct": rh_out,
+                "t_wp_out_c": t_sup,
+                "p_p1_net_w": p_p1,
+            },
+            priors.DAY1_COP_PARAMS,
+        )
+        assert diag["n_cv_runs"] == 6
+        assert fitted.beta_defrost > 0.38
+        assert fitted.beta_defrost == pytest.approx(0.45, abs=0.05)

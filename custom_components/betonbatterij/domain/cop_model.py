@@ -43,10 +43,13 @@ def _is_finite(val: float | int | None) -> TypeGuard[float | int]:
 
 
 def frost_penalty_factor(t_out_c: float, rh_out_pct: float = 80.0) -> float:
-    """Computes the smooth evaporator frost penalty factor `phi_frost`.
+    """Computes the asymmetric evaporator frost penalty factor `phi_frost`.
 
-    Peaks around `T_out = +1.0 °C` in humid outdoor air (`RH > 78%`) and is
-    strictly zero outside `[-5.0, +5.5] °C`.
+    Peaks at `T_out = 0.0 °C` in humid outdoor air (`RH > 70%`): above `0.0 °C`
+    it decays steeply (`sigma = 1.8 °C`, zero above `+4.5 °C`) as the
+    evaporator coil rises above freezing; below `0.0 °C` it decays slowly
+    (`sigma = 6.0 °C`, zero below `-10.0 °C`) as air moisture content drops
+    while sub-zero ambient air still impedes defrost melt.
 
     Args:
         t_out_c: Outdoor air temperature [°C].
@@ -56,15 +59,16 @@ def frost_penalty_factor(t_out_c: float, rh_out_pct: float = 80.0) -> float:
         Dimensionless frost penalty intensity in `[0.0, 1.0]`.
     """
     t_out = float(t_out_c)
-    if t_out < -5.0 or t_out > 5.5:
+    if t_out < -10.0 or t_out > 4.5:
         return 0.0
 
     rh = 80.0 if not _is_finite(rh_out_pct) else float(rh_out_pct)
-    rh_factor = max(0.0, min(1.0, (rh - 78.0) / 17.0))
+    rh_factor = max(0.0, min(1.0, (rh - 70.0) / 22.0))
     if rh_factor <= 0.0:
         return 0.0
 
-    temp_bell = math.exp(-((t_out - 1.0) ** 2) / (2.0 * (2.2**2)))
+    sigma_c = 1.8 if t_out >= 0.0 else 6.0
+    temp_bell = math.exp(-(t_out * t_out) / (2.0 * sigma_c * sigma_c))
     return rh_factor * temp_bell
 
 

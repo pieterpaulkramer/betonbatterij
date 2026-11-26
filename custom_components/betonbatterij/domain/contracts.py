@@ -144,7 +144,7 @@ class CopParameters:
 
     Attributes:
         eta_carnot_cv: Space-heating Carnot efficiency factor [-].
-        beta_defrost: Defrost COP penalty amplitude near +1 °C [-].
+        beta_defrost: Defrost COP penalty amplitude near 0 °C [-].
         eta_carnot_dhw: Domestic hot water Carnot efficiency factor [-].
         delta_p_wp_bias_w: Additive bias correction on WP electrical power [W].
     """
